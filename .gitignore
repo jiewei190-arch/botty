@@ -1,0 +1,30 @@
+# Environment / secrets
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime artifacts
+logs/*.log
+logs/*.jsonl
+storage/*.db
+storage/*.db-wal
+storage/*.db-shm
+storage/cache/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
