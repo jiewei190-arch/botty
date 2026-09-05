@@ -177,6 +177,12 @@ class TestNoLookahead:
             assert last == bars.index[length - 1]
             assert length <= len(bars)
 
+    def test_the_equity_curve_excludes_warmup_bars(self):
+        """Results describe the tradable window, not the warm-up in front of it."""
+        result = run(ScriptedStrategy(), {"AAA": flat(30)}, warmup_bars=10)
+        assert len(result.equity_curve) == 20
+        assert result.metrics.bars == 20
+
     def test_warmup_bars_are_not_traded(self):
         bars = flat(20)
         strategy = ScriptedStrategy({i: (100.0, 90.0, 120.0) for i in range(20)})
@@ -237,18 +243,73 @@ class TestExits:
         result = run(ScriptedStrategy({3: (100.0, 95.0, 110.0)}), {"AAA": bars})
         assert result.trades[0]["exit_reason"] == "STOP_LOSS"
 
-    def test_a_discretionary_exit_fills_at_the_open(self):
+    def test_a_discretionary_exit_fills_on_the_next_bar(self):
+        """Decided from bar 5's close, so it cannot fill at bar 5's own open.
+
+        The two opens differ deliberately: filling at 104 would mean selling at
+        a price that came before the information behind the decision.
+        """
         bars = frame(
             [(100, 101, 99, 100)] * 3
             + [(100, 101, 99, 100)]
             + [(100, 101, 99, 100)]  # 4: entry at 100
-            + [(104, 105, 103, 104)]  # 5: scripted exit, fills at this open
-            + [(104, 105, 103, 104)]
+            + [(104, 105, 103, 104)]  # 5: scripted exit decided from this close
+            + [(107, 108, 106, 107)]  # 6: it fills at this open
         )
         strategy = ScriptedStrategy({3: (100.0, 90.0, 200.0)}, exit_at={5})
         result = run(strategy, {"AAA": bars})
         assert result.trades[0]["exit_reason"] == "SIGNAL_FLIP"
-        assert result.trades[0]["exit_price"] == 104.0
+        assert result.trades[0]["exit_price"] == 107.0
+        assert result.trades[0]["exit_time"] == bars.index[6]
+
+    def test_a_discretionary_exit_never_closes_on_its_entry_bar(self):
+        """A zero-bar round trip at one price is an artefact, not a trade."""
+        bars = frame(
+            [(100, 101, 99, 100)] * 3
+            + [(100, 101, 99, 100)]  # 3: entry signal
+            + [(100, 101, 99, 100)]  # 4: entry fills; exit also scripted here
+            + [(103, 104, 102, 103)]  # 5: the exit fills here
+            + [(103, 104, 102, 103)]
+        )
+        strategy = ScriptedStrategy({3: (100.0, 90.0, 200.0)}, exit_at={4})
+        result = run(strategy, {"AAA": bars})
+        trade = result.trades[0]
+        assert trade["entry_time"] < trade["exit_time"]
+        assert trade["exit_price"] == 103.0
+
+    def test_a_queued_exit_pre_empts_a_stop_later_in_the_same_bar(self):
+        """The queued exit is a market order at the open, so it goes first.
+
+        The stop at 95 is only reached by the bar's low. By then the position is
+        already flat, so it closes near 100 rather than at the stop — and it is
+        closed exactly once.
+        """
+        bars = frame(
+            [(100, 101, 99, 100)] * 3
+            + [(100, 101, 99, 100)]
+            + [(100, 101, 99, 100)]  # 4: entry at 100; exit queued from its close
+            + [(100, 101, 94, 96)]  # 5: opens at 100, only later reaches the stop
+            + [(96, 97, 95, 96)]
+        )
+        strategy = ScriptedStrategy({3: (100.0, 95.0, 130.0)}, exit_at={4})
+        result = run(strategy, {"AAA": bars})
+        assert len(result.trades) == 1
+        assert result.trades[0]["exit_reason"] == "SIGNAL_FLIP"
+        assert result.trades[0]["exit_price"] == 100.0
+
+    def test_a_gap_through_the_stop_still_closes_at_the_open(self):
+        """When the bar opens below the stop, both routes agree on the price."""
+        bars = frame(
+            [(100, 101, 99, 100)] * 3
+            + [(100, 101, 99, 100)]
+            + [(100, 101, 99, 100)]  # 4: entry at 100
+            + [(90, 91, 89, 90)]  # 5: gaps below the 95 stop
+            + [(90, 91, 89, 90)]
+        )
+        strategy = ScriptedStrategy({3: (100.0, 95.0, 130.0)}, exit_at={4})
+        result = run(strategy, {"AAA": bars})
+        assert len(result.trades) == 1
+        assert result.trades[0]["exit_price"] == 90.0
 
     def test_open_positions_are_closed_at_the_end(self):
         """An unrealised loss must not escape by simply never being closed."""

@@ -220,6 +220,7 @@ class Backtester:
         self._cash = float(self.config.starting_equity)
         self._positions: dict[str, SimulatedPosition] = {}
         self._pending: list[tuple[str, Signal]] = []
+        self._pending_exits: dict[str, str] = {}
         self._trades: list[dict[str, Any]] = []
         self._equity: list[float] = []
         self._timestamps: list[pd.Timestamp] = []
@@ -325,22 +326,35 @@ class Backtester:
 
             self._roll_day(stamp)
 
-            # 1. Entries queued on the previous bar fill at this bar's open.
+            # 1. Exits queued on the previous bar fill at this bar's open,
+            #    before anything else competes for the cash.
+            self._fill_pending_exits(bars, stamp)
+
+            # 2. Entries queued on the previous bar fill at this bar's open.
             self._fill_pending(bars, stamp, step)
 
-            # 2. Exits, including for positions just opened at this open.
-            self._process_exits(bars, prepared, positions_by_index, stamp, step)
+            # 3. Protective exits: stops and targets the bar traded through,
+            #    including for a position opened at this same open.
+            self._process_exits(bars, stamp)
 
-            # 3. Mark to market.
+            # 4. Mark to market. Warm-up bars are excluded from the record: no
+            #    position can exist yet, so they would contribute a run of flat
+            #    returns that pads the bar count, understates exposure, and drags
+            #    the Sharpe ratio toward zero. The results describe the period the
+            #    strategy could actually trade.
             closes = {symbol: float(bar["close"]) for symbol, bar in bars.items()}
-            self._equity.append(self._equity_now(closes))
-            self._timestamps.append(stamp)
-            if self._positions:
-                self._bars_in_market += 1
+            if step >= warmup:
+                self._equity.append(self._equity_now(closes))
+                self._timestamps.append(stamp)
+                if self._positions:
+                    self._bars_in_market += 1
             for position in self._positions.values():
                 position.bars_held += 1
 
-            # 4. Generate signals for the *next* bar. Nothing here can act now.
+            # 5. Decide what to do on the *next* bar. Both the exit checks and
+            #    the entry signals read this bar's close, so neither can act
+            #    until the next bar opens.
+            self._queue_exits(prepared, positions_by_index, stamp)
             if step >= warmup:
                 self._generate(prepared, positions_by_index, stamp, closes)
 
@@ -430,15 +444,36 @@ class Backtester:
                 strategy=signal.strategy,
             )
 
-    def _process_exits(
-        self,
-        bars: dict[str, Any],
-        prepared: dict[str, pd.DataFrame],
-        index_maps: dict[str, dict],
-        stamp: pd.Timestamp,
-        step: int,
-    ) -> None:
-        """Close positions whose stop, target or strategy exit triggered."""
+    def _fill_pending_exits(self, bars: dict[str, Any], stamp: pd.Timestamp) -> None:
+        """Close positions whose strategy asked to exit on the previous bar.
+
+        A discretionary exit is decided from a bar's close, so it cannot be
+        filled at that same bar's open — that would be selling at a price that
+        precedes the information behind the decision. It fills here, at the next
+        bar's open, exactly as an entry does.
+        """
+        queued, self._pending_exits = self._pending_exits, {}
+        for symbol, reason in queued.items():
+            position = self._positions.get(symbol)
+            bar = bars.get(symbol)
+            if position is None:
+                continue  # a stop or target got there first
+            if bar is None:
+                self._pending_exits[symbol] = reason  # no bar here; try the next
+                continue
+            fill = self.fills.exit_fill(
+                bar, position.direction, position.quantity, FillReason.SIGNAL_EXIT
+            )
+            self._close(symbol, fill, stamp, reason)
+
+    def _process_exits(self, bars: dict[str, Any], stamp: pd.Timestamp) -> None:
+        """Close positions whose stop or target was touched during the bar.
+
+        Only the protective exits belong here. They are triggered by prices the
+        bar actually traded through, so acting within the bar is what really
+        happens. Discretionary exits are queued instead — see
+        :meth:`_queue_exits`.
+        """
         for symbol in list(self._positions):
             position = self._positions[symbol]
             bar = bars.get(symbol)
@@ -459,20 +494,30 @@ class Backtester:
                     bar, position.direction, position.quantity, position.stop_loss
                 )
                 self._close(symbol, fill, stamp, ExitReason.STOP_LOSS.value)
+                self._pending_exits.pop(symbol, None)
                 continue
             if hit_target:
                 fill = self.fills.target_fill(
                     bar, position.direction, position.quantity, position.take_profit
                 )
                 self._close(symbol, fill, stamp, ExitReason.TAKE_PROFIT.value)
-                continue
+                self._pending_exits.pop(symbol, None)
 
-            # Discretionary exits act on the *next* bar's open, like entries.
-            frame = prepared[symbol]
+    def _queue_exits(
+        self,
+        prepared: dict[str, pd.DataFrame],
+        index_maps: dict[str, dict],
+        stamp: pd.Timestamp,
+    ) -> None:
+        """Ask each strategy whether to exit, and queue it for the next bar."""
+        for symbol in list(self._positions):
+            if symbol in self._pending_exits:
+                continue
+            position = self._positions[symbol]
             row = index_maps[symbol].get(stamp)
             if row is None:
                 continue
-            history = frame.iloc[: row + 1]
+            history = prepared[symbol].iloc[: row + 1]
             for strategy in self.strategies:
                 if strategy.name != position.strategy:
                     continue
@@ -480,11 +525,7 @@ class Backtester:
                     position.to_strategy_position(), history
                 )
                 if exit_signal is not None:
-                    fill = self.fills.exit_fill(
-                        bar, position.direction, position.quantity,
-                        FillReason.SIGNAL_EXIT,
-                    )
-                    self._close(symbol, fill, stamp, exit_signal.reason.value)
+                    self._pending_exits[symbol] = exit_signal.reason.value
                     break
 
     def _generate(

@@ -198,3 +198,81 @@ def test_scan_caps_results(capsys):
     main(["scan", "--demo", "--bars", "405", "--top", "1", "--min-dollar-volume", "0"])
     output = capsys.readouterr().out
     assert output.count("Direction:") <= 1
+
+
+# ----------------------------------------------------------------------------
+# backtest
+# ----------------------------------------------------------------------------
+
+
+def test_backtest_demo_runs_without_credentials(capsys):
+    assert main(["backtest", "--demo", "--symbols", "AAPL", "--strategy", "momentum"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "BACKTEST" in out
+    assert "Sharpe ratio" in out
+
+
+def test_backtest_warns_that_demo_data_is_synthetic(capsys):
+    main(["backtest", "--demo", "--symbols", "AAPL"])
+    assert "NOT REAL MARKET DATA" in capsys.readouterr().out
+
+
+def test_backtest_says_results_are_not_a_forecast(capsys):
+    main(["backtest", "--demo", "--symbols", "AAPL"])
+    assert "not a forecast" in capsys.readouterr().out
+
+
+def test_backtest_honours_starting_capital(capsys):
+    main(["backtest", "--demo", "--symbols", "AAPL", "--capital", "50000"])
+    assert "$50,000.00" in capsys.readouterr().out
+
+
+def test_backtest_rejects_an_unknown_strategy(capsys):
+    assert main(["backtest", "--demo", "--strategy", "nonsense"]) == EXIT_FAILURE
+    assert "Unknown strategy" in capsys.readouterr().err
+
+
+def test_backtest_rejects_an_unparseable_date():
+    with pytest.raises(SystemExit):
+        main(["backtest", "--demo", "--start", "last tuesday"])
+
+
+def test_backtest_rejects_a_backwards_date_range(capsys):
+    result = main(
+        ["backtest", "--demo", "--start", "2025-06-01", "--end", "2025-05-01"]
+    )
+    assert result == EXIT_FAILURE
+    assert "must be before" in capsys.readouterr().err
+
+
+def test_backtest_writes_a_trade_csv(tmp_path, capsys):
+    target = tmp_path / "trades.csv"
+    main(["backtest", "--demo", "--symbols", "AAPL", "--csv", str(target)])
+    assert target.exists()
+    assert "symbol,strategy,direction" in target.read_text().splitlines()[0]
+
+
+def test_backtest_writes_a_result_json(tmp_path):
+    target = tmp_path / "result.json"
+    main(["backtest", "--demo", "--symbols", "AAPL", "--json", str(target)])
+    payload = json.loads(target.read_text())
+    assert {"metrics", "trades", "symbols"} <= set(payload)
+
+
+def test_backtest_can_list_every_trade(capsys):
+    main(["backtest", "--demo", "--symbols", "AAPL", "--trades"])
+    out = capsys.readouterr().out
+    assert "REASON" in out
+
+
+def test_backtest_no_costs_removes_slippage(capsys):
+    main(["backtest", "--demo", "--symbols", "AAPL", "--no-costs"])
+    assert "Slippage cost     : $0.00" in capsys.readouterr().out
+
+
+def test_backtest_accepts_multiple_strategies(capsys):
+    result = main(
+        ["backtest", "--demo", "--symbols", "AAPL", "--strategy", "momentum,breakout"]
+    )
+    assert result == EXIT_OK
+    assert "momentum" in capsys.readouterr().out

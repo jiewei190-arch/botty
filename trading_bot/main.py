@@ -30,12 +30,14 @@ Later phases add ``scan``, ``backtest``, ``run`` and ``dashboard``.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 # Allow `python main.py` from the repository root without installing the package.
 if __package__ in (None, ""):  # pragma: no cover - script execution path
@@ -44,6 +46,12 @@ if __package__ in (None, ""):  # pragma: no cover - script execution path
 from pydantic import ValidationError
 
 from trading_bot import __version__
+from trading_bot.backtesting import FRICTIONLESS, CostModel
+from trading_bot.backtesting.runner import (
+    BacktestDataError,
+    BacktestRequest,
+    run_backtest,
+)
 from trading_bot.config.settings import Settings, TradingMode, load_settings
 from trading_bot.data.cache import BarCache
 from trading_bot.data.database import Database
@@ -208,6 +216,65 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo", action="store_true", help="Use generated sample data — no API keys needed."
     )
     scan.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+
+    backtest = subparsers.add_parser(
+        "backtest", help="Simulate a strategy over historical bars."
+    )
+    backtest.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
+    backtest.add_argument(
+        "--strategy",
+        default="momentum",
+        help="Strategy name, comma-separated list, or 'all'. "
+        f"Available: {', '.join(available_strategies())}",
+    )
+    backtest.add_argument(
+        "--timeframe", default=None, help="Bar size (default: DATA_TIMEFRAME)."
+    )
+    backtest.add_argument("--start", help="First tradable date, YYYY-MM-DD.")
+    backtest.add_argument("--end", help="Last date, YYYY-MM-DD (default: now).")
+    backtest.add_argument(
+        "--capital", type=float, default=10_000.0, help="Starting equity (default 10000)."
+    )
+    backtest.add_argument(
+        "--commission", type=float, default=0.0,
+        help="Flat commission per fill (default 0, as most US retail brokers charge).",
+    )
+    backtest.add_argument(
+        "--commission-per-share", type=float, default=0.0,
+        help="Per-share commission.",
+    )
+    backtest.add_argument(
+        "--slippage", type=float, default=0.05,
+        help="Slippage per fill as a percent, always against the trade (default 0.05).",
+    )
+    backtest.add_argument(
+        "--risk-per-trade", type=float, default=None,
+        help="Percent of equity risked per trade (default: RISK_MAX_RISK_PER_TRADE_PCT).",
+    )
+    backtest.add_argument(
+        "--max-positions", type=int, default=None, help="Cap on concurrent positions."
+    )
+    backtest.add_argument(
+        "--min-confidence", type=float, default=None, help="Override the confidence floor."
+    )
+    backtest.add_argument(
+        "--allow-short", action="store_true", help="Permit short signals (off by default)."
+    )
+    backtest.add_argument(
+        "--no-costs", action="store_true",
+        help="Run frictionless. Useful for isolating strategy behaviour, never for "
+        "judging whether a strategy is worth trading.",
+    )
+    backtest.add_argument(
+        "--trades", action="store_true", help="Print every trade, not just the summary."
+    )
+    backtest.add_argument("--json", help="Write the full result to this JSON file.")
+    backtest.add_argument("--csv", help="Write the trade list to this CSV file.")
+    backtest.add_argument(
+        "--demo", action="store_true",
+        help="Run on generated sample data instead of the market — no API keys needed.",
+    )
+    backtest.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
 
     dashboard = subparsers.add_parser(
         "dashboard", help="Launch the Streamlit monitoring dashboard."
@@ -1033,6 +1100,124 @@ def _render_opportunity(opportunity, width: int) -> None:
         print(f"Risk Validation : REJECTED — {decision.rejection_reason}")
 
 
+def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
+    """Simulate a strategy over historical bars and report what it would have done.
+
+    Every figure here is a measurement of the past under an explicit set of
+    assumptions about fills and costs, not a forecast.
+    """
+    symbols = (
+        [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else list(settings.data.watchlist)
+    )
+    names = (
+        available_strategies()
+        if args.strategy.strip().lower() == "all"
+        else [item.strip() for item in args.strategy.split(",") if item.strip()]
+    )
+
+    start = _parse_date(args.start)
+    end = _parse_date(args.end)
+
+    costs = (
+        FRICTIONLESS
+        if args.no_costs
+        else CostModel(
+            commission_per_trade=args.commission,
+            commission_per_share=args.commission_per_share,
+            slippage_pct=args.slippage,
+        )
+    )
+
+    risk = settings.risk
+    overrides: dict[str, Any] = {}
+    if args.risk_per_trade is not None:
+        overrides["max_risk_per_trade_pct"] = args.risk_per_trade
+    if args.max_positions is not None:
+        overrides["max_open_positions"] = args.max_positions
+    if overrides:
+        risk = risk.model_copy(update=overrides)
+
+    try:
+        request = BacktestRequest(
+            symbols=tuple(symbols),
+            strategies=tuple(names),
+            timeframe=args.timeframe or settings.data.timeframe,
+            start=start,
+            end=end,
+            starting_equity=args.capital,
+            costs=costs,
+            risk=risk,
+            allow_short=args.allow_short,
+            min_confidence=args.min_confidence,
+            demo=args.demo,
+            use_cache=not args.no_cache,
+        )
+    except (ValueError, StrategyError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    if args.demo:
+        banner = "!" * 64
+        print(f"\n{banner}")
+        print("  DEMO MODE \u2014 GENERATED SAMPLE DATA, NOT REAL MARKET DATA")
+        print("  Results below describe a random walk, not any real instrument.")
+        print(banner)
+
+    print(f"\nSimulating {len(symbols)} symbol(s) with {', '.join(names)}...")
+    try:
+        result = run_backtest(request, settings)
+    except (BacktestDataError, StrategyError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    print()
+    print(result.summary())
+
+    if args.trades and result.trades:
+        _render_trades(result.trades)
+
+    if args.csv:
+        path = Path(args.csv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result.trade_frame.to_csv(path, index=False)
+        print(f"\nTrades written to {path}")
+
+    if args.json:
+        path = Path(args.json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result.as_dict(), indent=2, default=str))
+        print(f"Full result written to {path}")
+
+    print(
+        "\nThese are simulated results under the stated fill and cost assumptions.\n"
+        "Past behaviour of a strategy on historical data is not a forecast."
+    )
+    return EXIT_OK
+
+
+def _render_trades(trades: list[dict[str, Any]]) -> None:
+    """Print the trade list, one row per closed trade."""
+    print()
+    print("-" * 100)
+    print(
+        f"{'SYMBOL':<8}{'DIR':<6}{'ENTRY':>10}{'EXIT':>10}{'QTY':>7}"
+        f"{'P&L':>11}{'R':>7}  {'BARS':>5}  REASON"
+    )
+    print("-" * 100)
+    for trade in trades:
+        r_multiple = trade.get("r_multiple")
+        print(
+            f"{trade['symbol']:<8}{trade['direction']:<6}"
+            f"{trade['entry_price']:>10.2f}{trade['exit_price']:>10.2f}"
+            f"{trade['quantity']:>7.0f}{trade['pnl']:>11.2f}"
+            f"{(f'{r_multiple:.2f}' if r_multiple is not None else '-'):>7}"
+            f"  {trade['bars_held']:>5}  {trade['exit_reason']}"
+        )
+    print("-" * 100)
+
+
 def cmd_dashboard(settings: Settings, args: argparse.Namespace) -> int:
     """Launch the Streamlit dashboard.
 
@@ -1121,6 +1306,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_signals(settings, args)
         if args.command == "scan":
             return cmd_scan(settings, args)
+        if args.command == "backtest":
+            return cmd_backtest(settings, args)
         if args.command == "dashboard":
             return cmd_dashboard(settings, args)
         if args.command == "cache":
