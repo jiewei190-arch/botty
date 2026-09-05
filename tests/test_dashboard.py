@@ -538,6 +538,26 @@ def test_the_hunt_command_has_no_demo_mode():
     assert not hasattr(actions, "demo")
 
 
+def test_only_one_place_asks_for_the_account_balance(app_path):
+    """Two inputs for one balance is two chances to size against the wrong one."""
+    app = _run(app_path, page="Hunt")
+    assert not app.exception
+    equity_inputs = [
+        widget for widget in app.number_input if "equity" in widget.label.lower()
+    ]
+    assert len(equity_inputs) == 1, (
+        f"expected one equity input, found {[w.label for w in equity_inputs]}"
+    )
+
+
+def test_the_balance_is_never_read_from_a_broker(app_path):
+    """The data provider's account is not the account you trade."""
+    source = Path(app_path).read_text()
+    hunt = source.split("def _hunt(")[1].split("\ndef ")[0]
+    assert "get_account" not in hunt
+    assert "build_broker" not in hunt
+
+
 def test_the_app_uses_no_deprecated_streamlit_apis(app_path):
     """`use_container_width` was removed after 2025-12-31."""
     from pathlib import Path

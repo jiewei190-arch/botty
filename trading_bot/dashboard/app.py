@@ -38,6 +38,7 @@ from trading_bot.dashboard.charts import (
     r_multiple_chart,
     trade_chart,
 )
+from trading_bot.dashboard.preferences import remembered_equity, save_preference
 from trading_bot.dashboard.theme import app_css, direction_marker, get_palette
 from trading_bot.indicators import (
     IndicatorConfig,
@@ -172,13 +173,25 @@ def _sidebar(settings) -> dict:
 
         st.divider()
         st.markdown("**Risk sizing**")
+        # The one place the balance is entered. It is not read from a broker:
+        # the market-data account and the account you trade need not be the
+        # same place, and a data-only key holds nothing.
+        remembered = remembered_equity(
+            settings.data.database_path.parent, settings.risk.account_equity
+        )
         equity = st.number_input(
             "Account equity ($)",
             min_value=100.0,
-            value=10_000.0,
-            step=1_000.0,
-            help="Used when no broker account is connected. A live account overrides this.",
+            value=float(remembered),
+            step=500.0,
+            help="The balance of the account you actually trade. Every share "
+            "count on every page is derived from it. Your last entry is "
+            "remembered as a starting point — update it as your balance moves.",
         )
+        if equity != remembered:
+            save_preference(
+                settings.data.database_path.parent, "account_equity", float(equity)
+            )
 
         if st.button("Refresh data", width="stretch"):
             st.cache_data.clear()
@@ -254,19 +267,20 @@ def _hunt(settings, controls: dict, palette) -> None:
         )
         return
 
+    equity = float(controls.get("equity") or settings.risk.account_equity)
+
     with st.form("hunt"):
         first, second, third = st.columns(3)
         strategy_names = first.multiselect(
             "Strategies", available_strategies(), default=list(available_strategies())
         )
-        equity = second.number_input(
-            "Account equity ($)",
-            min_value=100.0,
-            # Seeded from the sidebar so the two controls never show different
-            # balances for the same account.
-            value=float(controls.get("equity") or settings.risk.account_equity),
-            step=500.0,
-            help="The balance you actually trade. Share counts are sized from this.",
+        # Deliberately not a second equity box. Two inputs for one balance is
+        # two chances to size against the wrong number; the sidebar owns it.
+        second.markdown(
+            f'<div class="metric-card"><div class="metric-label">Sizing against'
+            f'</div><div class="metric-value">${equity:,.0f}</div>'
+            f'<div class="metric-note">set in the sidebar</div></div>',
+            unsafe_allow_html=True,
         )
         top_n = third.number_input("Show top", min_value=1, max_value=50, value=10, step=1)
 

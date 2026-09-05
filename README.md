@@ -150,6 +150,12 @@ from it:
 RISK_ACCOUNT_EQUITY=15000
 ```
 
+That is the starting value. Since a traded balance moves, both front ends let
+you enter it per run instead: `hunt --equity 15000` on the command line, and a
+single **Account equity** box in the dashboard sidebar, which remembers your
+last entry as the next starting point. Whatever is in the box is what sizing
+uses — the config value only supplies the default.
+
 ### Verify the installation
 
 ```bash
