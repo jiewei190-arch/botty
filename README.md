@@ -1,29 +1,39 @@
-# Algorithmic Trading Bot
+# Market Hunter
 
-A modular, risk-first trading bot for US equities. Built to **test ideas safely**:
-backtest a strategy on historical data, then paper trade it against a live market
-feed, with real-money trading locked behind two explicit switches.
+A risk-first **swing-trading scanner** for US equities. It analyses every liquid
+listed stock, ranks the setups worth acting on, and gives you an entry, a stop,
+a target and a share count sized to your account. You place the orders yourself,
+wherever you trade.
 
-> **Status: Phases 1-5 of 10 complete, plus a read-only dashboard.** Foundation,
-> data, analysis, strategies, risk management and the scanner are built and
-> tested, with a Streamlit dashboard to look at them. Backtesting and paper
-> trading follow, and the dashboard grows trade controls with them (see the
-> [roadmap](#roadmap)).
+```bash
+python main.py hunt
+```
+
+> **It places no orders and connects to no broker for trading.** Market data is
+> read from a data provider; execution is yours. That separation is deliberate,
+> not a missing feature — see [Where you trade](#where-you-trade-is-not-where-you-get-data).
+
+> **Status: the scanner, the analysis behind it and the backtester are complete
+> and tested** — 850 tests, no credentials needed to run them. See the
+> [roadmap](#roadmap).
 
 ---
 
 ## Design principles
 
-1. **Risk management is not optional.** No order can be placed without passing
-   validation. Position size is derived from stop distance, never guessed.
+1. **Risk management is not optional.** Nothing is presented as an entry without
+   passing validation. Position size is derived from stop distance, never
+   guessed, and the constraint that bound it is always reported.
 2. **Backtests must be honest.** Fees, slippage, candle-by-candle execution and a
    hard guard against lookahead bias — a backtest that lies is worse than none.
-3. **Paper before live.** `PAPER` is the default mode and real trading requires
-   two independent switches, one of which is an exact confirmation phrase.
+3. **A quiet scan must explain itself.** Every filter stage reports what it
+   dropped and why. A scan returning four names out of six hundred is either
+   working perfectly or badly broken, and only the stage counts tell them apart.
 4. **Strategies are pluggable.** Every strategy implements one interface and is
    driven entirely by parameters, so ideas can be compared on equal footing.
-5. **Everything is logged.** Signals, rejections, risk calculations and fills all
-   land in both a human-readable log and a queryable database.
+5. **A score is a ranking, not a probability.** The scanner orders candidates
+   against each other. It does not estimate a chance of profit, and says so
+   wherever a score appears.
 
 ---
 
@@ -115,17 +125,30 @@ pip install -r requirements.txt
 cp .env.example .env               # then add your API keys
 ```
 
-Get free paper-trading keys from the
-[Alpaca paper dashboard](https://app.alpaca.markets/paper/dashboard/overview)
-and paste them into `.env`:
+### Market data
+
+Scanning the market means reading the market, so `hunt` needs a data key. Get a
+free one from the
+[Alpaca dashboard](https://app.alpaca.markets/paper/dashboard/overview) and
+paste it into `.env`:
 
 ```bash
 ALPACA_API_KEY=PK...
 ALPACA_SECRET_KEY=...
 ```
 
-Paper and live accounts have **separate key pairs**. Phase 1 only ever uses the
-paper endpoint.
+**No funding, no minimum, and no order is ever placed through it.** The account
+exists purely as a data feed; you trade wherever you already do. Alpaca is used
+because its API is built for this — one request returns bars for a hundred
+symbols, and the full tradable-symbol list comes down in one call — which is what
+makes a whole-market sweep finish in minutes instead of hours.
+
+Then set the balance you actually trade, because every share count is derived
+from it:
+
+```bash
+RISK_ACCOUNT_EQUITY=15000
+```
 
 ### Verify the installation
 
@@ -138,9 +161,8 @@ Health check results
 ------------------------------------------------------------------------
   [PASS] database       schema v1 at storage/trading_bot.db
   [PASS] credentials    ALPACA_API_KEY and ALPACA_SECRET_KEY present
-  [PASS] broker         PAPER account 8f3c21a0… status=ACTIVE equity=$100,000.00
   [PASS] market clock   CLOSED (opens 2026-09-05T13:30:00+00:00)
-  [PASS] market data    5 daily bars for AAPL, latest 2026-09-04 close $234.07
+  [PASS] market data    5 daily bars for AAPL, latest 2026-09-04 close $319.97
 ------------------------------------------------------------------------
 ```
 
@@ -160,7 +182,8 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py cache` | Inspect (`--clear` to empty) the bar cache |
 | `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
 | `python main.py signals` | Run strategies and report trade setups (Phase 3) |
-| `python main.py scan` | Rank the watchlist by trade confidence (Phase 5) |
+| `python main.py hunt` | **Scan the whole market and rank the best entries** |
+| `python main.py scan` | Rank a watchlist by trade confidence |
 | `python main.py backtest` | Simulate a strategy over historical bars (Phase 6) |
 | `python main.py dashboard` | Launch the Streamlit dashboard |
 
@@ -504,6 +527,112 @@ reports its *would-be* size — exactly what you need to decide which limit to t
 
 ---
 
+## Hunting the market
+
+```bash
+python main.py hunt                                  # scan everything liquid
+python main.py hunt --top 5 --min-risk-reward 3      # only the best setups
+python main.py hunt --equity 25000 --risk-per-trade 0.5
+python main.py hunt --symbols AAPL,MSFT,NVDA         # just these names
+python main.py hunt --csv setups.csv
+```
+
+Each result is a plan you could work from:
+
+```
+------------------------------------------------------------------------------
+#1  AAPL  ·  LONG  ·  momentum  ·  score 94/100
+------------------------------------------------------------------------------
+  ✓ Pullback to EMA 9 resumed higher
+  ✓ STRONG_BULLISH trend at 86/100
+  ✓ RSI 61.7 leaves room to run
+  ✓ Volume 1.29x average confirms the move
+
+  Buy              38 shares near $77.80   ($2,957)
+  Stop                       $76.35   (1.86% away)
+  Target                     $83.60   (7.45% away)
+
+  Risking $55.10 to make $220.39 (4.00:1)
+  Sized by: maximum position size
+```
+
+The same thing lives on the dashboard's **Hunt** page, with the funnel, the
+filters and a CSV download.
+
+### The funnel
+
+Analysing eleven thousand symbols the way you analyse ten is not a thing that
+finishes. Four stages, cheapest first:
+
+| Stage | Cuts | Cost |
+|---|---|---|
+| **Metadata** | exchange, tradability, instrument type | no price data; ~half |
+| **Liquidity** | price and turnover floors | the network stage |
+| **Strategies** | no setup on this bar | most symbols, most days |
+| **Score + risk** | fails the reward floor or sizing | the final few |
+
+The bars fetched for the liquidity screen are kept and reused, so a market-wide
+scan downloads the market **once**, not twice.
+
+### What gets filtered out, and why
+
+- **OTC and pink sheets.** Most retail brokers cannot trade them, so ranking
+  them produces opportunities you cannot act on.
+- **Leveraged and inverse funds.** Their daily reset decays a multi-day hold —
+  a 3x fund does not return 3x over a week. Excluded from a swing scan by
+  default; `--include-leveraged` if you want them anyway.
+- **SPACs, closed-end funds, warrants, rights and units.** Their price action
+  reflects deal news and flows rather than the behaviour these strategies read.
+- **Thin turnover.** Measured as price × volume, never volume alone: a million
+  shares of a $0.40 stock is $400,000 of liquidity, and volume alone hides that.
+  This is the single most effective filter for making results actionable.
+- **Anything under ~200 bars of history.** A recent listing has no 200-day
+  average and no established structure; indicators computed on it are arithmetic
+  without meaning.
+
+### Setups go stale
+
+A swing setup that triggered four sessions ago has already made its move. It
+still *evaluates* as valid — the conditions that fired are still true — but
+entering now means paying for the part you missed while carrying the same stop.
+Every candidate is dated, and stale ones are dropped rather than presented as
+fresh. `--max-age` controls the window; the default is one bar.
+
+### Share counts are per-trade
+
+Each setup is sized as though it were the only trade you take, because that is
+the question a ranked list actually raises: *if I take this one, how many
+shares?* How many fit **together** is reported separately.
+
+The alternative — sizing down the list cumulatively, so each entry assumes the
+ones above it were already bought — answers a different question and reads as a
+bug. On a $15,000 account it made the fourth-best idea report four shares, and
+rejected 92 of 101 otherwise-tradable setups outright, purely because earlier
+ranks had consumed the account.
+
+---
+
+## Where you trade is not where you get data
+
+The scanner reads market data from one place and assumes you execute somewhere
+else entirely. Nothing in it connects to a broker for trading.
+
+That has one consequence worth stating plainly: **position sizing uses
+`RISK_ACCOUNT_EQUITY` from your `.env`, not a broker balance.** If you scan with
+a free data-only key and trade elsewhere, the data account holds nothing, and
+sizing against it would produce share counts unrelated to the money genuinely at
+risk. Set it to the balance you actually trade:
+
+```bash
+RISK_ACCOUNT_EQUITY=15000
+RISK_MAX_RISK_PER_TRADE_PCT=1.0     # $150 at risk per trade on that balance
+```
+
+A data-only account needs no funding and places no orders. The market data is
+the only thing the scanner wants from it.
+
+---
+
 ## Backtesting
 
 ```bash
@@ -818,18 +947,26 @@ pytest                    # full suite
 pytest -v tests/test_settings.py
 ```
 
-The suite runs against synthetic bars and an in-memory database — **no API
-credentials or network access required**, so it is safe to run in CI. Tests
-cover the live-trading locks, bar normalization, the lookahead guards, cache
-coverage rules, P&L arithmetic, retry classification, CLI exit codes, and every
-indicator's maths against independently derived reference values.
+**850+ tests, `ruff check` clean.** The suite runs against synthetic bars and an
+in-memory database — **no API credentials or network access required**, so it is
+safe to run in CI. Tests cover the universe filters, the scan funnel, per-trade
+sizing, bar normalization, the lookahead guards, cache coverage rules, P&L
+arithmetic, retry classification, CLI exit codes, and every indicator's maths
+against independently derived reference values.
+
+The synthetic bars are calibrated rather than arbitrary: a generated daily bar's
+true range averages 2.54% of price, against 2.48% measured on real AAPL
+sessions. That matters more than it sounds — an earlier fixed volatility was
+right for 15-minute bars and five times too calm for daily ones, which made
+ATR-derived stops come out near 1% and read as a strategy bug that did not
+exist.
 
 | Area | File | Tests |
 |---|---|---|
 | Risk gate and portfolio state | `tests/test_risk_manager.py` | 40 |
 | Scanner scoring and ranking | `tests/test_scanner.py` | 34 |
 | Position sizing arithmetic | `tests/test_position_sizing.py` | 32 |
-| Dashboard charts, palette, pages | `tests/test_dashboard.py` | 87 |
+| Dashboard charts, palette, pages | `tests/test_dashboard.py` | 92 |
 | Strategy contract and registry | `tests/test_strategies.py` | 57 |
 | Per-strategy behaviour | `tests/test_strategy_signals.py` | 36 |
 | Backtest engine and lookahead guards | `tests/test_backtest_engine.py` | 36 |
@@ -839,24 +976,32 @@ indicator's maths against independently derived reference values.
 | Swing points and levels | `tests/test_price_action.py` | 49 |
 | Trend classification | `tests/test_trend_analysis.py` | 17 |
 | Volume analysis | `tests/test_volume_analysis.py` | 30 |
-| Phase 1 foundation and CLI | 10 further files | 186 |
+| Universe filters and discovery | `tests/test_universe.py` | 45 |
+| Market-wide sweep | `tests/test_market_scan.py` | 26 |
+| Foundation, data access and CLI | 10 further files | 196 |
 
 ---
 
 ## Roadmap
 
-| Phase | Scope | Status |
-|---|---|---|
-| 1 | Project setup, Alpaca connection, market data | **Complete** |
-| 2 | Technical indicator engine | **Complete** |
-| 3 | Strategy engine (momentum, mean reversion, breakout) | **Complete** |
-| 4 | Risk management and position sizing | **Complete** |
-| 5 | Market scanner with confidence scoring | **Complete** |
-| 6 | Backtesting engine | **Complete** |
-| 7 | Alpaca paper trading execution | Planned |
-| 8 | Position monitoring and automated exits | Planned |
-| 9 | Streamlit dashboard | **Read-only version shipped**; trade controls with Phase 7 |
-| 10 | Performance optimisation | Planned |
+The project began as a paper-trading bot and was redirected into a
+decision-support scanner: it finds and ranks entries, and a person executes
+them. Order placement and automated exits were dropped from the plan rather
+than deferred — they are not features this tool is missing.
+
+| Scope | Status |
+|---|---|
+| Project setup, market data access | **Complete** |
+| Technical indicator engine | **Complete** |
+| Strategy engine (momentum, mean reversion, breakout) | **Complete** |
+| Risk management and position sizing | **Complete** |
+| Confidence scoring and watchlist scanner | **Complete** |
+| Backtesting engine | **Complete** |
+| Universe discovery and market-wide hunt | **Complete** |
+| Dashboard (hunt, charts, backtests, settings) | **Complete** |
+| Alerts when a setup appears (email/push, scheduled scans) | Planned |
+| Tracking setups you took, to measure the scanner against reality | Planned |
+| Broker order placement | **Not planned** — you execute |
 
 ---
 

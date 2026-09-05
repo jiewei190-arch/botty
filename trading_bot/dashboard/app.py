@@ -53,7 +53,14 @@ from trading_bot.indicators import (
 from trading_bot.strategies import available_strategies
 from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES
 
-PAGES = ("Overview", "Market Scanner", "Chart", "Backtest", "Strategy Settings")
+PAGES = (
+    "Hunt",
+    "Overview",
+    "Market Scanner",
+    "Chart",
+    "Backtest",
+    "Strategy Settings",
+)
 
 
 def main() -> None:
@@ -77,7 +84,9 @@ def main() -> None:
         )
 
     page = controls["page"]
-    if page == "Overview":
+    if page == "Hunt":
+        _hunt(settings, controls, palette)
+    elif page == "Overview":
         _overview(settings, controls, palette)
     elif page == "Market Scanner":
         _scanner(settings, controls, palette)
@@ -207,6 +216,252 @@ def _metric(label: str, value: str, note: str = "") -> str:
 
 
 # -- pages -------------------------------------------------------------------
+
+
+def _hunt(settings, controls: dict, palette) -> None:
+    """Scan the whole market and show the setups worth acting on.
+
+    The centrepiece page. It reads live market data, ranks every liquid US
+    equity, and prints entry, stop, target and a share count for each survivor.
+    It places nothing — the orders are yours to work, wherever you trade.
+    """
+    st.subheader("Hunt")
+    st.caption(
+        "Scans every liquid US equity for swing setups and ranks what it finds. "
+        "Each result is a proposal with the prices to work it at — nothing is "
+        "ordered, and the score ranks candidates against each other rather than "
+        "estimating a chance of profit."
+    )
+
+    if not settings.alpaca.has_credentials:
+        st.error(
+            "**Market data credentials are missing.** Add `ALPACA_API_KEY` and "
+            "`ALPACA_SECRET_KEY` to your `.env` and restart. A free data-only "
+            "account is enough — no funding, and no order is ever placed through "
+            "it. You keep trading wherever you already do."
+        )
+        return
+
+    with st.form("hunt"):
+        first, second, third = st.columns(3)
+        strategy_names = first.multiselect(
+            "Strategies", available_strategies(), default=list(available_strategies())
+        )
+        equity = second.number_input(
+            "Account equity ($)",
+            min_value=100.0,
+            # Seeded from the sidebar so the two controls never show different
+            # balances for the same account.
+            value=float(controls.get("equity") or settings.risk.account_equity),
+            step=500.0,
+            help="The balance you actually trade. Share counts are sized from this.",
+        )
+        top_n = third.number_input("Show top", min_value=1, max_value=50, value=10, step=1)
+
+        fourth, fifth, sixth = st.columns(3)
+        min_turnover = fourth.number_input(
+            "Min turnover ($/day)",
+            min_value=0.0,
+            value=10_000_000.0,
+            step=1_000_000.0,
+            help="Price x volume. The single most effective filter for making "
+            "results actionable — a perfect setup you cannot get filled in is not "
+            "an opportunity.",
+        )
+        min_rr = fifth.number_input(
+            "Min reward:risk", min_value=1.0, max_value=10.0, value=2.0, step=0.25
+        )
+        max_age = sixth.number_input(
+            "Max signal age (bars)",
+            min_value=1, max_value=10, value=1, step=1,
+            help="A swing setup from several sessions ago has already made its "
+            "move; entering now pays for the part you missed.",
+        )
+
+        seventh, eighth, ninth = st.columns(3)
+        min_price = seventh.number_input("Min price ($)", min_value=0.0, value=5.0, step=1.0)
+        max_price = eighth.number_input("Max price ($)", min_value=10.0, value=1000.0, step=50.0)
+        risk_pct = ninth.number_input(
+            "Risk per trade (%)",
+            min_value=0.05, max_value=10.0,
+            value=float(settings.risk.max_risk_per_trade_pct), step=0.25,
+        )
+
+        include_leveraged = st.checkbox(
+            "Include leveraged and inverse ETFs",
+            value=False,
+            help="Their daily reset decays a multi-day hold, so a 3x fund does "
+            "not return 3x over a week.",
+        )
+        submitted = st.form_submit_button("Run hunt", type="primary")
+
+    if submitted:
+        if not strategy_names:
+            st.error("Choose at least one strategy.")
+            return
+        with st.spinner("Scanning the market — this takes a few minutes…"):
+            try:
+                sweep = dashboard_data.run_hunt(
+                    settings,
+                    strategies=tuple(strategy_names),
+                    equity=float(equity),
+                    risk_pct=float(risk_pct),
+                    top_n=int(top_n),
+                    min_turnover=float(min_turnover),
+                    min_price=float(min_price),
+                    max_price=float(max_price),
+                    min_risk_reward=float(min_rr),
+                    max_age=int(max_age),
+                    include_leveraged=bool(include_leveraged),
+                )
+            except Exception as error:  # noqa: BLE001 - surfaced in the UI
+                st.error(f"Hunt failed: {error}")
+                return
+        st.session_state["hunt_sweep"] = sweep
+        st.session_state["hunt_equity"] = float(equity)
+
+    sweep = st.session_state.get("hunt_sweep")
+    if sweep is None:
+        st.info(
+            "Set your filters and run a hunt. The first run downloads the market's "
+            "daily bars and takes a few minutes; later runs reuse the cache."
+        )
+        return
+
+    _hunt_results(sweep, st.session_state.get("hunt_equity", 0.0), palette)
+
+
+def _hunt_results(sweep, equity: float, palette) -> None:
+    """Render a completed sweep."""
+    columns = st.columns(4)
+    columns[0].markdown(
+        _metric("Scanned", f"{sweep.universe_size:,}", "liquid symbols"),
+        unsafe_allow_html=True,
+    )
+    columns[1].markdown(
+        _metric("Setups found", f"{len(sweep.opportunities)}", "after every filter"),
+        unsafe_allow_html=True,
+    )
+    columns[2].markdown(
+        _metric(
+            "Fit at once",
+            f"{sweep.concurrent_capacity}",
+            f"on ${equity:,.0f}" if equity else "given your limits",
+        ),
+        unsafe_allow_html=True,
+    )
+    columns[3].markdown(
+        _metric("Scan time", f"{sweep.elapsed_seconds:,.0f}s", "whole market"),
+        unsafe_allow_html=True,
+    )
+
+    if sweep.halt_reason:
+        st.error(f"Trading halted: {sweep.halt_reason}")
+
+    with st.expander("Where the symbols went"):
+        for line in sweep.summary_lines():
+            st.text(line)
+
+    if not sweep.opportunities:
+        st.info(
+            "No setups met the criteria. That is a normal outcome — most days, "
+            "most stocks are not at an entry. Loosening the reward:risk floor or "
+            "raising the maximum signal age will surface more, and worse, entries."
+        )
+        if sweep.blockers:
+            st.markdown("**Most common blockers**")
+            st.dataframe(
+                pd.DataFrame(
+                    sorted(sweep.blockers.items(), key=lambda item: -item[1])[:10],
+                    columns=["Blocked by", "Symbols"],
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+        return
+
+    st.markdown(
+        f"**Each share count assumes this is the only trade you take.** Your "
+        f"account supports about **{sweep.concurrent_capacity}** of these at "
+        "once; taking more means sizing each one smaller."
+    )
+
+    for opportunity in sweep.opportunities:
+        _entry_plan_card(opportunity, palette)
+
+    st.divider()
+    frame = sweep.as_frame()
+    with st.expander("All setups as a table"):
+        st.dataframe(frame, width="stretch", hide_index=True)
+    st.download_button(
+        "Download setups as CSV",
+        frame.to_csv(index=False),
+        file_name="hunt_setups.csv",
+        mime="text/csv",
+    )
+    st.caption(
+        "Ranked against each other, not scored for probability of profit. "
+        "Nothing on this page has been placed as an order."
+    )
+
+
+def _entry_plan_card(opportunity, palette) -> None:
+    """One setup, as a plan you could work from."""
+    signal = opportunity.signal
+    decision = opportunity.decision
+    shares = int(decision.shares) if decision else 0
+    is_long = signal.direction.value == "LONG"
+    stop_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
+    target_pct = abs(signal.take_profit - signal.entry_price) / signal.entry_price * 100
+    arrow = direction_marker(signal.direction.value)
+
+    with st.container(border=True):
+        header, badge = st.columns([4, 1])
+        # direction_marker already pairs the arrow with the word, so the
+        # direction is never carried by the glyph alone.
+        header.markdown(f"### #{opportunity.rank} · {signal.symbol} {arrow}")
+        badge.markdown(
+            confidence_bar(opportunity.confidence, palette), unsafe_allow_html=True
+        )
+        st.caption(f"{signal.strategy} · score {opportunity.confidence:.0f}/100")
+
+        plan = st.columns(4)
+        plan[0].markdown(
+            _metric(
+                "Buy" if is_long else "Short",
+                f"{shares:,}",
+                f"shares ≈ ${shares * signal.entry_price:,.0f}",
+            ),
+            unsafe_allow_html=True,
+        )
+        plan[1].markdown(
+            _metric("Entry near", f"${signal.entry_price:,.2f}", "limit order"),
+            unsafe_allow_html=True,
+        )
+        plan[2].markdown(
+            _metric("Stop", f"${signal.stop_loss:,.2f}", f"{stop_pct:.2f}% away"),
+            unsafe_allow_html=True,
+        )
+        plan[3].markdown(
+            _metric("Target", f"${signal.take_profit:,.2f}", f"{target_pct:.2f}% away"),
+            unsafe_allow_html=True,
+        )
+
+        if decision is not None and decision.approved:
+            risk = float(decision.risk_amount)
+            reward = risk * signal.risk_reward_ratio
+            st.markdown(
+                f"Risking **{_dollars(risk)}** to make **{_dollars(reward)}** "
+                f"({signal.risk_reward_ratio:.2f}:1) · sized by "
+                f"{decision.sizing.binding_constraint.description}"
+            )
+        elif decision is not None:
+            st.warning(f"Not sized — {decision.rejection_reason}")
+
+        if signal.reasons:
+            with st.expander("Why this fired"):
+                for reason in signal.reasons:
+                    st.markdown(f"- {reason}")
 
 
 def _overview(settings, controls: dict, palette) -> None:
@@ -769,6 +1024,17 @@ def _backtest(settings, controls: dict, palette) -> None:
         return
 
     _backtest_result(result, palette)
+
+
+def _dollars(value: float) -> str:
+    """Currency for a markdown context, with the dollar sign escaped.
+
+    Streamlit renders markdown, where a pair of unescaped ``$`` delimits LaTeX
+    math: "$55.10** to make **$220.39" loses both signs and italicises the words
+    between them. Anything written with st.markdown needs this; the HTML metric
+    cards do not, because they are not parsed as markdown.
+    """
+    return f"\\${abs(value):,.2f}" if value >= 0 else f"-\\${abs(value):,.2f}"
 
 
 def _money(value: float) -> str:

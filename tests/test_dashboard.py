@@ -9,6 +9,8 @@ contradicts its own meaning.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -242,7 +244,8 @@ def test_importing_the_app_does_not_launch_it():
     import trading_bot.dashboard.app as app
 
     assert callable(app.main)
-    assert app.PAGES[0] == "Overview"
+    # Hunt leads: it is what the app is for.
+    assert app.PAGES[0] == "Hunt"
 
 
 def test_the_dashboard_contains_no_order_placing_code():
@@ -369,6 +372,128 @@ def test_the_backtest_page_rejects_a_backwards_date_range(app_path):
 
     assert not app.exception
     assert any("before the end date" in str(item.value) for item in app.error)
+
+
+def _fake_sweep():
+    """A completed sweep, so the results path can be rendered without a network."""
+    from decimal import Decimal
+
+    from tests.conftest import make_bars
+    from trading_bot.risk import PortfolioState, RiskManager
+    from trading_bot.scanner.market_scan import HuntConfig, sweep_market
+    from trading_bot.strategies import build_strategy
+    from trading_bot.universe import Universe
+    from trading_bot.universe.filters import profile_liquidity
+
+    frames, profiles = {}, {}
+    for index in range(160):
+        symbol = f"S{index:03d}"
+        bars = make_bars(
+            300, seed=index, freq="1D", start_price=float(20 + (index * 17) % 300)
+        )
+        frames[symbol] = bars
+        profiles[symbol] = profile_liquidity(symbol, bars)
+
+    equity = Decimal("15000")
+    return sweep_market(
+        Universe(symbols=tuple(frames), profiles=profiles, frames=frames),
+        [build_strategy("momentum")],
+        portfolio=PortfolioState(
+            equity=equity, cash=equity, buying_power=equity
+        ),
+        risk_manager=RiskManager(),
+        config=HuntConfig(top_n=5),
+    )
+
+
+def test_the_hunt_page_asks_for_credentials_when_missing(app_path):
+    """It reads live data by design, so it must say so rather than fail oddly."""
+    app = _run(app_path, page="Hunt")
+    assert not app.exception
+    messages = " ".join(str(item.value) for item in app.error)
+    assert "ALPACA_API_KEY" in messages
+    # And it must be clear the key is for data, not for trading.
+    assert "no order is ever placed" in messages
+
+
+def test_the_hunt_page_renders_results(app_path, monkeypatch):
+    """The result cards only exist after a sweep, so rendering needs one."""
+    from streamlit.testing.v1 import AppTest
+
+    import trading_bot.dashboard.data as dashboard_data
+
+    sweep = _fake_sweep()
+    monkeypatch.setattr(
+        dashboard_data, "run_hunt", lambda *args, **kwargs: sweep, raising=False
+    )
+    monkeypatch.setattr(
+        "trading_bot.config.settings.AlpacaSettings.has_credentials",
+        property(lambda self: True),
+    )
+
+    app = AppTest.from_file(app_path, default_timeout=600)
+    app.run()
+    app.radio[0].set_value("Hunt").run()
+    assert not app.exception, f"hunt page raised: {app.exception}"
+
+    _click(app, "Run hunt").run()
+    assert not app.exception, f"running the hunt raised: {app.exception}"
+
+    rendered = " ".join(str(item.value) for item in app.markdown)
+    assert "Scanned" in rendered
+    assert "Setups found" in rendered
+    # Per-trade sizing must never imply every setup can be taken at once.
+    if sweep.opportunities:
+        assert "only trade you take" in rendered
+        assert "Entry near" in rendered
+        assert "Stop" in rendered
+        assert "Target" in rendered
+
+
+def test_the_hunt_page_never_claims_a_probability(app_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    import trading_bot.dashboard.data as dashboard_data
+
+    sweep = _fake_sweep()
+    monkeypatch.setattr(
+        dashboard_data, "run_hunt", lambda *args, **kwargs: sweep, raising=False
+    )
+    monkeypatch.setattr(
+        "trading_bot.config.settings.AlpacaSettings.has_credentials",
+        property(lambda self: True),
+    )
+    app = AppTest.from_file(app_path, default_timeout=600)
+    app.run()
+    app.radio[0].set_value("Hunt").run()
+    _click(app, "Run hunt").run()
+
+    text = " ".join(str(item.value) for item in app.caption)
+    text += " ".join(str(item.value) for item in app.markdown)
+    if sweep.opportunities:
+        assert "not scored for probability" in text or "rather than estimating" in text
+
+
+def test_currency_in_markdown_escapes_the_dollar_sign():
+    """Streamlit parses markdown, where a pair of $ delimits LaTeX math.
+
+    "Risking $55.10 to make $220.39" rendered as "Risking 55.10 *to make* 220.39":
+    both signs consumed as delimiters and the words between them italicised.
+    """
+    from trading_bot.dashboard.app import _dollars
+
+    assert _dollars(55.10) == r"\$55.10"
+    assert _dollars(-220.39) == r"-\$220.39"
+    assert _dollars(1234.5) == r"\$1,234.50"
+
+
+def test_the_direction_marker_is_not_doubled_up(app_path):
+    """direction_marker already pairs the arrow with the word."""
+    from trading_bot.dashboard.theme import direction_marker
+
+    source = Path(app_path).read_text()
+    assert "{arrow} {signal.direction.value}" not in source
+    assert direction_marker("LONG") == "\u25b2 LONG"
 
 
 def test_the_app_uses_no_deprecated_streamlit_apis(app_path):

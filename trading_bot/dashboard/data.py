@@ -27,7 +27,7 @@ from trading_bot.config.settings import Settings, TradingMode, load_settings
 from trading_bot.data.database import Database
 from trading_bot.data.market_data import build_market_data, drop_incomplete_bars
 from trading_bot.indicators import IndicatorConfig, calculate_all_indicators
-from trading_bot.risk import RiskManager, build_portfolio_state
+from trading_bot.risk import PortfolioState, RiskManager, build_portfolio_state
 from trading_bot.scanner import MarketScanner, ScannerConfig
 from trading_bot.strategies import build_strategy, explain_blockers
 from trading_bot.utils.timeframes import Timeframe
@@ -41,6 +41,11 @@ FETCH_TTL = 60
 #: Backtest results are cached longer than quotes: the inputs are historical
 #: and settled, so a result only changes when the request does.
 BACKTEST_TTL = 900
+
+#: A market-wide hunt is the most expensive thing this app does — minutes of
+#: network time. Streamlit reruns the script on every widget interaction, so
+#: without a cache, expanding a section would restart the scan.
+HUNT_TTL = 900
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,3 +328,56 @@ def backtest_frames(
     except Exception:  # noqa: BLE001 - charts are optional, the result is not
         logger.exception("Could not reload frames for the backtest charts")
         return {}
+
+
+@st.cache_data(ttl=HUNT_TTL, show_spinner=False, hash_funcs={Settings: id})
+def run_hunt(
+    _settings: Settings,
+    *,
+    strategies: tuple[str, ...],
+    equity: float,
+    risk_pct: float,
+    top_n: int,
+    min_turnover: float,
+    min_price: float,
+    max_price: float,
+    min_risk_reward: float,
+    max_age: int,
+    include_leveraged: bool,
+):
+    """Discover the universe and sweep it, cached on the parameters.
+
+    A market-wide sweep takes minutes, and Streamlit reruns the whole script on
+    every widget interaction. Without caching, opening an expander would start
+    the scan again.
+    """
+    from trading_bot.risk.position_sizing import to_decimal
+    from trading_bot.scanner.market_scan import HuntConfig, sweep_market
+    from trading_bot.strategies import build_strategy
+    from trading_bot.universe import AssetCatalogue, UniverseFilter, build_universe
+
+    filters = UniverseFilter(
+        min_price=min_price,
+        max_price=max_price,
+        min_dollar_volume=min_turnover,
+        exclude_leveraged=not include_leveraged,
+    )
+    provider = build_market_data(_settings.alpaca, _settings.data)
+    catalogue = AssetCatalogue(_settings.alpaca, cache_dir=_settings.data.cache_dir)
+    universe = build_universe(catalogue, provider, filters)
+
+    amount = to_decimal(equity)
+    portfolio = PortfolioState(equity=amount, cash=amount, buying_power=amount)
+    risk = _settings.risk.model_copy(update={"max_risk_per_trade_pct": risk_pct})
+
+    return sweep_market(
+        universe,
+        [build_strategy(name) for name in strategies],
+        portfolio=portfolio,
+        risk_manager=RiskManager(risk),
+        config=HuntConfig(
+            top_n=top_n,
+            min_risk_reward=min_risk_reward,
+            max_signal_age_bars=max_age,
+        ),
+    )
