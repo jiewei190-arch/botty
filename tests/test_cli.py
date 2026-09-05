@@ -156,3 +156,45 @@ def test_signals_confidence_override_is_accepted(capsys):
 def test_signals_without_credentials_fails_cleanly(capsys):
     assert main(["signals", "--symbols", "AAPL"]) == EXIT_FAILURE
     assert "credentials are missing" in capsys.readouterr().err
+
+
+# -- Phase 5: scan ----------------------------------------------------------------
+
+
+def test_scan_demo_runs_without_credentials(capsys):
+    assert main(["scan", "--demo", "--symbols", "AAPL", "--min-dollar-volume", "0"]) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "MARKET SCAN" in output
+    assert "NOT REAL MARKET DATA" in output
+
+
+def test_scan_ranks_and_scores(capsys):
+    main(["scan", "--demo", "--symbols", "AAPL,AMZN", "--bars", "405",
+          "--min-dollar-volume", "0"])
+    output = capsys.readouterr().out
+    if "Confidence:" in output:
+        assert "Score breakdown" in output
+        assert "Suggested Entry" in output
+        assert "Risk/Reward" in output
+
+
+def test_scan_reports_liquidity_filtering(capsys):
+    """A high turnover floor should filter the demo symbols out."""
+    main(["scan", "--demo", "--symbols", "AAPL", "--min-dollar-volume", "1e12"])
+    assert "Filtered out before analysis" in capsys.readouterr().out
+
+
+def test_scan_rejects_an_unknown_strategy(capsys):
+    assert main(["scan", "--demo", "--strategy", "nonsense"]) == EXIT_FAILURE
+    assert "Unknown strategy" in capsys.readouterr().err
+
+
+def test_scan_without_credentials_fails_cleanly(capsys):
+    assert main(["scan", "--symbols", "AAPL"]) == EXIT_FAILURE
+    assert "credentials are missing" in capsys.readouterr().err
+
+
+def test_scan_caps_results(capsys):
+    main(["scan", "--demo", "--bars", "405", "--top", "1", "--min-dollar-volume", "0"])
+    output = capsys.readouterr().out
+    assert output.count("Direction:") <= 1

@@ -22,6 +22,7 @@ from trading_bot.data.database import Database
 from trading_bot.data.market_data import build_market_data, drop_incomplete_bars
 from trading_bot.indicators import IndicatorConfig, calculate_all_indicators
 from trading_bot.risk import RiskManager, build_portfolio_state
+from trading_bot.scanner import MarketScanner, ScannerConfig
 from trading_bot.strategies import build_strategy, explain_blockers
 from trading_bot.utils.timeframes import Timeframe
 
@@ -209,6 +210,49 @@ def evaluate_risk(
     manager = RiskManager(settings.risk)
     halt = manager.trading_halted(portfolio)
     return manager.evaluate_many(signals, portfolio), portfolio, halt
+
+
+def run_ranked_scan(
+    symbols: list[str],
+    strategy_names: list[str],
+    timeframe_label: str,
+    bars: int,
+    demo: bool,
+    settings: Settings,
+    indicators: IndicatorConfig,
+    *,
+    equity: float | None = None,
+    overrides: dict[str, Any] | None = None,
+    min_dollar_volume: float = 0.0,
+):
+    """Fetch, scan and rank the watchlist.
+
+    Returns the scanner's own :class:`~trading_bot.scanner.ScanResult` plus the
+    portfolio it was sized against, so the page can show both.
+    """
+    frames: dict[str, pd.DataFrame] = {}
+    failures: dict[str, str] = {}
+    for symbol in symbols:
+        loaded = load_symbol(symbol, timeframe_label, bars, demo, settings, indicators)
+        if loaded.ok:
+            frames[symbol] = loaded.frame
+        else:
+            failures[symbol] = loaded.error or "no data"
+
+    portfolio = portfolio_for(settings, equity)
+    strategies = [
+        build_strategy(name, indicators=indicators, **(overrides or {}))
+        for name in strategy_names
+    ]
+    scanner = MarketScanner(
+        strategies,
+        indicators=indicators,
+        risk_manager=RiskManager(settings.risk),
+        config=ScannerConfig(min_avg_dollar_volume=min_dollar_volume),
+    )
+    result = scanner.scan(frames, portfolio=portfolio)
+    result.failures.update(failures)
+    return result, portfolio
 
 
 def account_snapshot(settings: Settings) -> tuple[Any | None, str | None]:

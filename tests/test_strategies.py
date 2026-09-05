@@ -465,3 +465,78 @@ def test_a_registered_strategy_becomes_buildable():
         from trading_bot.strategies import STRATEGY_REGISTRY
 
         STRATEGY_REGISTRY.pop("custom_test_strategy", None)
+
+
+# ============================================================================
+# Stop distance floor
+# ============================================================================
+
+
+def test_a_structural_stop_is_floored_at_a_minimum_atr(strategy):
+    """A stop inside the noise is not a stop.
+
+    A structural level can sit a few cents from the entry. Left alone, that
+    produces a stop an ordinary bar would take out, while inflating both
+    reward:risk and — because sizing divides by the stop distance — position
+    size. Found by reading a scan that showed 11.6:1 on a stop 0.26 ATR wide,
+    where 98% of recent bars had a range wider than the whole stop.
+    """
+    from trading_bot.indicators import Level, SupportResistance
+
+    atr = 2.0
+    # Support one cent below the entry: a naive structural stop would be ~1 cent.
+    levels = SupportResistance(
+        price=100.0,
+        support=(Level(price=99.99, touches=3, last_touch_index=10, kind="support"),),
+        resistance=(),
+        swing_points=(),
+    )
+    stop, _, notes = strategy.build_exits(
+        SignalDirection.LONG, 100.0, atr=atr, levels=levels
+    )
+    distance = 100.0 - stop
+    assert distance >= atr * strategy.config.min_stop_atr - 1e-9
+    assert any("inside the noise" in note for note in notes)
+
+
+def test_the_floor_does_not_widen_an_already_sensible_stop(strategy):
+    stop, _, notes = strategy.build_exits(SignalDirection.LONG, 100.0, atr=1.0)
+    assert 100.0 - stop == pytest.approx(strategy.config.atr_stop_multiplier)
+    assert not any("inside the noise" in note for note in notes)
+
+
+def test_the_floor_applies_to_shorts_too(strategy):
+    from trading_bot.indicators import Level, SupportResistance
+
+    levels = SupportResistance(
+        price=100.0,
+        support=(),
+        resistance=(Level(price=100.01, touches=2, last_touch_index=5, kind="resistance"),),
+        swing_points=(),
+    )
+    stop, _, _ = strategy.build_exits(
+        SignalDirection.SHORT, 100.0, atr=2.0, levels=levels
+    )
+    assert stop - 100.0 >= 2.0 * strategy.config.min_stop_atr - 1e-9
+
+
+def test_the_floor_caps_runaway_reward_to_risk(strategy):
+    """The inflated ratio was the visible symptom of the real problem."""
+    from trading_bot.indicators import Level, SupportResistance
+
+    levels = SupportResistance(
+        price=100.0,
+        support=(Level(price=99.99, touches=3, last_touch_index=10, kind="support"),),
+        resistance=(),
+        swing_points=(),
+    )
+    stop, target, _ = strategy.build_exits(
+        SignalDirection.LONG, 100.0, atr=2.0, levels=levels
+    )
+    assert (target - 100.0) / (100.0 - stop) < 10
+
+
+def test_min_stop_atr_is_configurable_and_validated():
+    assert StrategyConfig(min_stop_atr=0.0).min_stop_atr == 0.0
+    with pytest.raises(ValueError, match="min_stop_atr"):
+        StrategyConfig(min_stop_atr=-1.0)

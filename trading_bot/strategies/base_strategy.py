@@ -327,6 +327,12 @@ class StrategyConfig:
     max_structure_distance_atr: float = 2.0
     #: Extra buffer beyond a structural level, as a fraction of ATR.
     structure_buffer_atr: float = 0.25
+    #: Floor on the stop distance, in ATR. A stop closer than this sits inside a
+    #: single bar's ordinary range and will be hit by noise rather than by the
+    #: trade being wrong. It also inflates reward:risk and, because position size
+    #: divides by the stop distance, inflates the position — a tight stop is not
+    #: a free lunch, it is a smaller edge taken in larger size.
+    min_stop_atr: float = 0.75
     allow_long: bool = True
     allow_short: bool = False
     #: Close a position after this many bars, or None to hold indefinitely.
@@ -341,6 +347,8 @@ class StrategyConfig:
             raise ValueError(
                 f"atr_stop_multiplier must be > 0, got {self.atr_stop_multiplier}"
             )
+        if self.min_stop_atr < 0:
+            raise ValueError(f"min_stop_atr must be >= 0, got {self.min_stop_atr}")
         if self.atr_target_multiplier <= 0:
             raise ValueError(
                 f"atr_target_multiplier must be > 0, got {self.atr_target_multiplier}"
@@ -574,6 +582,12 @@ class BaseStrategy(ABC):
            stock gets a tight stop and a volatile one gets room.
         3. ``fallback_stop_pct`` percent, only while ATR is warming up.
 
+        Whichever is chosen is then floored at ``min_stop_atr`` ATRs. A structural
+        level can sit a few cents from the entry, and a stop that close is inside
+        the noise: it gets hit by an ordinary bar, while the arithmetic makes the
+        trade look better than it is — reward:risk is inflated, and position size,
+        which divides by the stop distance, is inflated with it.
+
         The target is ``atr_target_multiplier`` ATRs away, then widened if needed
         so reward:risk is never below ``min_risk_reward``. That makes the ratio a
         structural guarantee rather than something to filter for later.
@@ -598,6 +612,15 @@ class BaseStrategy(ABC):
         else:
             risk = entry_price * self.config.fallback_stop_pct / 100
             notes.append("ATR unavailable — using a percentage stop")
+
+        if atr is not None and atr > 0:
+            floor = atr * self.config.min_stop_atr
+            if risk < floor:
+                notes.append(
+                    f"Stop widened to {self.config.min_stop_atr:.2f} ATR — "
+                    "closer than that is inside the noise"
+                )
+                risk = floor
 
         # Never let a degenerate stop through; it would divide sizing by ~zero.
         risk = max(risk, entry_price * 0.0005)

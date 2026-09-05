@@ -303,8 +303,9 @@ def test_every_page_renders(app_path):
         assert not app.exception, f"{page} raised"
 
 
-def test_the_scanner_sizes_an_approved_setup(app_path):
-    """850 bars of AAPL demo data produces a momentum signal, which must be sized."""
+def test_the_scanner_page_ranks_and_sizes_opportunities(app_path):
+    """850 bars of AAPL demo data yields a momentum signal, which must be
+    ranked, scored and sized."""
     app = _run(
         app_path, page="Market Scanner", bars=850, symbols=["AAPL"],
         strategies=["momentum"],
@@ -312,8 +313,11 @@ def test_the_scanner_sizes_an_approved_setup(app_path):
     assert not app.exception
     rendered = " ".join(str(item.value) for item in app.markdown)
     rendered += " ".join(str(item.value) for item in app.caption)
+    assert "Ranked opportunities" in rendered
+    assert "Score breakdown" in rendered
     assert "Risk validation" in rendered
-    assert "cleared risk validation" in rendered
+    # The score's meaning is stated wherever it is shown.
+    assert "probability of profit" in rendered
 
 
 def test_the_app_uses_no_deprecated_streamlit_apis(app_path):

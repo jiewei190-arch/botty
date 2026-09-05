@@ -4,10 +4,11 @@ A modular, risk-first trading bot for US equities. Built to **test ideas safely*
 backtest a strategy on historical data, then paper trade it against a live market
 feed, with real-money trading locked behind two explicit switches.
 
-> **Status: Phases 1-4 of 10 complete, plus a read-only dashboard.** Foundation,
-> data, analysis, strategies and risk management are built and tested, with a
-> Streamlit dashboard to look at them. Backtesting and paper trading follow, and
-> the dashboard grows trade controls with them (see the [roadmap](#roadmap)).
+> **Status: Phases 1-5 of 10 complete, plus a read-only dashboard.** Foundation,
+> data, analysis, strategies, risk management and the scanner are built and
+> tested, with a Streamlit dashboard to look at them. Backtesting and paper
+> trading follow, and the dashboard grows trade controls with them (see the
+> [roadmap](#roadmap)).
 
 ---
 
@@ -79,6 +80,9 @@ botty/
 │   │   ├── risk_manager.py          The gate: nine limits, explicit verdicts
 │   │   ├── position_sizing.py       Size from stop distance, four caps
 │   │   └── portfolio.py             The state the limits are judged against
+│   ├── scanner/
+│   │   ├── scanner.py               Filter, find, score, size, rank
+│   │   └── scoring.py               Seven direction-aware factors
 │   ├── backtesting/              Phase 6
 │   ├── dashboard/
 │   │   ├── app.py                   Streamlit app (read-only)
@@ -86,7 +90,7 @@ botty/
 │   │   ├── theme.py                 Validated palette, light and dark
 │   │   └── data.py                  Cached data access for the UI
 │   └── main.py                   CLI
-├── tests/                        558 tests, no credentials required
+├── tests/                        603 tests, no credentials required
 ├── logs/                         Runtime logs (gitignored)
 ├── storage/                      SQLite database + parquet cache (gitignored)
 ├── main.py                       Launcher
@@ -156,6 +160,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py cache` | Inspect (`--clear` to empty) the bar cache |
 | `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
 | `python main.py signals` | Run strategies and report trade setups (Phase 3) |
+| `python main.py scan` | Rank the watchlist by trade confidence (Phase 5) |
 | `python main.py dashboard` | Launch the Streamlit dashboard |
 
 Global flags: `--mode {backtest,paper,live}` and `--log-level {DEBUG,INFO,WARNING,ERROR}`.
@@ -339,6 +344,81 @@ red, contradicting the app's own colour meaning.
 
 Light or dark is set by `theme.base` in `.streamlit/config.toml`, and the chart
 palette reads that same value, so the chrome and the charts cannot disagree.
+
+---
+
+## The market scanner
+
+```bash
+python main.py scan --demo --bars 405 --min-dollar-volume 0
+```
+
+```
+#1  AAPL
+Direction: LONG
+Confidence: 78/100
+
+Score breakdown:
+  risk_reward     100  ██████████  1:4.00 reward to risk
+  trend            81  ████████    STRONG_BULLISH at 85/100 (agreement 88)
+  momentum        100  ██████████  MACD bullish, histogram increasing
+  conviction       85  ████████    momentum fired at 85/100
+  rsi_headroom    100  ██████████  RSI 58.0 — room to run
+  volume           67  ███████     1.08x average, confirming the move
+  structure        29  ███         0.9 ATR of room to resistance at 118.38
+
+Suggested Entry : $117.31
+Stop Loss       : $116.37  (0.80% away)
+Take Profit     : $121.08
+Risk/Reward     : 1:4.00
+Position Size   : 6 shares (risking $5.66)
+Risk Validation : PASSED — limited by maximum position size
+```
+
+### Why re-score at all?
+
+**A strategy's own confidence is not comparable across strategies.** Momentum
+reporting 80 means "80% of momentum's evidence is present"; mean reversion
+reporting 80 means 80% of a completely different checklist. Sorting a mixed list
+by those numbers ranks the checklists, not the opportunities.
+
+So every candidate is scored again on a **common yardstick** measured from the
+market rather than from the strategy that found it. Seven factors, each 0-100,
+each answering the same question: *how much does this support a trade in this
+direction?*
+
+| Factor | Weight | Reads |
+|---|---|---|
+| Trend | 0.20 | Direction and strength, damped by component agreement |
+| Risk / reward | 0.17 | What the setup pays for what it risks (saturates at 4:1) |
+| Momentum | 0.15 | MACD state and whether it is building |
+| Conviction | 0.15 | The strategy's own confidence |
+| Volume | 0.13 | Participation, and whether it confirms the move |
+| Structure | 0.10 | Room to the nearest level in the way |
+| RSI headroom | 0.10 | How far from exhaustion the move is |
+
+Every factor is direction-aware — a strongly bullish trend scores near 100 for a
+long and near 0 for a short. Factors without data are dropped and the remaining
+weights renormalised, so a short history reduces the evidence rather than
+scoring a missing input as zero.
+
+**The score ranks opportunities against each other. It is not a probability of
+profit.**
+
+### Order of operations
+
+1. **Filter** — drop symbols too illiquid to trade before spending analysis on
+   them. A perfect setup in something trading 4,000 shares a day is not an
+   opportunity.
+2. **Find** — every strategy evaluates every surviving symbol.
+3. **Score** — on the common yardstick.
+4. **Size** — the risk manager approves or rejects, working down the *ranked*
+   order so scarce position slots reach the best candidates.
+5. **Rank** — best first.
+
+Risk runs *after* scoring, so a rejected opportunity still appears with its score
+and the reason it was refused. A scanner that silently dropped everything the
+limits blocked would leave you unable to tell a quiet market from a mis-set limit.
 
 ---
 
@@ -633,6 +713,7 @@ indicator's maths against independently derived reference values.
 | Area | File | Tests |
 |---|---|---|
 | Risk gate and portfolio state | `tests/test_risk_manager.py` | 40 |
+| Scanner scoring and ranking | `tests/test_scanner.py` | 35 |
 | Position sizing arithmetic | `tests/test_position_sizing.py` | 32 |
 | Dashboard charts, palette, pages | `tests/test_dashboard.py` | 59 |
 | Strategy contract and registry | `tests/test_strategies.py` | 52 |
@@ -653,7 +734,7 @@ indicator's maths against independently derived reference values.
 | 2 | Technical indicator engine | **Complete** |
 | 3 | Strategy engine (momentum, mean reversion, breakout) | **Complete** |
 | 4 | Risk management and position sizing | **Complete** |
-| 5 | Market scanner with confidence scoring | Planned |
+| 5 | Market scanner with confidence scoring | **Complete** |
 | 6 | Backtesting engine | Planned |
 | 7 | Alpaca paper trading execution | Planned |
 | 8 | Position monitoring and automated exits | Planned |

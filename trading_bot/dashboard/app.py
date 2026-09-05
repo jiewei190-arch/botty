@@ -133,6 +133,14 @@ def _sidebar(settings) -> dict:
         min_confidence = st.slider("Minimum confidence", 0, 100, 55, step=5)
         allow_short = st.checkbox("Allow short signals", value=False)
 
+        min_dollar_volume = st.number_input(
+            "Minimum average turnover ($)",
+            min_value=0.0,
+            value=0.0,
+            step=250_000.0,
+            help="Skip symbols that trade less than this per bar on average.",
+        )
+
         st.divider()
         st.markdown("**Risk sizing**")
         equity = st.number_input(
@@ -158,6 +166,7 @@ def _sidebar(settings) -> dict:
         "min_confidence": float(min_confidence),
         "allow_short": allow_short,
         "equity": equity,
+        "min_dollar_volume": min_dollar_volume,
     }
 
 
@@ -333,9 +342,10 @@ def _watchlist_table(settings, controls: dict, palette) -> None:
 def _scanner(settings, controls: dict, palette) -> None:
     st.subheader("Market Scanner")
     st.caption(
-        f"Running {len(controls['strategies'])} strateg"
-        f"{'ies' if len(controls['strategies']) != 1 else 'y'} across "
-        f"{len(controls['symbols'])} symbol(s) on {controls['timeframe']} bars."
+        f"Ranking {len(controls['symbols'])} symbol(s) with "
+        f"{len(controls['strategies'])} strateg"
+        f"{'ies' if len(controls['strategies']) != 1 else 'y'} on "
+        f"{controls['timeframe']} bars."
     )
 
     overrides: dict = {"min_confidence": controls["min_confidence"]}
@@ -343,7 +353,7 @@ def _scanner(settings, controls: dict, palette) -> None:
         overrides["allow_short"] = True
 
     with st.spinner("Scanning…"):
-        signals, blockers, failures = dashboard_data.run_scan(
+        result, portfolio = dashboard_data.run_ranked_scan(
             controls["symbols"],
             controls["strategies"],
             controls["timeframe"],
@@ -351,56 +361,171 @@ def _scanner(settings, controls: dict, palette) -> None:
             controls["demo"],
             settings,
             _indicator_config(controls),
-            overrides,
+            equity=controls.get("equity"),
+            overrides=overrides,
+            min_dollar_volume=controls.get("min_dollar_volume", 0.0),
         )
 
-    decisions: list = []
-    halt: str | None = None
-    if signals:
-        decisions, portfolio, halt = dashboard_data.evaluate_risk(
-            signals, settings, equity=controls.get("equity")
-        )
-        if halt:
-            st.error(f"**Trading halted** — {halt}", icon="🛑")
-        approved = sum(1 for decision in decisions if decision.approved)
-        st.caption(
-            f"Sizing against ${float(portfolio.equity):,.2f} equity · "
-            f"{portfolio.open_count} open position(s) · "
-            f"risking {settings.risk.max_risk_per_trade_pct:.2f}% per trade · "
-            f"**{approved} of {len(signals)} cleared risk validation**"
-        )
+    if result.halt_reason:
+        st.error(f"**Trading halted** — {result.halt_reason}", icon="🛑")
 
-    by_signal = {id(decision.signal): decision for decision in decisions}
+    st.caption(
+        f"{result.summary()} · sizing against ${float(portfolio.equity):,.2f} equity"
+    )
 
-    if not signals:
+    if not result.opportunities:
         st.info(
-            "No setups met the entry criteria on the latest bar. That is the normal "
+            "No opportunities scored above the threshold. That is the normal "
             "outcome — every strategy requires several conditions to align at once."
         )
-        if blockers:
+        if result.blockers:
             st.markdown("##### Why not")
             st.caption(
                 "An idle bot with no explanation is indistinguishable from a broken "
                 "one. These are the conditions that blocked an entry."
             )
-            blocked = pd.DataFrame(
-                sorted(blockers.items(), key=lambda item: -item[1]),
-                columns=["Condition", "Times blocked"],
+            st.dataframe(
+                pd.DataFrame(
+                    sorted(result.blockers.items(), key=lambda item: -item[1]),
+                    columns=["Condition", "Times blocked"],
+                ),
+                width="stretch",
+                hide_index=True,
             )
-            st.dataframe(blocked, width="stretch", hide_index=True)
     else:
-        st.success(f"{len(signals)} setup(s) found.")
-        for signal in signals:
-            _signal_card(signal, palette, by_signal.get(id(signal)))
+        st.markdown("##### Ranked opportunities")
+        table = pd.DataFrame(
+            [
+                {
+                    "#": item.rank,
+                    "Symbol": item.symbol,
+                    "Dir": item.signal.direction.value,
+                    "Strategy": item.signal.strategy,
+                    "Score": item.confidence,
+                    "Entry": item.signal.entry_price,
+                    "R:R": item.signal.risk_reward_ratio,
+                    "Qty": item.quantity,
+                    "Status": "Tradable" if item.tradable else (
+                        item.rejection_reason or "not sized"
+                    ),
+                }
+                for item in result.opportunities
+            ]
+        )
+        st.dataframe(
+            table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Trade confidence", min_value=0, max_value=100, format="%.0f"
+                ),
+                "Entry": st.column_config.NumberColumn(format="$%.2f"),
+                "R:R": st.column_config.NumberColumn(format="1:%.2f"),
+            },
+        )
+        st.caption(
+            "The score ranks these against each other on one common yardstick, so "
+            "candidates from different strategies are comparable. It is **not** a "
+            "probability of profit."
+        )
+        for opportunity in result.opportunities:
+            _opportunity_card(opportunity, palette)
 
-    if failures:
-        st.warning("Not scanned: " + ", ".join(f"{k} ({v})" for k, v in failures.items()))
+    if result.skipped:
+        with st.expander(f"Filtered out before analysis ({len(result.skipped)})"):
+            for symbol, reason in result.skipped.items():
+                st.markdown(f"- **{symbol}** — {reason}")
+    if result.failures:
+        st.warning(
+            "Not scanned: "
+            + ", ".join(f"{key} ({reason})" for key, reason in result.failures.items())
+        )
 
     st.divider()
     st.caption(
         "These are sized proposals, not orders. Nothing here can place a trade — "
         "order placement arrives in Phase 7."
     )
+
+
+def _opportunity_card(opportunity, palette) -> None:
+    """One ranked opportunity, with its score breakdown."""
+    signal = opportunity.signal
+    with st.container(border=True):
+        header, meter = st.columns([3, 2])
+        header.markdown(
+            f"### #{opportunity.rank} &nbsp; {signal.symbol} &nbsp; "
+            f'<span class="pill">{direction_marker(signal.direction.value)}</span> '
+            f'<span class="pill">{signal.strategy}</span>',
+            unsafe_allow_html=True,
+        )
+        meter.markdown("**Trade confidence**")
+        meter.markdown(
+            confidence_bar(opportunity.confidence, palette), unsafe_allow_html=True
+        )
+
+        columns = st.columns(4)
+        columns[0].markdown(_metric("Entry", f"${signal.entry_price:,.2f}"),
+                            unsafe_allow_html=True)
+        columns[1].markdown(
+            _metric("Stop", f"${signal.stop_loss:,.2f}",
+                    f"{signal.stop_distance_pct:.2f}% away"),
+            unsafe_allow_html=True,
+        )
+        columns[2].markdown(_metric("Target", f"${signal.take_profit:,.2f}"),
+                            unsafe_allow_html=True)
+        columns[3].markdown(
+            _metric("Reward : risk", f"1:{signal.risk_reward_ratio:.2f}"),
+            unsafe_allow_html=True,
+        )
+
+        decision = opportunity.decision
+        if decision is not None and decision.approved:
+            st.markdown(
+                f"**Risk validation: PASSED** — {decision.shares} share(s), risking "
+                f"${float(decision.risk_amount):,.2f} "
+                f"(${float(decision.position_value):,.2f} position). "
+                f"Limited by {decision.sizing.binding_constraint.description}."
+            )
+        elif decision is not None:
+            st.warning(
+                f"**Risk validation: REJECTED** — {decision.rejection_reason}",
+                icon="⚠️",
+            )
+
+        weakest = opportunity.weakest_factor()
+        if weakest is not None and weakest.score < 40:
+            st.caption(f"⚠️ Weakest factor — **{weakest.name}**: {weakest.detail}")
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Score breakdown**")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"Factor": f.name, "Score": f.score, "Detail": f.detail}
+                        for f in sorted(opportunity.factors, key=lambda x: -x.contribution)
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Score": st.column_config.ProgressColumn(
+                        "Score", min_value=0, max_value=100, format="%.0f"
+                    )
+                },
+            )
+        with right:
+            if opportunity.reasons:
+                st.markdown("**Why the setup**")
+                for reason in opportunity.reasons:
+                    st.markdown(f"- {reason}")
+            if decision is not None:
+                with st.expander("Risk checks"):
+                    for check in decision.checks:
+                        mark = "✅" if check.passed else "❌"
+                        st.markdown(f"{mark} **{check.name}** — {check.detail}")
 
 
 def _signal_card(signal, palette, decision=None) -> None:

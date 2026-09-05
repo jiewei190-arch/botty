@@ -20,6 +20,10 @@ Phase 3 adds::
 
 Phase 4 adds risk validation and position sizing to ``signals``.
 
+Phase 5 adds::
+
+    python main.py scan            # rank the watchlist by trade confidence
+
 Later phases add ``scan``, ``backtest``, ``run`` and ``dashboard``.
 """
 
@@ -66,6 +70,7 @@ from trading_bot.indicators import (
     rsi_column,
 )
 from trading_bot.risk import RiskManager, build_portfolio_state
+from trading_bot.scanner import MarketScanner, ScannerConfig
 from trading_bot.strategies import (
     StrategyError,
     available_strategies,
@@ -175,6 +180,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report raw signals without risk validation or sizing.",
     )
+
+    scan = subparsers.add_parser(
+        "scan", help="Rank watchlist opportunities by trade confidence."
+    )
+    scan.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
+    scan.add_argument(
+        "--strategy", default="all",
+        help=f"Strategy name, comma-separated list, or 'all'. "
+        f"Available: {', '.join(available_strategies())}",
+    )
+    scan.add_argument("--timeframe", default=None, help="Bar size (default: DATA_TIMEFRAME).")
+    scan.add_argument("--bars", type=int, default=None, help="Bars of history to use.")
+    scan.add_argument(
+        "--min-score", type=float, default=0.0, help="Only show scores at or above this."
+    )
+    scan.add_argument("--top", type=int, default=None, help="Show only the top N.")
+    scan.add_argument(
+        "--min-dollar-volume", type=float, default=1_000_000.0,
+        help="Skip symbols whose average turnover is below this (default 1,000,000).",
+    )
+    scan.add_argument(
+        "--equity", type=float, default=None, help="Account equity to size against."
+    )
+    scan.add_argument("--allow-short", action="store_true", help="Permit short signals.")
+    scan.add_argument(
+        "--demo", action="store_true", help="Use generated sample data — no API keys needed."
+    )
+    scan.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
 
     dashboard = subparsers.add_parser(
         "dashboard", help="Launch the Streamlit monitoring dashboard."
@@ -859,6 +892,147 @@ def _portfolio_for_sizing(settings: Settings, args: argparse.Namespace):
     return state
 
 
+def cmd_scan(settings: Settings, args: argparse.Namespace) -> int:
+    """Rank watchlist opportunities by trade confidence.
+
+    Reports opportunities in ranked order with the factors behind each score.
+    Places nothing — order placement arrives in Phase 7.
+    """
+    symbols = (
+        [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else list(settings.data.watchlist)
+    )
+    timeframe = Timeframe.parse(args.timeframe or settings.data.timeframe)
+
+    names = (
+        available_strategies()
+        if args.strategy.strip().lower() == "all"
+        else [item.strip() for item in args.strategy.split(",") if item.strip()]
+    )
+    overrides: dict[str, object] = {"allow_short": True} if args.allow_short else {}
+    try:
+        strategies = [build_strategy(name, **overrides) for name in names]
+    except StrategyError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    warmup = max(strategy.min_bars for strategy in strategies)
+    bars_wanted = args.bars or max(settings.data.lookback_bars, warmup + 50)
+
+    frames, failures = _load_bars(settings, args, symbols, timeframe, bars_wanted)
+    if not frames:
+        print("No data to scan. Check credentials, symbols and timeframe.")
+        return EXIT_FAILURE
+
+    portfolio = _portfolio_for_sizing(settings, args)
+    scanner = MarketScanner(
+        strategies,
+        risk_manager=RiskManager(settings.risk),
+        config=ScannerConfig(
+            min_avg_dollar_volume=args.min_dollar_volume,
+            min_confidence=args.min_score,
+            max_results=args.top,
+        ),
+    )
+    result = scanner.scan(frames, portfolio=portfolio)
+    result.failures.update(failures)
+
+    width = 72
+    print()
+    print("=" * width)
+    print(f"MARKET SCAN — {timeframe.label} bars")
+    print("=" * width)
+    print(result.summary())
+    print(
+        f"Sizing against ${float(portfolio.equity):,.2f} equity · "
+        f"{portfolio.open_count} open position(s)"
+    )
+    if result.halt_reason:
+        print(f"\n*** TRADING HALTED: {result.halt_reason} ***")
+
+    if not result.opportunities:
+        print("\nNo opportunities scored above the threshold.")
+        if result.blockers:
+            print("\nMost common blockers:")
+            for name, count in sorted(
+                result.blockers.items(), key=lambda item: -item[1]
+            )[:8]:
+                print(f"  {count:>3}x  {name}")
+    for opportunity in result.opportunities:
+        _render_opportunity(opportunity, width)
+
+    if result.opportunities:
+        print("\n" + "=" * width)
+        print(f"{'#':<3}{'SYMBOL':<8}{'DIR':<6}{'STRATEGY':<15}{'SCORE':>6}"
+              f"{'QTY':>6}{'R:R':>7}  STATUS")
+        print("-" * width)
+        for opportunity in result.opportunities:
+            status = "TRADABLE" if opportunity.tradable else (
+                (opportunity.rejection_reason or "not sized")[:24]
+            )
+            print(
+                f"{opportunity.rank:<3}{opportunity.symbol:<8}"
+                f"{opportunity.signal.direction.value:<6}{opportunity.signal.strategy:<15}"
+                f"{opportunity.confidence:>6.1f}{opportunity.quantity:>6}"
+                f"{opportunity.signal.risk_reward_ratio:>7.2f}  {status}"
+            )
+        print("-" * width)
+
+    if result.skipped:
+        print("\nFiltered out before analysis:")
+        for symbol, reason in result.skipped.items():
+            print(f"  {symbol}: {reason}")
+    if result.failures:
+        print("\nNot scanned:")
+        for key, reason in result.failures.items():
+            print(f"  ! {key}: {reason}")
+
+    print(
+        "\nThe score ranks these against each other. It is not a probability of "
+        "profit.\nThese are proposals — order placement arrives in Phase 7."
+    )
+    return EXIT_OK
+
+
+def _render_opportunity(opportunity, width: int) -> None:
+    """Print one ranked opportunity."""
+    signal = opportunity.signal
+    print()
+    print("-" * width)
+    print(f"#{opportunity.rank}  {signal.symbol}")
+    print(f"Direction: {signal.direction.value}")
+    print(f"Confidence: {opportunity.confidence:.0f}/100")
+
+    if opportunity.reasons:
+        print("\nReasons:")
+        for reason in opportunity.reasons:
+            print(f"  \u2713 {reason}")
+
+    print("\nScore breakdown:")
+    for factor in sorted(opportunity.factors, key=lambda item: -item.contribution):
+        bar = "\u2588" * int(round(factor.score / 10))
+        print(f"  {factor.name:<14}{factor.score:>5.0f}  {bar:<10}  {factor.detail}")
+
+    print()
+    print(f"Suggested Entry : ${signal.entry_price:,.2f}")
+    print(f"Stop Loss       : ${signal.stop_loss:,.2f}"
+          f"  ({signal.stop_distance_pct:.2f}% away)")
+    print(f"Take Profit     : ${signal.take_profit:,.2f}")
+    print(f"Risk/Reward     : 1:{signal.risk_reward_ratio:.2f}")
+
+    decision = opportunity.decision
+    if decision is None:
+        print("Risk            : not evaluated")
+    elif decision.approved:
+        print(f"Position Size   : {decision.shares} shares "
+              f"(risking ${float(decision.risk_amount):,.2f})")
+        print(f"Risk Validation : PASSED — limited by "
+              f"{decision.sizing.binding_constraint.description}")
+    else:
+        print(f"Risk Validation : REJECTED — {decision.rejection_reason}")
+
+
 def cmd_dashboard(settings: Settings, args: argparse.Namespace) -> int:
     """Launch the Streamlit dashboard.
 
@@ -945,6 +1119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_analyze(settings, args)
         if args.command == "signals":
             return cmd_signals(settings, args)
+        if args.command == "scan":
+            return cmd_scan(settings, args)
         if args.command == "dashboard":
             return cmd_dashboard(settings, args)
         if args.command == "cache":
