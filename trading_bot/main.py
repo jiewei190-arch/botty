@@ -16,6 +16,7 @@ Phase 2 adds::
 Phase 3 adds::
 
     python main.py signals         # run strategies and report trade setups
+    python main.py dashboard       # launch the Streamlit monitoring dashboard
 
 Later phases add ``scan``, ``backtest``, ``run`` and ``dashboard``.
 """
@@ -160,6 +161,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run on generated sample data instead of the market — no API keys needed.",
     )
     signals.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+
+    dashboard = subparsers.add_parser(
+        "dashboard", help="Launch the Streamlit monitoring dashboard."
+    )
+    dashboard.add_argument("--port", type=int, default=8501, help="Port (default 8501).")
+    dashboard.add_argument(
+        "--host", default="localhost", help="Bind address (default localhost)."
+    )
+    dashboard.add_argument(
+        "--headless", action="store_true", help="Do not open a browser automatically."
+    )
 
     cache = subparsers.add_parser("cache", help="Inspect or clear the bar cache.")
     cache.add_argument("--clear", action="store_true", help="Delete cached files.")
@@ -737,6 +749,45 @@ def cmd_signals(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_dashboard(settings: Settings, args: argparse.Namespace) -> int:
+    """Launch the Streamlit dashboard.
+
+    Streamlit owns its own server, so this hands off to it rather than trying to
+    run it in-process.
+    """
+    import subprocess
+
+    app_path = Path(__file__).resolve().parent / "dashboard" / "app.py"
+    if not app_path.exists():
+        print(f"Dashboard not found at {app_path}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        print(
+            "Streamlit is not installed. Run:\n\n    pip install -r requirements.txt\n",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+
+    command = [
+        sys.executable, "-m", "streamlit", "run", str(app_path),
+        "--server.port", str(args.port),
+        "--server.address", args.host,
+        "--server.headless", "true" if args.headless else "false",
+        "--browser.gatherUsageStats", "false",
+    ]
+    logger.info("Starting the dashboard on http://%s:%d", args.host, args.port)
+    print(f"\nDashboard starting at http://{args.host}:{args.port}")
+    print("The dashboard is read-only — it cannot place orders.\nPress Ctrl+C to stop.\n")
+    try:
+        return subprocess.call(command)
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
+        return EXIT_OK
+
+
 def cmd_cache(settings: Settings, args: argparse.Namespace) -> int:
     cache = BarCache(
         settings.data.cache_dir,
@@ -784,6 +835,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_analyze(settings, args)
         if args.command == "signals":
             return cmd_signals(settings, args)
+        if args.command == "dashboard":
+            return cmd_dashboard(settings, args)
         if args.command == "cache":
             return cmd_cache(settings, args)
         parser.error(f"Unknown command {args.command!r}")

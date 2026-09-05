@@ -4,9 +4,11 @@ A modular, risk-first trading bot for US equities. Built to **test ideas safely*
 backtest a strategy on historical data, then paper trade it against a live market
 feed, with real-money trading locked behind two explicit switches.
 
-> **Status: Phases 1-3 of 10 complete.** Foundation, data, analysis and the
-> strategy engine are built and tested. Risk management, backtesting, paper
-> trading and the dashboard follow (see the [roadmap](#roadmap)).
+> **Status: Phases 1-3 of 10 complete, plus a read-only dashboard.** Foundation,
+> data, analysis and the strategy engine are built and tested, and there is a
+> Streamlit dashboard to look at them. Risk management, backtesting and paper
+> trading follow, and the dashboard grows trade controls with them (see the
+> [roadmap](#roadmap)).
 
 ---
 
@@ -76,9 +78,13 @@ botty/
 │   │   └── breakout_strategy.py     Confirmed breaks out of consolidation
 │   ├── risk/                     Phase 4
 │   ├── backtesting/              Phase 6
-│   ├── dashboard/                Phase 9
+│   ├── dashboard/
+│   │   ├── app.py                   Streamlit app (read-only)
+│   │   ├── charts.py                Plotly figure builders
+│   │   ├── theme.py                 Validated palette, light and dark
+│   │   └── data.py                  Cached data access for the UI
 │   └── main.py                   CLI
-├── tests/                        427 tests, no credentials required
+├── tests/                        482 tests, no credentials required
 ├── logs/                         Runtime logs (gitignored)
 ├── storage/                      SQLite database + parquet cache (gitignored)
 ├── main.py                       Launcher
@@ -148,6 +154,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py cache` | Inspect (`--clear` to empty) the bar cache |
 | `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
 | `python main.py signals` | Run strategies and report trade setups (Phase 3) |
+| `python main.py dashboard` | Launch the Streamlit dashboard |
 
 Global flags: `--mode {backtest,paper,live}` and `--log-level {DEBUG,INFO,WARNING,ERROR}`.
 
@@ -286,6 +293,50 @@ until bar `i + strength`, because the rule needs the bars after it. Every
 `SwingPoint` records `confirmed_index`, and `find_support_resistance(as_of=N)`
 uses only pivots confirmed by bar `N` — so a backtest asking "what levels were
 visible here?" gets an honest answer.
+
+---
+
+## The dashboard
+
+```bash
+python main.py dashboard        # http://localhost:8501
+```
+
+Four pages: **Overview** (account, watchlist snapshot), **Market Scanner**
+(setups and, when there are none, what blocked them), **Chart** (four-panel
+interactive price chart), **Strategy Settings** (live indicator tuning).
+
+It works with no API keys — the sidebar's *Demo data* toggle is on by default
+when credentials are absent, and every generated price is labelled as such.
+
+**It is read-only and cannot place an order.** There is no order-placing code
+anywhere in the system yet, by design; a test asserts the dashboard package
+contains none. Trade controls arrive with the execution layer in Phase 7,
+defaulting to paper trading with manual approval.
+
+### Chart design
+
+Four stacked panels share one x-axis — price, volume, RSI, MACD. **Never a dual
+axis:** two scales on one plot let any two lines be placed in any relationship
+the author likes, which is the most common way a chart misleads.
+
+Colour choices are validated, not eyeballed. The three EMA hues clear
+colour-vision-deficiency separation on every pair in both light and dark modes.
+Two rules follow from that:
+
+- **Up and down never depend on colour alone.** Candles differ in *fill* as well
+  as hue — hollow for up, solid for down — so direction survives colourblindness
+  and greyscale printing. Direction labels elsewhere pair an arrow with the word.
+- **Series carry both a legend and end-of-line labels.** Labels alone fail
+  exactly when EMAs converge and their labels collide.
+
+Green means bullish and red means bearish everywhere, including the MACD
+histogram. Streamlit's default red accent is overridden in
+`.streamlit/config.toml` — left alone, it painted a `STRONG_BULLISH` trend bar
+red, contradicting the app's own colour meaning.
+
+Light or dark is set by `theme.base` in `.streamlit/config.toml`, and the chart
+palette reads that same value, so the chrome and the charts cannot disagree.
 
 ---
 
@@ -498,6 +549,7 @@ indicator's maths against independently derived reference values.
 
 | Area | File | Tests |
 |---|---|---|
+| Dashboard charts and palette | `tests/test_dashboard.py` | 55 |
 | Strategy contract and registry | `tests/test_strategies.py` | 52 |
 | Per-strategy behaviour | `tests/test_strategy_signals.py` | 36 |
 | Indicator maths and validation | `tests/test_indicators.py` | 91 |
@@ -520,7 +572,7 @@ indicator's maths against independently derived reference values.
 | 6 | Backtesting engine | Planned |
 | 7 | Alpaca paper trading execution | Planned |
 | 8 | Position monitoring and automated exits | Planned |
-| 9 | Streamlit dashboard | Planned |
+| 9 | Streamlit dashboard | **Read-only version shipped**; trade controls with Phase 7 |
 | 10 | Performance optimisation | Planned |
 
 ---

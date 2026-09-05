@@ -12,12 +12,12 @@ python-dotenv>=1.0          # .env loading (tested 1.2.3)
 pydantic>=2.7,<3.0          # typed settings + validation (tested 2.13.5)
 pydantic-settings>=2.3,<3.0 # environment-driven configuration (tested 2.15.0)
 
+# --- Dashboard --------------------------------------------------------------
+streamlit>=1.35             # monitoring dashboard (tested 1.63.0)
+plotly>=5.20                # interactive charts (tested 7.0.0)
+
 # --- Development ------------------------------------------------------------
 pytest>=8.0                 # test suite (tested 9.1.1)
 
-# --- Added in later phases --------------------------------------------------
-# Phase 6 (backtesting charts) and Phase 9 (dashboard) add:
-#   streamlit>=1.35
-#   plotly>=5.20
-# Technical indicators are implemented directly on pandas/numpy in Phase 2, so
-# no TA-Lib C library is required.
+# Technical indicators are implemented directly on pandas and numpy, so no
+# TA-Lib C library is required.
