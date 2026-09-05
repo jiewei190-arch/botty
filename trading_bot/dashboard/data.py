@@ -11,6 +11,7 @@ to the broker's order endpoints.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,9 +63,34 @@ class SymbolData:
         return self.error is None and not self.frame.empty
 
 
+def _adopt_streamlit_secrets() -> None:
+    """Copy Streamlit secrets into the environment before settings are read.
+
+    Settings come from environment variables, which is right for a local run
+    with a ``.env``. A hosted deployment has no ``.env`` — credentials arrive
+    as Streamlit secrets instead — so without this the app would start on a
+    host and report missing credentials for a key that was supplied.
+
+    Existing environment variables win: a value set explicitly on the host
+    should not be silently overridden by a stale secret.
+    """
+    try:
+        secrets = st.secrets
+    except Exception:  # noqa: BLE001 - no secrets file is the normal local case
+        return
+    for key in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "RISK_ACCOUNT_EQUITY"):
+        try:
+            value = secrets[key]
+        except Exception:  # noqa: BLE001 - absent key
+            continue
+        if value and key not in os.environ:
+            os.environ[key] = str(value)
+
+
 @st.cache_resource
 def get_settings_cached() -> Settings:
     """Load settings once per session."""
+    _adopt_streamlit_secrets()
     return load_settings()
 
 
