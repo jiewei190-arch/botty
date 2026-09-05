@@ -21,7 +21,7 @@ ask "what levels were visible at this bar?" and get an honest answer.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -332,14 +332,29 @@ def find_support_resistance(
         )
 
     reference_price = float(price if price is not None else data["close"].iloc[position])
-    all_points = find_swing_points(data, settings.swing_strength, settings)
 
-    window_start = max(0, position - settings.level_lookback)
+    # Only bars inside the lookback can contribute a level, so only scan those.
+    # Scanning the whole history instead would make a per-bar backtest O(n^2) for
+    # results that are discarded anyway. The extra `swing_strength` bars give the
+    # earliest pivot in the window its left-hand comparison bars.
+    window_start = max(0, position - settings.level_lookback - settings.swing_strength)
+    window = data.iloc[window_start : position + 1]
+    all_points = [
+        # Shift indices back to positions in the caller's frame.
+        replace(
+            point,
+            index=point.index + window_start,
+            confirmed_index=point.confirmed_index + window_start,
+        )
+        for point in find_swing_points(window, settings.swing_strength, settings)
+    ]
+
+    relevant_from = max(0, position - settings.level_lookback)
     visible = [
         point
         for point in all_points
         # Confirmed by now, and recent enough to still be relevant.
-        if point.confirmed_index <= position and window_start <= point.index <= position
+        if point.confirmed_index <= position and relevant_from <= point.index <= position
     ]
 
     highs = [point for point in visible if point.kind == "high"]
@@ -389,11 +404,17 @@ def detect_market_structure(
     """
     settings = config or DEFAULT_CONFIG
     position = len(data) - 1 if as_of is None else int(as_of)
+
+    # Same windowing as find_support_resistance: only recent structure matters,
+    # and scanning the full history per bar does not scale.
+    window_start = max(0, position - settings.level_lookback - settings.swing_strength)
+    window = data.iloc[window_start : position + 1]
     points = [
-        point
-        for point in find_swing_points(data, settings.swing_strength, settings)
-        if point.confirmed_index <= position
+        replace(point, index=point.index + window_start,
+                confirmed_index=point.confirmed_index + window_start)
+        for point in find_swing_points(window, settings.swing_strength, settings)
     ]
+    points = [point for point in points if point.confirmed_index <= position]
 
     highs = [point.price for point in points if point.kind == "high"][-2:]
     lows = [point.price for point in points if point.kind == "low"][-2:]

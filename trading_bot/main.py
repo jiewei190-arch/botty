@@ -13,6 +13,10 @@ Phase 2 adds::
 
     python main.py analyze         # full technical analysis of a symbol
 
+Phase 3 adds::
+
+    python main.py signals         # run strategies and report trade setups
+
 Later phases add ``scan``, ``backtest``, ``run`` and ``dashboard``.
 """
 
@@ -21,6 +25,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,7 +62,17 @@ from trading_bot.indicators import (
     find_support_resistance,
     rsi_column,
 )
-from trading_bot.utils.logging_setup import configure_logging, log_banner
+from trading_bot.strategies import (
+    StrategyError,
+    available_strategies,
+    build_strategy,
+    explain_blockers,
+)
+from trading_bot.utils.logging_setup import (
+    configure_logging,
+    log_banner,
+    log_signal_block,
+)
 from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES, Timeframe
 
 logger = logging.getLogger("trading_bot.cli")
@@ -120,6 +135,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run on generated sample data instead of the market — no API keys needed.",
     )
     analyze.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+
+    signals = subparsers.add_parser(
+        "signals", help="Run trading strategies over the watchlist and report setups."
+    )
+    signals.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
+    signals.add_argument(
+        "--strategy",
+        default="all",
+        help="Strategy name, comma-separated list, or 'all' (default). "
+        f"Available: {', '.join(available_strategies())}",
+    )
+    signals.add_argument("--timeframe", default=None, help="Bar size (default: DATA_TIMEFRAME).")
+    signals.add_argument("--bars", type=int, default=None, help="Bars of history to use.")
+    signals.add_argument(
+        "--min-confidence", type=float, default=None, help="Override the confidence floor."
+    )
+    signals.add_argument(
+        "--allow-short", action="store_true", help="Permit short signals (off by default)."
+    )
+    signals.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run on generated sample data instead of the market — no API keys needed.",
+    )
+    signals.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
 
     cache = subparsers.add_parser("cache", help="Inspect or clear the bar cache.")
     cache.add_argument("--clear", action="store_true", help="Delete cached files.")
@@ -566,6 +606,137 @@ def cmd_analyze(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _load_bars(settings: Settings, args: argparse.Namespace, symbols, timeframe, bars_wanted):
+    """Fetch bars for a command, or generate demo data. Returns (frames, failures)."""
+    if args.demo:
+        banner = "!" * 64
+        print(f"\n{banner}")
+        print("  DEMO MODE \u2014 GENERATED SAMPLE DATA, NOT REAL MARKET DATA")
+        print("  Prices below are synthetic. Supply Alpaca credentials for live analysis.")
+        print(banner)
+        return {symbol: _demo_bars(symbol, bars_wanted) for symbol in symbols}, {}
+
+    provider = build_market_data(settings.alpaca, settings.data, use_cache=not args.no_cache)
+    logger.info("Fetching %s bars for %d symbol(s)", timeframe.label, len(symbols))
+    frames, report = provider.fetch_watchlist(symbols, timeframe, lookback_bars=bars_wanted)
+    # A forming bar must never reach a strategy.
+    frames = {
+        symbol: drop_incomplete_bars(frame, timeframe) for symbol, frame in frames.items()
+    }
+    return frames, dict(report.failed)
+
+
+def cmd_signals(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the Phase 3 strategies over the watchlist and report trade setups.
+
+    Reports opportunities only. It sizes nothing and places nothing — position
+    sizing arrives with the risk manager in Phase 4, and order placement in
+    Phase 7.
+    """
+    symbols = (
+        [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else list(settings.data.watchlist)
+    )
+    timeframe = Timeframe.parse(args.timeframe or settings.data.timeframe)
+
+    names = (
+        available_strategies()
+        if args.strategy.strip().lower() == "all"
+        else [item.strip() for item in args.strategy.split(",") if item.strip()]
+    )
+    overrides: dict[str, object] = {}
+    if args.min_confidence is not None:
+        overrides["min_confidence"] = args.min_confidence
+    if args.allow_short:
+        overrides["allow_short"] = True
+
+    try:
+        strategies = [build_strategy(name, **overrides) for name in names]
+    except StrategyError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    warmup = max(strategy.min_bars for strategy in strategies)
+    bars_wanted = args.bars or max(settings.data.lookback_bars, warmup + 50)
+
+    frames, failed = _load_bars(settings, args, symbols, timeframe, bars_wanted)
+    if not frames:
+        print("No data to analyse. Check credentials, symbols and timeframe.")
+        return EXIT_FAILURE
+
+    found = []
+    blockers: Counter[str] = Counter()
+    for symbol in sorted(frames):
+        frame = frames[symbol]
+        if frame.empty:
+            failed.setdefault(symbol, "no complete bars")
+            continue
+        for strategy in strategies:
+            try:
+                prepared = strategy.prepare(frame)
+                signal = strategy.generate_signal(symbol, prepared)
+            except Exception as error:  # noqa: BLE001 - one failure must not stop the scan
+                logger.exception("%s failed on %s", strategy.name, symbol)
+                failed[f"{symbol}/{strategy.name}"] = str(error)
+                continue
+            if signal is not None:
+                found.append(signal)
+            else:
+                # Record why not. An idle bot with no explanation is
+                # indistinguishable from a broken one.
+                for name in explain_blockers(strategy):
+                    blockers[f"{strategy.name}.{name}"] += 1
+
+    found.sort(key=lambda item: item.confidence, reverse=True)
+
+    print(f"\nScanned {len(frames)} symbol(s) with {len(strategies)} "
+          f"strateg{'ies' if len(strategies) != 1 else 'y'} on {timeframe.label} bars")
+    print("=" * 64)
+    if not found:
+        print("\nNo setups met the entry criteria on the latest bar.")
+        print("That is the normal outcome — every strategy requires several conditions")
+        print("to align at once, and most bars in most markets do not qualify.")
+        if blockers:
+            print("\nMost common blockers (condition, times it blocked an entry):")
+            for name, count in blockers.most_common(8):
+                print(f"  {count:>3}x  {name}")
+    for signal in found:
+        log_signal_block(
+            logger,
+            symbol=signal.symbol,
+            strategy=signal.strategy,
+            direction=signal.direction.value,
+            confidence=signal.confidence,
+            entry=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+            reasons=list(signal.reasons),
+            timestamp=signal.timestamp,
+        )
+
+    if found:
+        print("\nSummary")
+        print("-" * 64)
+        print(f"{'SYMBOL':<8}{'STRATEGY':<16}{'DIR':<6}{'CONF':>6}{'ENTRY':>10}{'R:R':>7}")
+        print("-" * 64)
+        for signal in found:
+            print(
+                f"{signal.symbol:<8}{signal.strategy:<16}{signal.direction.value:<6}"
+                f"{signal.confidence:>5.0f} {signal.entry_price:>9,.2f}"
+                f"{signal.risk_reward_ratio:>6.2f}"
+            )
+        print("-" * 64)
+        print("\nThese are proposals, not orders. Position sizing and risk validation")
+        print("arrive in Phase 4; order placement in Phase 7.")
+
+    if failed:
+        print("\nNot analysed:")
+        for key, reason in failed.items():
+            print(f"  ! {key}: {reason}")
+    return EXIT_OK
+
+
 def cmd_cache(settings: Settings, args: argparse.Namespace) -> int:
     cache = BarCache(
         settings.data.cache_dir,
@@ -611,6 +782,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_fetch(settings, args)
         if args.command == "analyze":
             return cmd_analyze(settings, args)
+        if args.command == "signals":
+            return cmd_signals(settings, args)
         if args.command == "cache":
             return cmd_cache(settings, args)
         parser.error(f"Unknown command {args.command!r}")

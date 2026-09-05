@@ -112,3 +112,47 @@ def test_analyze_without_credentials_fails_cleanly(capsys):
 def test_analyze_respects_a_bar_count(capsys):
     main(["analyze", "--demo", "--symbols", "AAPL", "--bars", "300"])
     assert "Bars analysed : 300" in capsys.readouterr().out
+
+
+# -- Phase 3: signals -------------------------------------------------------------
+
+
+def test_signals_demo_runs_without_credentials(capsys):
+    assert main(["signals", "--demo", "--symbols", "AAPL,NVDA"]) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "NOT REAL MARKET DATA" in output
+    assert "Scanned 2 symbol(s)" in output
+
+
+def test_signals_explains_why_no_setup_was_found(capsys):
+    """An idle bot with no explanation is indistinguishable from a broken one."""
+    main(["signals", "--demo", "--symbols", "AAPL,NVDA,SPY,QQQ"])
+    output = capsys.readouterr().out
+    if "No setups met the entry criteria" in output:
+        assert "Most common blockers" in output
+
+
+def test_signals_accepts_a_single_strategy(capsys):
+    assert main(["signals", "--demo", "--symbols", "AAPL", "--strategy", "momentum"]) == EXIT_OK
+    assert "1 strategy" in capsys.readouterr().out
+
+
+def test_signals_accepts_a_strategy_list(capsys):
+    main(["signals", "--demo", "--symbols", "AAPL", "--strategy", "momentum,breakout"])
+    assert "2 strategies" in capsys.readouterr().out
+
+
+def test_signals_rejects_an_unknown_strategy(capsys):
+    assert main(["signals", "--demo", "--strategy", "nonsense"]) == EXIT_FAILURE
+    assert "Unknown strategy" in capsys.readouterr().err
+
+
+def test_signals_confidence_override_is_accepted(capsys):
+    assert main(
+        ["signals", "--demo", "--symbols", "AAPL", "--min-confidence", "95"]
+    ) == EXIT_OK
+
+
+def test_signals_without_credentials_fails_cleanly(capsys):
+    assert main(["signals", "--symbols", "AAPL"]) == EXIT_FAILURE
+    assert "credentials are missing" in capsys.readouterr().err

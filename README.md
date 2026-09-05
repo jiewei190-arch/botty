@@ -4,9 +4,9 @@ A modular, risk-first trading bot for US equities. Built to **test ideas safely*
 backtest a strategy on historical data, then paper trade it against a live market
 feed, with real-money trading locked behind two explicit switches.
 
-> **Status: Phases 1-2 of 10 complete.** The foundation, data and analysis layers
-> are built and tested. Strategies, risk management, backtesting and the
-> dashboard follow in later phases (see the [roadmap](#roadmap)).
+> **Status: Phases 1-3 of 10 complete.** Foundation, data, analysis and the
+> strategy engine are built and tested. Risk management, backtesting, paper
+> trading and the dashboard follow (see the [roadmap](#roadmap)).
 
 ---
 
@@ -69,12 +69,16 @@ botty/
 │   │   ├── trend_analysis.py        Weighted trend direction, strength, confidence
 │   │   ├── volume_analysis.py       Relative volume, participation, confirmation
 │   │   └── price_action.py          Swing points, support/resistance
-│   ├── strategies/               Phase 3
+│   ├── strategies/
+│   │   ├── base_strategy.py         Signal/Position contract, exits, confidence
+│   │   ├── momentum_strategy.py     Trend continuation
+│   │   ├── mean_reversion.py        Fade stretched moves, with a regime veto
+│   │   └── breakout_strategy.py     Confirmed breaks out of consolidation
 │   ├── risk/                     Phase 4
 │   ├── backtesting/              Phase 6
 │   ├── dashboard/                Phase 9
 │   └── main.py                   CLI
-├── tests/                        332 tests, no credentials required
+├── tests/                        427 tests, no credentials required
 ├── logs/                         Runtime logs (gitignored)
 ├── storage/                      SQLite database + parquet cache (gitignored)
 ├── main.py                       Launcher
@@ -143,6 +147,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py db-init` | Create or migrate the database |
 | `python main.py cache` | Inspect (`--clear` to empty) the bar cache |
 | `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
+| `python main.py signals` | Run strategies and report trade setups (Phase 3) |
 
 Global flags: `--mode {backtest,paper,live}` and `--log-level {DEBUG,INFO,WARNING,ERROR}`.
 
@@ -284,6 +289,95 @@ visible here?" gets an honest answer.
 
 ---
 
+## The strategy engine
+
+Three strategies with deliberately different edges, behind one interface:
+
+| Strategy | Thesis | Works when |
+|---|---|---|
+| `momentum` | Trends continue | Markets are trending |
+| `mean_reversion` | Stretched prices snap back | Markets are ranging |
+| `breakout` | Compression precedes expansion | Ranges are resolving |
+
+They are *meant* to disagree. Momentum and mean reversion looking at the same
+oversold chart should reach opposite conclusions — that is why you run more than
+one, and why the scanner (Phase 5) will rank their output rather than average it.
+
+```bash
+python main.py signals --demo                      # no API keys needed
+python main.py signals --strategy momentum         # one strategy
+python main.py signals --min-confidence 75         # only high-conviction setups
+```
+
+```python
+from trading_bot.strategies import build_strategy
+
+strategy = build_strategy("momentum", min_confidence=70)
+prepared = strategy.prepare(bars)                  # enrich indicators once
+signal = strategy.generate_signal("AAPL", prepared)
+if signal:
+    print(signal.direction, signal.confidence, signal.risk_reward_ratio)
+```
+
+### One evaluation rule
+
+`generate_signal` reads **the last bar of the frame it is given, and nothing
+else**. That single rule is what makes backtest and live behaviour identical: the
+backtester passes `bars.iloc[:i+1]` for each `i`, the live bot passes everything
+up to now, and the strategy cannot tell which is which. It also makes lookahead
+bias structurally impossible — a strategy has no way to reach a bar it was not
+handed.
+
+### Signals are proposals, not orders
+
+A `Signal` carries entry, stop and target, so the risk manager can size it
+without re-deriving anything. Strategies never size positions, check account
+limits, or place orders. Construction validates that the stop and target sit on
+the correct sides of the entry — a long whose stop is above its entry would make
+position sizing divide by a negative risk, so it is rejected at the source.
+
+### Confidence
+
+Each strategy declares its entry conditions. Required conditions are vetoes;
+optional ones contribute weight, and confidence is the share of total weight that
+passed. **A signal at 62/100 means "the setup is valid and about 62% of the
+supporting evidence is present" — not a 62% chance of profit.**
+
+### Why didn't it trade?
+
+The most important question a trading bot has to answer. Every evaluation records
+which conditions blocked it:
+
+```
+No setups met the entry criteria on the latest bar.
+
+Most common blockers (condition, times it blocked an entry):
+   10x  momentum.trigger
+    9x  breakout.consolidation
+    9x  mean_reversion.band_stretched
+    8x  breakout.volume
+```
+
+An idle bot with no explanation is indistinguishable from a broken one.
+
+### Strategies have different risk shapes
+
+Mean reversion ships with a **tighter stop and a lower reward:risk floor** (1.5
+rather than 2.0) than momentum. This is deliberate. Reverting to the mean pays
+roughly one standard deviation, so demanding a trend-following 2:1 would reject
+essentially every valid setup. Mean reversion earns its expectancy from a high
+win rate at modest reward — the mirror image of momentum. Comparing the two on
+reward:risk alone is a category error; compare them on expectancy, which Phase 6's
+backtester measures.
+
+### Adding your own
+
+Subclass `BaseStrategy`, implement `evaluate`, call `register_strategy`. The
+scanner, backtester and dashboard all work through the registry, so nothing else
+changes.
+
+---
+
 ## Configuration
 
 All configuration lives in `.env` — see `.env.example` for the annotated list.
@@ -404,11 +498,13 @@ indicator's maths against independently derived reference values.
 
 | Area | File | Tests |
 |---|---|---|
+| Strategy contract and registry | `tests/test_strategies.py` | 52 |
+| Per-strategy behaviour | `tests/test_strategy_signals.py` | 36 |
 | Indicator maths and validation | `tests/test_indicators.py` | 91 |
 | Swing points and levels | `tests/test_price_action.py` | 33 |
 | Trend classification | `tests/test_trend_analysis.py` | 17 |
 | Volume analysis | `tests/test_volume_analysis.py` | 30 |
-| Phase 1 foundation and CLI | 9 further files | 161 |
+| Phase 1 foundation and CLI | 9 further files | 168 |
 
 ---
 
@@ -418,7 +514,7 @@ indicator's maths against independently derived reference values.
 |---|---|---|
 | 1 | Project setup, Alpaca connection, market data | **Complete** |
 | 2 | Technical indicator engine | **Complete** |
-| 3 | Strategy engine (momentum, mean reversion, breakout) | Planned |
+| 3 | Strategy engine (momentum, mean reversion, breakout) | **Complete** |
 | 4 | Risk management and position sizing | Planned |
 | 5 | Market scanner with confidence scoring | Planned |
 | 6 | Backtesting engine | Planned |
