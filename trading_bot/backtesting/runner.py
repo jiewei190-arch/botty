@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -103,7 +103,7 @@ def load_data(
         Nothing could be loaded for any symbol.
     """
     timeframe = Timeframe.parse(request.timeframe)
-    end = request.end or datetime.now(UTC)
+    end = request.end or datetime.now(timezone.utc)
     lead = warmup + WARMUP_MARGIN
 
     if request.demo:

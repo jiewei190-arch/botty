@@ -581,7 +581,7 @@ def test_the_app_uses_no_deprecated_streamlit_apis(app_path):
 @pytest.fixture(scope="module")
 def backtest_result():
     """A real backtest over generated bars, so the charts see real output."""
-    from datetime import UTC, datetime
+    from datetime import datetime, timezone
 
     from trading_bot.backtesting import BacktestConfig, Backtester
     from trading_bot.strategies import build_strategy
@@ -589,7 +589,7 @@ def backtest_result():
     strategy = build_strategy("momentum")
     frames = {
         symbol: strategy.prepare(
-            make_bars(400, start=datetime(2025, 6, 2, tzinfo=UTC), seed=seed)
+            make_bars(400, start=datetime(2025, 6, 2, tzinfo=timezone.utc), seed=seed)
         )
         for symbol, seed in (("AAA", 11), ("BBB", 23))
     }

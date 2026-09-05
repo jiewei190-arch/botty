@@ -17,7 +17,7 @@ or directly::
 from __future__ import annotations
 
 import sys
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 if __package__ in (None, ""):  # pragma: no cover - streamlit runs this as a script
@@ -1023,8 +1023,8 @@ def _backtest(settings, controls: dict, palette) -> None:
             symbols=symbols,
             strategies=tuple(strategy_names),
             timeframe=controls["timeframe"],
-            start=datetime.combine(start_date, time.min, tzinfo=UTC),
-            end=datetime.combine(end_date, time.min, tzinfo=UTC),
+            start=datetime.combine(start_date, time.min, tzinfo=timezone.utc),
+            end=datetime.combine(end_date, time.min, tzinfo=timezone.utc),
             starting_equity=float(capital),
             costs=CostModel(
                 commission_per_trade=float(commission),

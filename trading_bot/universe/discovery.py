@@ -16,7 +16,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +56,7 @@ class Universe:
     frames: dict[str, pd.DataFrame] = field(default_factory=dict)
     static_report: FilterReport = field(default_factory=FilterReport)
     liquidity_report: FilterReport = field(default_factory=FilterReport)
-    built_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    built_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __len__(self) -> int:
         return len(self.symbols)
@@ -179,7 +179,7 @@ class AssetCatalogue:
         try:
             payload = json.loads(path.read_text())
             stamp = datetime.fromisoformat(payload["fetched_at"])
-            if datetime.now(UTC) - stamp > ASSET_CACHE_TTL:
+            if datetime.now(timezone.utc) - stamp > ASSET_CACHE_TTL:
                 return None
             return payload["assets"]
         except Exception as error:  # noqa: BLE001 - a bad cache is not fatal
@@ -194,7 +194,7 @@ class AssetCatalogue:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 json.dumps(
-                    {"fetched_at": datetime.now(UTC).isoformat(), "assets": records}
+                    {"fetched_at": datetime.now(timezone.utc).isoformat(), "assets": records}
                 )
             )
         except OSError as error:

@@ -395,3 +395,33 @@ def test_hunt_reports_the_universe_funnel(fake_market, capsys):
     out = capsys.readouterr().out
     assert "Static filters" in out
     assert "Swept" in out
+
+
+def test_the_codebase_runs_on_the_python_it_claims_to_support():
+    """`datetime.UTC` is 3.11+, and pyproject declares support for 3.10.
+
+    The mismatch is invisible locally on a newer interpreter and surfaces as an
+    ImportError at startup on an older one — including on a hosting platform
+    where the Python version is a dropdown someone else chose.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    declared = re.search(
+        r'requires-python\s*=\s*"[>=~^]*(\d+)\.(\d+)', (root / "pyproject.toml").read_text()
+    )
+    assert declared, "pyproject.toml does not declare requires-python"
+    minimum = (int(declared.group(1)), int(declared.group(2)))
+
+    offenders = []
+    for path in (root / "trading_bot").rglob("*.py"):
+        text = path.read_text()
+        if re.search(r"from datetime import [^\n]*\bUTC\b|datetime\.UTC", text):
+            offenders.append(str(path.relative_to(root)))
+
+    if minimum < (3, 11):
+        assert not offenders, (
+            f"pyproject declares Python {minimum[0]}.{minimum[1]}+ but these use "
+            f"datetime.UTC, which needs 3.11+: {offenders}. Use timezone.utc."
+        )
