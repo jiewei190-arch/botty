@@ -10,6 +10,7 @@ contradicts its own meaning.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -581,7 +582,7 @@ def test_the_app_uses_no_deprecated_streamlit_apis(app_path):
 @pytest.fixture(scope="module")
 def backtest_result():
     """A real backtest over generated bars, so the charts see real output."""
-    from datetime import UTC, datetime
+    from datetime import datetime, timezone
 
     from trading_bot.backtesting import BacktestConfig, Backtester
     from trading_bot.strategies import build_strategy
@@ -589,7 +590,7 @@ def backtest_result():
     strategy = build_strategy("momentum")
     frames = {
         symbol: strategy.prepare(
-            make_bars(400, start=datetime(2025, 6, 2, tzinfo=UTC), seed=seed)
+            make_bars(400, start=datetime(2025, 6, 2, tzinfo=timezone.utc), seed=seed)
         )
         for symbol, seed in (("AAA", 11), ("BBB", 23))
     }
@@ -739,3 +740,38 @@ def test_missing_secrets_are_not_an_error(monkeypatch):
 
     monkeypatch.setattr(dashboard_data.st, "secrets", Exploding())
     dashboard_data._adopt_streamlit_secrets()  # must not raise
+
+
+def test_markdown_escaping_covers_whole_messages():
+    """Streamlit parses markdown in warning/error/info, not just markdown().
+
+    A message carrying two dollar amounts had both signs consumed as LaTeX
+    delimiters and everything between them italicised. It happened twice — on
+    the entry cards, then on the feed warning, where advice about turnover
+    thresholds rendered as an equation.
+    """
+    import re
+
+    from trading_bot.dashboard.app import _md
+    from trading_bot.universe import feed_liquidity_warning
+
+    warning = feed_liquidity_warning("iex", 10_000_000)
+    assert "$" in warning, "fixture no longer exercises the bug"
+    escaped = _md(warning)
+    # No dollar sign survives unescaped.
+    assert re.search(r"(?<!\\)\$", escaped) is None
+    # The text itself is unchanged apart from the escaping.
+    assert escaped.replace("\\$", "$") == warning
+
+
+def test_every_streamlit_message_boundary_escapes(app_path):
+    """Values produced elsewhere must be escaped where they enter markdown."""
+    source = Path(app_path).read_text()
+    unescaped = [
+        line.strip()
+        for line in source.splitlines()
+        if re.search(r"st\.(warning|error|info)\(f?\"[^\"]*\{(?!_md)", line)
+        and "_md(" not in line
+        and "Choose at least" not in line  # a literal, no outside value
+    ]
+    assert not unescaped, f"unescaped interpolations into markdown: {unescaped}"

@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -135,7 +135,7 @@ class MarketSweep:
     universe_size: int = 0
     scanned: int = 0
     halt_reason: str | None = None
-    as_of: datetime = field(default_factory=lambda: datetime.now(UTC))
+    as_of: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     elapsed_seconds: float = 0.0
 
     def summary_lines(self) -> list[str]:
