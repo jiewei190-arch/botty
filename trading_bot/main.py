@@ -18,6 +18,8 @@ Phase 3 adds::
     python main.py signals         # run strategies and report trade setups
     python main.py dashboard       # launch the Streamlit monitoring dashboard
 
+Phase 4 adds risk validation and position sizing to ``signals``.
+
 Later phases add ``scan``, ``backtest``, ``run`` and ``dashboard``.
 """
 
@@ -63,6 +65,7 @@ from trading_bot.indicators import (
     find_support_resistance,
     rsi_column,
 )
+from trading_bot.risk import RiskManager, build_portfolio_state
 from trading_bot.strategies import (
     StrategyError,
     available_strategies,
@@ -161,6 +164,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run on generated sample data instead of the market — no API keys needed.",
     )
     signals.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+    signals.add_argument(
+        "--equity",
+        type=float,
+        default=None,
+        help="Account equity to size against. Defaults to the broker's, or 10000 in demo mode.",
+    )
+    signals.add_argument(
+        "--no-risk",
+        action="store_true",
+        help="Report raw signals without risk validation or sizing.",
+    )
 
     dashboard = subparsers.add_parser(
         "dashboard", help="Launch the Streamlit monitoring dashboard."
@@ -702,8 +716,27 @@ def cmd_signals(settings: Settings, args: argparse.Namespace) -> int:
 
     found.sort(key=lambda item: item.confidence, reverse=True)
 
+    # Risk validation and sizing. Signals are proposals; only the risk manager
+    # attaches a quantity, and only to trades that clear every limit.
+    decisions = []
+    portfolio = None
+    if found and not args.no_risk:
+        portfolio = _portfolio_for_sizing(settings, args)
+        manager = RiskManager(settings.risk)
+        halt = manager.trading_halted(portfolio)
+        if halt:
+            print(f"\n*** TRADING HALTED: {halt} ***")
+        decisions = manager.evaluate_many(found, portfolio)
+
+    approved = {id(d.signal): d for d in decisions if d.approved}
+    rejected = [d for d in decisions if not d.approved]
+
     print(f"\nScanned {len(frames)} symbol(s) with {len(strategies)} "
           f"strateg{'ies' if len(strategies) != 1 else 'y'} on {timeframe.label} bars")
+    if portfolio is not None:
+        print(f"Sizing against ${float(portfolio.equity):,.2f} equity · "
+              f"{portfolio.open_count} open position(s) · "
+              f"risk {settings.risk.max_risk_per_trade_pct:.2f}% per trade")
     print("=" * 64)
     if not found:
         print("\nNo setups met the entry criteria on the latest bar.")
@@ -714,6 +747,15 @@ def cmd_signals(settings: Settings, args: argparse.Namespace) -> int:
             for name, count in blockers.most_common(8):
                 print(f"  {count:>3}x  {name}")
     for signal in found:
+        decision = approved.get(id(signal))
+        matching = next((d for d in decisions if d.signal is signal), None)
+        if args.no_risk:
+            validation, size = None, None
+        elif decision is not None:
+            validation, size = "PASSED", decision.shares
+        else:
+            reason = matching.rejection_reason if matching else "not evaluated"
+            validation, size = f"REJECTED — {reason}", None
         log_signal_block(
             logger,
             symbol=signal.symbol,
@@ -725,28 +767,96 @@ def cmd_signals(settings: Settings, args: argparse.Namespace) -> int:
             take_profit=signal.take_profit,
             reasons=list(signal.reasons),
             timestamp=signal.timestamp,
+            risk_validation=validation,
+            position_size=size,
         )
 
     if found:
         print("\nSummary")
         print("-" * 64)
-        print(f"{'SYMBOL':<8}{'STRATEGY':<16}{'DIR':<6}{'CONF':>6}{'ENTRY':>10}{'R:R':>7}")
-        print("-" * 64)
+        header = f"{'SYMBOL':<8}{'STRATEGY':<15}{'DIR':<6}{'CONF':>5}{'ENTRY':>10}{'R:R':>6}"
+        if not args.no_risk:
+            header += f"{'QTY':>6}{'RISK $':>9}  STATUS"
+        print(header)
+        print("-" * 78)
         for signal in found:
-            print(
-                f"{signal.symbol:<8}{signal.strategy:<16}{signal.direction.value:<6}"
-                f"{signal.confidence:>5.0f} {signal.entry_price:>9,.2f}"
+            row = (
+                f"{signal.symbol:<8}{signal.strategy:<15}{signal.direction.value:<6}"
+                f"{signal.confidence:>5.0f}{signal.entry_price:>10,.2f}"
                 f"{signal.risk_reward_ratio:>6.2f}"
             )
-        print("-" * 64)
-        print("\nThese are proposals, not orders. Position sizing and risk validation")
-        print("arrive in Phase 4; order placement in Phase 7.")
+            if not args.no_risk:
+                decision = next((d for d in decisions if d.signal is signal), None)
+                if decision is not None and decision.approved:
+                    row += f"{decision.shares:>6}{float(decision.risk_amount):>9,.2f}  APPROVED"
+                else:
+                    reason = decision.rejection_reason if decision else "not evaluated"
+                    row += f"{'—':>6}{'—':>9}  {reason[:34]}"
+            print(row)
+        print("-" * 78)
+
+        if not args.no_risk:
+            print(f"\n{len(approved)} of {len(found)} setup(s) cleared risk validation.")
+            if rejected:
+                print("Rejected by:")
+                blocked_by = Counter(
+                    check.name
+                    for decision in rejected
+                    for check in decision.failed_checks
+                )
+                for name, count in blocked_by.most_common():
+                    print(f"  {count:>3}x  {name}")
+        print("\nThese are sized proposals, not orders. Order placement arrives in Phase 7.")
 
     if failed:
         print("\nNot analysed:")
         for key, reason in failed.items():
             print(f"  ! {key}: {reason}")
     return EXIT_OK
+
+
+def _portfolio_for_sizing(settings: Settings, args: argparse.Namespace):
+    """Build the portfolio the risk manager sizes against.
+
+    Uses the live broker account and trade history when available. In demo mode,
+    or without credentials, falls back to a stated equity so sizing can still be
+    demonstrated — clearly, and without pretending an account exists.
+    """
+    from trading_bot.data.database import Database
+
+    equity = args.equity
+    account = None
+    positions: list = []
+    database = None
+
+    if not args.demo and settings.alpaca.has_credentials:
+        try:
+            from trading_bot.execution.broker import build_broker
+
+            broker = build_broker(settings)
+            account = broker.get_account()
+            positions = broker.get_positions()
+        except Exception as error:  # noqa: BLE001 - fall back to stated equity
+            logger.warning("Could not read the broker account for sizing: %s", error)
+
+    try:
+        database = Database(settings.data.database_path)
+        database.initialize()
+    except Exception as error:  # noqa: BLE001
+        logger.warning("Could not open the database for risk history: %s", error)
+        database = None
+
+    if account is None and equity is None:
+        equity = 10_000.0
+        print(f"\nNo broker account available — sizing against a stated "
+              f"${equity:,.0f} for demonstration.")
+
+    state = build_portfolio_state(
+        account=account, broker_positions=positions, database=database, equity=equity
+    )
+    if database is not None:
+        database.close()
+    return state
 
 
 def cmd_dashboard(settings: Settings, args: argparse.Namespace) -> int:

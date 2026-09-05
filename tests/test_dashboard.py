@@ -252,3 +252,73 @@ def test_the_dashboard_contains_no_order_placing_code():
         source = path.read_text()
         for token in forbidden:
             assert token not in source, f"{path.name} references {token}"
+
+
+# ============================================================================
+# End-to-end app runs
+# ============================================================================
+#
+# Streamlit's AppTest executes the real app headlessly, so these catch the
+# failures that only appear when the pages actually render — a broken widget
+# chain, an exception inside a page, a deprecated API. They are slower than the
+# unit tests above, so there are few of them and each covers a whole page.
+
+
+@pytest.fixture(scope="module")
+def app_path() -> str:
+    from pathlib import Path
+
+    return str(Path(__file__).resolve().parents[1] / "trading_bot" / "dashboard" / "app.py")
+
+
+def _run(app_path, **widgets):
+    """Run the app headlessly, optionally setting sidebar widgets first."""
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file(app_path, default_timeout=300)
+    app.run()
+    if widgets:
+        if "bars" in widgets:
+            app.slider[0].set_value(widgets["bars"])
+        if "symbols" in widgets:
+            app.multiselect[0].set_value(widgets["symbols"])
+        if "strategies" in widgets:
+            app.multiselect[1].set_value(widgets["strategies"])
+        if "page" in widgets:
+            app.radio[0].set_value(widgets["page"])
+        app.run()
+    return app
+
+
+def test_the_app_starts_without_error(app_path):
+    app = _run(app_path)
+    assert not app.exception
+
+
+def test_every_page_renders(app_path):
+    from trading_bot.dashboard.app import PAGES
+
+    for page in PAGES:
+        app = _run(app_path, page=page, symbols=["AAPL"], strategies=["momentum"])
+        assert not app.exception, f"{page} raised"
+
+
+def test_the_scanner_sizes_an_approved_setup(app_path):
+    """850 bars of AAPL demo data produces a momentum signal, which must be sized."""
+    app = _run(
+        app_path, page="Market Scanner", bars=850, symbols=["AAPL"],
+        strategies=["momentum"],
+    )
+    assert not app.exception
+    rendered = " ".join(str(item.value) for item in app.markdown)
+    rendered += " ".join(str(item.value) for item in app.caption)
+    assert "Risk validation" in rendered
+    assert "cleared risk validation" in rendered
+
+
+def test_the_app_uses_no_deprecated_streamlit_apis(app_path):
+    """`use_container_width` was removed after 2025-12-31."""
+    from pathlib import Path
+
+    source = Path(app_path).read_text()
+    assert "use_container_width" not in source

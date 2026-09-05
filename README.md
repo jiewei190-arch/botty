@@ -4,11 +4,10 @@ A modular, risk-first trading bot for US equities. Built to **test ideas safely*
 backtest a strategy on historical data, then paper trade it against a live market
 feed, with real-money trading locked behind two explicit switches.
 
-> **Status: Phases 1-3 of 10 complete, plus a read-only dashboard.** Foundation,
-> data, analysis and the strategy engine are built and tested, and there is a
-> Streamlit dashboard to look at them. Risk management, backtesting and paper
-> trading follow, and the dashboard grows trade controls with them (see the
-> [roadmap](#roadmap)).
+> **Status: Phases 1-4 of 10 complete, plus a read-only dashboard.** Foundation,
+> data, analysis, strategies and risk management are built and tested, with a
+> Streamlit dashboard to look at them. Backtesting and paper trading follow, and
+> the dashboard grows trade controls with them (see the [roadmap](#roadmap)).
 
 ---
 
@@ -76,7 +75,10 @@ botty/
 │   │   ├── momentum_strategy.py     Trend continuation
 │   │   ├── mean_reversion.py        Fade stretched moves, with a regime veto
 │   │   └── breakout_strategy.py     Confirmed breaks out of consolidation
-│   ├── risk/                     Phase 4
+│   ├── risk/
+│   │   ├── risk_manager.py          The gate: nine limits, explicit verdicts
+│   │   ├── position_sizing.py       Size from stop distance, four caps
+│   │   └── portfolio.py             The state the limits are judged against
 │   ├── backtesting/              Phase 6
 │   ├── dashboard/
 │   │   ├── app.py                   Streamlit app (read-only)
@@ -84,7 +86,7 @@ botty/
 │   │   ├── theme.py                 Validated palette, light and dark
 │   │   └── data.py                  Cached data access for the UI
 │   └── main.py                   CLI
-├── tests/                        482 tests, no credentials required
+├── tests/                        558 tests, no credentials required
 ├── logs/                         Runtime logs (gitignored)
 ├── storage/                      SQLite database + parquet cache (gitignored)
 ├── main.py                       Launcher
@@ -340,6 +342,87 @@ palette reads that same value, so the chrome and the charts cannot disagree.
 
 ---
 
+## Risk management
+
+**The gate every trade passes through.** `RiskManager` is the only thing in the
+system that turns a signal into a quantity, and the execution layer will take a
+`RiskDecision` rather than a `Signal` — so "forgetting" to check risk is not an
+available mistake.
+
+```bash
+python main.py signals --demo --symbols AAPL,AMZN --bars 405
+```
+
+```
+  Risk Validation : PASSED
+  Position Size   : 17 shares
+
+SYMBOL  STRATEGY       DIR    CONF     ENTRY   R:R   QTY   RISK $  STATUS
+------------------------------------------------------------------------------
+AAPL    momentum       LONG     85    117.31 11.57    17     5.54  APPROVED
+AMZN    momentum       LONG     85    101.94  4.18    19    13.63  APPROVED
+```
+
+### Sizing is arithmetic, not preference
+
+```
+risk budget    = equity × max_risk_per_trade_pct / 100
+risk per share = |entry − stop|
+quantity       = risk budget ÷ risk per share
+```
+
+A wide stop buys fewer shares and a tight stop buys more, so **every trade risks
+the same amount** regardless of how volatile the instrument is. Sizing by a fixed
+dollar amount instead makes each trade risk a different, unknown quantity — which
+is how accounts die from a run of "small" trades.
+
+Four caps apply and the smallest wins: risk budget, position size, portfolio
+exposure, buying power. **The result reports which one bound**, because "why is
+my position so small?" is otherwise unanswerable:
+
+| $10,000 account, entry $210.50, stop $207.00 | Shares |
+|---|---|
+| 1% risk budget alone | 28 |
+| With the 20% position cap | **9** ← binds |
+
+That is not a bug — knowing which cap it was is the difference between tuning the
+right number and the wrong one.
+
+### The nine checks
+
+| Check | Blocks when |
+|---|---|
+| `account_tradable` | Broker blocked the account, or the kill switch is pulled |
+| `daily_loss` | Today's loss has reached the daily limit |
+| `cooldown` | A run of losses is still cooling off |
+| `open_positions` | Every position slot is used |
+| `duplicate` | A position in this symbol is already open |
+| `confidence` | The signal is below the confidence floor |
+| `risk_reward` | The setup pays too little for what it risks |
+| `position_size` | The limits leave less than one share |
+| `exposure` | The trade would breach total exposure |
+
+Every check is reported whether it passed or failed, so a rejection explains
+itself and an approval shows how much headroom was left. A rejected signal still
+reports its *would-be* size — exactly what you need to decide which limit to tune.
+
+### Details that matter
+
+- **Unrealised losses count toward the daily limit.** A limit that ignored open
+  positions could be satisfied while the account bled, because nothing had been
+  closed yet.
+- **Batches accumulate.** `evaluate_many` folds each approval into the portfolio
+  before judging the next signal, so six signals cannot fill five slots. Highest
+  confidence is considered first, so scarce slots go to the strongest setups.
+- **An unknown cooldown fails closed.** A losing streak with no recorded
+  timestamp refuses to trade rather than assuming the cooldown expired.
+- **Money is `Decimal`.** Prices convert through `str`, so `0.1` stays `0.1`.
+- **The manager does no I/O.** It is a pure function of a signal and a
+  `PortfolioState`, so every limit is testable without a network or a database,
+  and a backtest exercises the same code the live bot does.
+
+---
+
 ## The strategy engine
 
 Three strategies with deliberately different edges, behind one interface:
@@ -549,7 +632,9 @@ indicator's maths against independently derived reference values.
 
 | Area | File | Tests |
 |---|---|---|
-| Dashboard charts and palette | `tests/test_dashboard.py` | 55 |
+| Risk gate and portfolio state | `tests/test_risk_manager.py` | 40 |
+| Position sizing arithmetic | `tests/test_position_sizing.py` | 32 |
+| Dashboard charts, palette, pages | `tests/test_dashboard.py` | 59 |
 | Strategy contract and registry | `tests/test_strategies.py` | 52 |
 | Per-strategy behaviour | `tests/test_strategy_signals.py` | 36 |
 | Indicator maths and validation | `tests/test_indicators.py` | 91 |
@@ -567,7 +652,7 @@ indicator's maths against independently derived reference values.
 | 1 | Project setup, Alpaca connection, market data | **Complete** |
 | 2 | Technical indicator engine | **Complete** |
 | 3 | Strategy engine (momentum, mean reversion, breakout) | **Complete** |
-| 4 | Risk management and position sizing | Planned |
+| 4 | Risk management and position sizing | **Complete** |
 | 5 | Market scanner with confidence scoring | Planned |
 | 6 | Backtesting engine | Planned |
 | 7 | Alpaca paper trading execution | Planned |

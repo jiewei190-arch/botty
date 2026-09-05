@@ -21,6 +21,7 @@ from trading_bot.config.settings import Settings, TradingMode, load_settings
 from trading_bot.data.database import Database
 from trading_bot.data.market_data import build_market_data, drop_incomplete_bars
 from trading_bot.indicators import IndicatorConfig, calculate_all_indicators
+from trading_bot.risk import RiskManager, build_portfolio_state
 from trading_bot.strategies import build_strategy, explain_blockers
 from trading_bot.utils.timeframes import Timeframe
 
@@ -156,6 +157,58 @@ def run_scan(
 
     signals.sort(key=lambda item: item.confidence, reverse=True)
     return signals, blockers, failures
+
+
+def portfolio_for(settings: Settings, equity: float | None = None):
+    """Portfolio state for risk sizing, from the broker when it is reachable.
+
+    Falls back to a stated equity so the dashboard can demonstrate sizing
+    without an account — clearly, rather than by inventing one.
+    """
+    from trading_bot.data.database import Database
+
+    account, _ = account_snapshot(settings)
+    positions: list = []
+    if account is not None:
+        try:
+            from trading_bot.execution.broker import build_broker
+
+            positions = build_broker(settings).get_positions()
+        except Exception as error:  # noqa: BLE001
+            logger.warning("Could not read broker positions: %s", error)
+
+    database = None
+    try:
+        database = Database(settings.data.database_path)
+        database.initialize()
+    except Exception as error:  # noqa: BLE001
+        logger.warning("Could not open the database: %s", error)
+
+    state = build_portfolio_state(
+        account=account,
+        broker_positions=positions,
+        database=database,
+        equity=equity if account is None else None,
+    )
+    if database is not None:
+        database.close()
+    return state
+
+
+def evaluate_risk(
+    signals: list, settings: Settings, equity: float | None = None
+) -> tuple[list, Any, str | None]:
+    """Size and validate signals.
+
+    Returns
+    -------
+    tuple
+        ``(decisions, portfolio, halt_reason)``.
+    """
+    portfolio = portfolio_for(settings, equity)
+    manager = RiskManager(settings.risk)
+    halt = manager.trading_halted(portfolio)
+    return manager.evaluate_many(signals, portfolio), portfolio, halt
 
 
 def account_snapshot(settings: Settings) -> tuple[Any | None, str | None]:

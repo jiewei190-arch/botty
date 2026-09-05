@@ -133,7 +133,17 @@ def _sidebar(settings) -> dict:
         min_confidence = st.slider("Minimum confidence", 0, 100, 55, step=5)
         allow_short = st.checkbox("Allow short signals", value=False)
 
-        if st.button("Refresh data", use_container_width=True):
+        st.divider()
+        st.markdown("**Risk sizing**")
+        equity = st.number_input(
+            "Account equity ($)",
+            min_value=100.0,
+            value=10_000.0,
+            step=1_000.0,
+            help="Used when no broker account is connected. A live account overrides this.",
+        )
+
+        if st.button("Refresh data", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
@@ -147,6 +157,7 @@ def _sidebar(settings) -> dict:
         "strategies": strategies or available_strategies(),
         "min_confidence": float(min_confidence),
         "allow_short": allow_short,
+        "equity": equity,
     }
 
 
@@ -225,7 +236,7 @@ def _overview(settings, controls: dict, palette) -> None:
 
     with left:
         st.markdown("##### Equity curve")
-        st.plotly_chart(equity_placeholder(palette), use_container_width=True,
+        st.plotly_chart(equity_placeholder(palette), width="stretch",
                         config={"displayModeBar": False})
 
     with right:
@@ -298,7 +309,7 @@ def _watchlist_table(settings, controls: dict, palette) -> None:
         table = pd.DataFrame(rows).sort_values("Strength", ascending=False)
         st.dataframe(
             table,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Price": st.column_config.NumberColumn(format="$%.2f"),
@@ -343,6 +354,24 @@ def _scanner(settings, controls: dict, palette) -> None:
             overrides,
         )
 
+    decisions: list = []
+    halt: str | None = None
+    if signals:
+        decisions, portfolio, halt = dashboard_data.evaluate_risk(
+            signals, settings, equity=controls.get("equity")
+        )
+        if halt:
+            st.error(f"**Trading halted** — {halt}", icon="🛑")
+        approved = sum(1 for decision in decisions if decision.approved)
+        st.caption(
+            f"Sizing against ${float(portfolio.equity):,.2f} equity · "
+            f"{portfolio.open_count} open position(s) · "
+            f"risking {settings.risk.max_risk_per_trade_pct:.2f}% per trade · "
+            f"**{approved} of {len(signals)} cleared risk validation**"
+        )
+
+    by_signal = {id(decision.signal): decision for decision in decisions}
+
     if not signals:
         st.info(
             "No setups met the entry criteria on the latest bar. That is the normal "
@@ -358,24 +387,24 @@ def _scanner(settings, controls: dict, palette) -> None:
                 sorted(blockers.items(), key=lambda item: -item[1]),
                 columns=["Condition", "Times blocked"],
             )
-            st.dataframe(blocked, use_container_width=True, hide_index=True)
+            st.dataframe(blocked, width="stretch", hide_index=True)
     else:
         st.success(f"{len(signals)} setup(s) found.")
         for signal in signals:
-            _signal_card(signal, palette)
+            _signal_card(signal, palette, by_signal.get(id(signal)))
 
     if failures:
         st.warning("Not scanned: " + ", ".join(f"{k} ({v})" for k, v in failures.items()))
 
     st.divider()
     st.caption(
-        "These are proposals, not orders. Position sizing and risk validation arrive "
-        "in Phase 4; order placement in Phase 7."
+        "These are sized proposals, not orders. Nothing here can place a trade — "
+        "order placement arrives in Phase 7."
     )
 
 
-def _signal_card(signal, palette) -> None:
-    """One setup, with its reasons and levels."""
+def _signal_card(signal, palette, decision=None) -> None:
+    """One setup, with its reasons, levels and risk verdict."""
     with st.container(border=True):
         header, meter = st.columns([3, 2])
         header.markdown(
@@ -402,10 +431,32 @@ def _signal_card(signal, palette) -> None:
             unsafe_allow_html=True,
         )
 
+        if decision is not None:
+            if decision.approved:
+                st.markdown(
+                    f"**Risk validation: PASSED** — "
+                    f"{decision.shares} share(s), risking "
+                    f"${float(decision.risk_amount):,.2f} "
+                    f"(${float(decision.position_value):,.2f} position). "
+                    f"Limited by {decision.sizing.binding_constraint.description}."
+                )
+            else:
+                st.warning(
+                    f"**Risk validation: REJECTED** — {decision.rejection_reason}",
+                    icon="⚠️",
+                )
+
+        columns = st.columns(2)
         if signal.reasons:
-            st.markdown("**Why**")
-            for reason in signal.reasons:
-                st.markdown(f"- {reason}")
+            with columns[0]:
+                st.markdown("**Why the setup**")
+                for reason in signal.reasons:
+                    st.markdown(f"- {reason}")
+        if decision is not None:
+            with columns[1], st.expander("Risk checks"):
+                for check in decision.checks:
+                    mark = "✅" if check.passed else "❌"
+                    st.markdown(f"{mark} **{check.name}** — {check.detail}")
 
 
 def _chart(settings, controls: dict, palette) -> None:
@@ -464,7 +515,7 @@ def _chart(settings, controls: dict, palette) -> None:
             volume_period=indicators.volume_sma_period,
             show_bollinger=show_bands, show_levels=show_levels,
         ),
-        use_container_width=True,
+        width="stretch",
         config={"scrollZoom": True, "displaylogo": False},
     )
     st.caption(
@@ -478,7 +529,7 @@ def _chart(settings, controls: dict, palette) -> None:
         table = pd.DataFrame(
             {"Indicator": wanted, "Value": [latest[c] for c in wanted]}
         )
-        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.dataframe(table, width="stretch", hide_index=True)
 
 
 def _strategy_settings(controls: dict, palette) -> None:
