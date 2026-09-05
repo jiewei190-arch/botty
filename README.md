@@ -4,9 +4,9 @@ A modular, risk-first trading bot for US equities. Built to **test ideas safely*
 backtest a strategy on historical data, then paper trade it against a live market
 feed, with real-money trading locked behind two explicit switches.
 
-> **Status: Phase 1 of 10 complete.** The foundation and data layers are built and
-> tested. Strategies, risk management, backtesting and the dashboard follow in
-> later phases (see the [roadmap](#roadmap)).
+> **Status: Phases 1-2 of 10 complete.** The foundation, data and analysis layers
+> are built and tested. Strategies, risk management, backtesting and the
+> dashboard follow in later phases (see the [roadmap](#roadmap)).
 
 ---
 
@@ -64,13 +64,17 @@ botty/
 │   │   ├── logging_setup.py      Console + rotating file + JSON-lines sinks
 │   │   ├── retry.py              Exponential backoff for API calls
 │   │   └── timeframes.py         Bar-size parsing and calendar arithmetic
-│   ├── indicators/               Phase 2
+│   ├── indicators/
+│   │   ├── technical_indicators.py  SMA/EMA/RSI/MACD/Bollinger/ATR + signal helpers
+│   │   ├── trend_analysis.py        Weighted trend direction, strength, confidence
+│   │   ├── volume_analysis.py       Relative volume, participation, confirmation
+│   │   └── price_action.py          Swing points, support/resistance
 │   ├── strategies/               Phase 3
 │   ├── risk/                     Phase 4
 │   ├── backtesting/              Phase 6
 │   ├── dashboard/                Phase 9
 │   └── main.py                   CLI
-├── tests/                        151 tests, no credentials required
+├── tests/                        332 tests, no credentials required
 ├── logs/                         Runtime logs (gitignored)
 ├── storage/                      SQLite database + parquet cache (gitignored)
 ├── main.py                       Launcher
@@ -138,6 +142,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py fetch` | Download and preview historical bars |
 | `python main.py db-init` | Create or migrate the database |
 | `python main.py cache` | Inspect (`--clear` to empty) the bar cache |
+| `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
 
 Global flags: `--mode {backtest,paper,live}` and `--log-level {DEBUG,INFO,WARNING,ERROR}`.
 
@@ -154,6 +159,128 @@ python main.py fetch --symbols AAPL,NVDA --timeframe 1Day \
 # Bypass the cache to force a fresh download
 python main.py fetch --symbols SPY --timeframe 5Min --no-cache
 ```
+
+### Analysing a symbol
+
+```bash
+# Try it with no API keys at all — generated sample data
+python main.py analyze --demo --symbols AAPL
+
+# Real analysis of your watchlist
+python main.py analyze
+
+# One symbol on a daily timeframe
+python main.py analyze --symbols NVDA --timeframe 1Day
+```
+
+```
+================================================================
+MARKET ANALYSIS — AAPL
+================================================================
+
+Bars analysed : 300  (2026-08-22 13:30 to 2026-09-04 19:45 UTC)
+Price         : $234.07
+
+TREND
+  Direction   : BULLISH
+  Strength    : 72/100   (50 = neutral)
+  Confidence  : 84/100
+
+MOVING AVERAGES
+  EMA 9       : $233.11  (price above)
+  EMA 20      : $231.40  (price above)
+  EMA 50      : $228.85  (price above)
+  EMA 200     : $221.02  (price above)
+
+MOMENTUM
+  RSI 14      : 62.4  — NEUTRAL
+  MACD        : BULLISH  (increasing momentum)
+  EMA 9/20    : NONE
+
+VOLATILITY
+  ATR 14      : $1.86  (0.79% of price)
+  Bollinger   : NORMAL
+  Band width  : 0.0312
+
+VOLUME
+  Relative    : 1.42x average
+  Condition   : HIGH
+  Trend       : RISING
+
+KEY LEVELS
+  Resistance  : $238.90  (+2.06%, 3 touches)
+  Support     : $229.55  (-1.93%, 2 touches)
+
+SIGNALS
+  ✓ Bullish EMA alignment (EMA 9 > EMA 20 > EMA 50 > EMA 200)
+  ✓ Price above EMA 50
+  ✓ Higher highs and higher lows
+  ✓ Positive MACD momentum and rising
+  ✓ Above-average volume at 1.42x
+================================================================
+```
+
+---
+
+## The indicator engine
+
+Strategies never compute indicator maths themselves. They call
+`calculate_all_indicators()` once and read columns, so a backtest and the live
+scanner can never disagree about what a value was.
+
+```python
+from trading_bot.indicators import (
+    calculate_all_indicators, analyze_trend, analyze_volume, find_support_resistance,
+)
+
+enriched = calculate_all_indicators(bars)      # appends every indicator column
+trend = analyze_trend(enriched)                # BULLISH, 72/100, with reasons
+volume = analyze_volume(enriched)              # HIGH, 1.42x average
+levels = find_support_resistance(enriched)     # clustered from confirmed pivots
+```
+
+**Columns produced:** `SMA_20/50/100/200`, `EMA_9/20/50/200`, `RSI_14`, `MACD`,
+`MACD_SIGNAL`, `MACD_HISTOGRAM`, `BB_UPPER/MIDDLE/LOWER/WIDTH/PERCENT_B`,
+`ATR_14`, `ATR_14_PCT`, `VOLUME_SMA_20`, `RELATIVE_VOLUME`.
+
+Every period and threshold lives in `IndicatorConfig`, so a strategy or a
+backtest parameter sweep can vary them without touching calculation code:
+
+```python
+from trading_bot.indicators import IndicatorConfig
+fast = IndicatorConfig(rsi_period=7, ema_periods=(5, 13, 34), volume_spike_threshold=3.0)
+```
+
+### Conventions that determine whether values match your charts
+
+| Choice | Why |
+|---|---|
+| EMA seeded with an SMA | TA-Lib / TradingView convention. Seeding with the first value instead visibly changes the first few dozen bars. |
+| RSI and ATR use Wilder's smoothing | `alpha = 1/period`, not a simple average. This is what "RSI 14" means everywhere it is quoted. |
+| Bollinger uses population σ (`ddof=0`) | pandas defaults to the sample σ, which makes the bands too wide. |
+| True Range undefined on bar 1 | It needs a previous close, so ATR's first value lands at index `period`. |
+
+RSI, EMA and ATR are verified in the test suite against values derived
+independently — by hand from the indicator's definition, or by a separate plain
+Python loop.
+
+### Warm-up returns NaN, not a guess
+
+An EMA-200 computed from 30 bars is not a rough EMA-200, it is a wrong number.
+Every indicator returns `NaN` until it has enough history. `calculate_all_indicators`
+logs which indicators were short; pass `strict=True` to raise instead.
+
+### Two lookahead guards
+
+**Indicator maths is causal.** Every rolling window is trailing, never centred.
+A test proves it: computing on a truncated history reproduces the values
+computed on the full history, bar for bar.
+
+**Pivots carry a confirmation lag.** A swing high at bar `i` cannot be known
+until bar `i + strength`, because the rule needs the bars after it. Every
+`SwingPoint` records `confirmed_index`, and `find_support_resistance(as_of=N)`
+uses only pivots confirmed by bar `N` — so a backtest asking "what levels were
+visible here?" gets an honest answer.
 
 ---
 
@@ -271,8 +398,17 @@ pytest -v tests/test_settings.py
 
 The suite runs against synthetic bars and an in-memory database — **no API
 credentials or network access required**, so it is safe to run in CI. Tests
-cover the live-trading locks, bar normalization, the lookahead guard, cache
-coverage rules, P&L arithmetic, retry classification and CLI exit codes.
+cover the live-trading locks, bar normalization, the lookahead guards, cache
+coverage rules, P&L arithmetic, retry classification, CLI exit codes, and every
+indicator's maths against independently derived reference values.
+
+| Area | File | Tests |
+|---|---|---|
+| Indicator maths and validation | `tests/test_indicators.py` | 91 |
+| Swing points and levels | `tests/test_price_action.py` | 33 |
+| Trend classification | `tests/test_trend_analysis.py` | 17 |
+| Volume analysis | `tests/test_volume_analysis.py` | 30 |
+| Phase 1 foundation and CLI | 9 further files | 161 |
 
 ---
 
@@ -281,7 +417,7 @@ coverage rules, P&L arithmetic, retry classification and CLI exit codes.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Project setup, Alpaca connection, market data | **Complete** |
-| 2 | Technical indicator engine | Planned |
+| 2 | Technical indicator engine | **Complete** |
 | 3 | Strategy engine (momentum, mean reversion, breakout) | Planned |
 | 4 | Risk management and position sizing | Planned |
 | 5 | Market scanner with confidence scoring | Planned |

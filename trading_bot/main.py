@@ -9,6 +9,10 @@ Phase 1 commands::
     python main.py db-init         # create or migrate the database
     python main.py cache           # inspect or clear the bar cache
 
+Phase 2 adds::
+
+    python main.py analyze         # full technical analysis of a symbol
+
 Later phases add ``scan``, ``backtest``, ``run`` and ``dashboard``.
 """
 
@@ -35,6 +39,23 @@ from trading_bot.data.market_data import (
     MarketDataError,
     build_market_data,
     drop_incomplete_bars,
+)
+from trading_bot.indicators import (
+    BB_WIDTH_COL,
+    RELATIVE_VOLUME_COL,
+    IndicatorConfig,
+    analyze_trend,
+    analyze_volume,
+    atr_column,
+    calculate_all_indicators,
+    detect_bollinger_condition,
+    detect_ema_crossover,
+    detect_macd_momentum,
+    detect_macd_signal,
+    detect_rsi_condition,
+    ema_column,
+    find_support_resistance,
+    rsi_column,
 )
 from trading_bot.utils.logging_setup import configure_logging, log_banner
 from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES, Timeframe
@@ -84,6 +105,21 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
     fetch.add_argument("--csv-dir", help="Also write each symbol to CSV in this directory.")
     fetch.add_argument("--tail", type=int, default=5, help="Rows to preview (default: 5).")
+
+    analyze = subparsers.add_parser(
+        "analyze", help="Run the technical indicator engine over one or more symbols."
+    )
+    analyze.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
+    analyze.add_argument("--timeframe", default=None, help="Bar size (default: DATA_TIMEFRAME).")
+    analyze.add_argument(
+        "--bars", type=int, default=None, help="Bars of history to analyse (default: lookback)."
+    )
+    analyze.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run on generated sample data instead of the market — no API keys needed.",
+    )
+    analyze.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
 
     cache = subparsers.add_parser("cache", help="Inspect or clear the bar cache.")
     cache.add_argument("--clear", action="store_true", help="Delete cached files.")
@@ -327,6 +363,209 @@ def cmd_fetch(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _demo_bars(symbol: str, periods: int = 400):
+    """Generate a deterministic sample series for ``analyze --demo``.
+
+    This is **not** market data. It exists so the indicator engine can be
+    exercised end to end without API credentials.
+    """
+    import zlib
+
+    import numpy as np
+    import pandas as pd
+
+    # crc32, not hash(): Python randomises string hashing per process, which would
+    # make "deterministic" false and the demo unreproducible between runs.
+    seed = zlib.crc32(symbol.encode("utf-8"))
+    rng = np.random.default_rng(seed)
+    drift = float(rng.choice([0.0035, -0.0035, 0.0]))
+    close = 100 * np.exp(np.cumsum(rng.normal(drift, 0.005, periods)))
+    spread = np.abs(rng.normal(0, 0.004, periods)) * close
+    index = pd.date_range(
+        end=pd.Timestamp.now(tz="UTC").floor("15min"),
+        periods=periods,
+        freq="15min",
+        tz="UTC",
+        name="timestamp",
+    )
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    return pd.DataFrame(
+        {
+            "open": open_,
+            "high": np.maximum(open_, close) + spread,
+            "low": np.minimum(open_, close) - spread,
+            "close": close,
+            "volume": rng.integers(80_000, 600_000, periods).astype("float64"),
+        },
+        index=index,
+    )
+
+
+def _money(value: float | None, places: int = 2) -> str:
+    """Render a price, or ``n/a`` when the indicator is still warming up."""
+    return "n/a" if value is None else f"${value:,.{places}f}"
+
+
+def _price_note(close: float, average: float | None) -> str:
+    """Say whether price sits above or below a moving average."""
+    if average is None:
+        return ""
+    return "  (price above)" if close > average else "  (price below)"
+
+
+def _level_note(level, close: float) -> str:
+    """Describe a support/resistance level's distance and touch count."""
+    if level is None:
+        return "n/a"
+    return (
+        f"{_money(level.price)}  ({level.distance_pct(close):+.2f}%, "
+        f"{level.touches} touch{'es' if level.touches != 1 else ''})"
+    )
+
+
+def _render_analysis(symbol: str, frame, config: IndicatorConfig) -> None:
+    """Print the market-analysis report for one symbol."""
+    import pandas as pd
+
+    enriched = calculate_all_indicators(frame, config)
+    row = enriched.iloc[-1]
+    trend = analyze_trend(enriched, config)
+    volume = analyze_volume(enriched, config)
+    levels = find_support_resistance(enriched, config)
+    close = float(row["close"])
+
+    def value(column: str) -> float | None:
+        if column not in enriched.columns:
+            return None
+        raw = row[column]
+        return None if pd.isna(raw) else float(raw)
+
+    width = 64
+    print()
+    print("=" * width)
+    print(f"MARKET ANALYSIS \u2014 {symbol}")
+    print("=" * width)
+    print(
+        f"\nBars analysed : {len(enriched)}"
+        f"  ({enriched.index[0]:%Y-%m-%d %H:%M} to {enriched.index[-1]:%Y-%m-%d %H:%M} UTC)"
+    )
+    print(f"Price         : {_money(close)}")
+
+    print("\nTREND")
+    print(f"  Direction   : {trend.direction.value}")
+    print(f"  Strength    : {trend.strength}/100   (50 = neutral)")
+    print(f"  Confidence  : {trend.confidence}/100")
+
+    print("\nMOVING AVERAGES")
+    for period in sorted(config.ema_periods):
+        ema = value(ema_column(period))
+        print(f"  EMA {period:<4}    : {_money(ema)}{_price_note(close, ema)}")
+
+    print("\nMOMENTUM")
+    rsi_value = value(rsi_column(config.rsi_period))
+    rsi_text = "n/a" if rsi_value is None else f"{rsi_value:.1f}"
+    print(
+        f"  RSI {config.rsi_period:<4}    : {rsi_text}"
+        f"  \u2014 {detect_rsi_condition(enriched, config)}"
+    )
+    momentum = detect_macd_momentum(enriched, config).lower()
+    print(f"  MACD        : {detect_macd_signal(enriched, config)}  ({momentum} momentum)")
+    print(f"  EMA 9/20    : {detect_ema_crossover(enriched, 9, 20).signal}")
+
+    print("\nVOLATILITY")
+    atr_value = value(atr_column(config.atr_period))
+    atr_note = ""
+    if atr_value is not None and close > 0:
+        atr_note = f"  ({atr_value / close * 100:.2f}% of price)"
+    print(f"  ATR {config.atr_period:<4}    : {_money(atr_value)}{atr_note}")
+    print(f"  Bollinger   : {detect_bollinger_condition(enriched, config)}")
+    band_width = value(BB_WIDTH_COL)
+    print(f"  Band width  : {'n/a' if band_width is None else f'{band_width:.4f}'}")
+
+    print("\nVOLUME")
+    relative = value(RELATIVE_VOLUME_COL)
+    print(f"  Relative    : {'n/a' if relative is None else f'{relative:.2f}x average'}")
+    print(f"  Condition   : {volume.condition.value}")
+    print(f"  Trend       : {volume.trend}")
+
+    print("\nKEY LEVELS")
+    print(f"  Resistance  : {_level_note(levels.nearest_resistance, close)}")
+    print(f"  Support     : {_level_note(levels.nearest_support, close)}")
+
+    print("\nSIGNALS")
+    observations = list(trend.reasons) + list(volume.reasons)
+    if not observations:
+        print("  (no notable conditions)")
+    for observation in observations:
+        print(f"  \u2713 {observation}")
+    print()
+    print("=" * width)
+
+
+def cmd_analyze(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the Phase 2 indicator engine over the watchlist and print a report.
+
+    This is the Phase 2 demonstration path: it pulls bars through the Phase 1
+    market-data layer, enriches them with every configured indicator, and prints
+    the trend, momentum, volatility, volume and level analysis.
+    """
+    symbols = (
+        [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else list(settings.data.watchlist)
+    )
+    timeframe = Timeframe.parse(args.timeframe or settings.data.timeframe)
+    config = IndicatorConfig()
+    # Indicators need warm-up before the first usable value.
+    bars_wanted = args.bars or max(settings.data.lookback_bars, config.max_lookback + 50)
+
+    if args.demo:
+        banner = "!" * 64
+        print(f"\n{banner}")
+        print("  DEMO MODE \u2014 GENERATED SAMPLE DATA, NOT REAL MARKET DATA")
+        print("  Prices below are synthetic. Supply Alpaca credentials for live analysis.")
+        print(banner)
+        frames = {symbol: _demo_bars(symbol, bars_wanted) for symbol in symbols}
+        failed: dict[str, str] = {}
+    else:
+        provider = build_market_data(
+            settings.alpaca, settings.data, use_cache=not args.no_cache
+        )
+        logger.info(
+            "Fetching %s bars for %d symbol(s) to analyse", timeframe.label, len(symbols)
+        )
+        frames, report = provider.fetch_watchlist(
+            symbols, timeframe, lookback_bars=bars_wanted
+        )
+        # A forming bar must never reach the indicator engine.
+        frames = {
+            symbol: drop_incomplete_bars(frame, timeframe)
+            for symbol, frame in frames.items()
+        }
+        failed = dict(report.failed)
+
+    if not frames:
+        print("No data to analyse. Check credentials, symbols and timeframe.")
+        return EXIT_FAILURE
+
+    for symbol in sorted(frames):
+        frame = frames[symbol]
+        if frame.empty:
+            failed.setdefault(symbol, "no complete bars")
+            continue
+        try:
+            _render_analysis(symbol, frame, config)
+        except Exception as error:  # noqa: BLE001 - one bad symbol must not stop the run
+            logger.exception("Analysis failed for %s", symbol)
+            failed[symbol] = str(error)
+
+    if failed:
+        print("\nNot analysed:")
+        for symbol, reason in failed.items():
+            print(f"  ! {symbol}: {reason}")
+    return EXIT_OK
+
+
 def cmd_cache(settings: Settings, args: argparse.Namespace) -> int:
     cache = BarCache(
         settings.data.cache_dir,
@@ -370,6 +609,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_db_init(settings)
         if args.command == "fetch":
             return cmd_fetch(settings, args)
+        if args.command == "analyze":
+            return cmd_analyze(settings, args)
         if args.command == "cache":
             return cmd_cache(settings, args)
         parser.error(f"Unknown command {args.command!r}")

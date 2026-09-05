@@ -74,3 +74,41 @@ def test_fetch_without_credentials_fails_gracefully(capsys):
 def test_mode_override_is_applied(capsys):
     main(["--mode", "backtest", "config"])
     assert json.loads(capsys.readouterr().out)["trading_mode"] == "backtest"
+
+
+# -- Phase 2: analyze -------------------------------------------------------------
+
+
+def test_analyze_demo_runs_without_credentials(capsys):
+    """The demo path must work with no API keys, and say so loudly."""
+    assert main(["analyze", "--demo", "--symbols", "AAPL"]) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "NOT REAL MARKET DATA" in output
+    assert "MARKET ANALYSIS" in output
+    for section in ("TREND", "MOVING AVERAGES", "MOMENTUM", "VOLATILITY", "VOLUME", "SIGNALS"):
+        assert section in output, section
+
+
+def test_analyze_demo_handles_multiple_symbols(capsys):
+    assert main(["analyze", "--demo", "--symbols", "AAPL,NVDA"]) == EXIT_OK
+    output = capsys.readouterr().out
+    assert output.count("MARKET ANALYSIS") == 2
+
+
+def test_analyze_reports_a_trend_direction(capsys):
+    main(["analyze", "--demo", "--symbols", "SPY"])
+    output = capsys.readouterr().out
+    assert any(
+        label in output
+        for label in ("STRONG_BULLISH", "BULLISH", "NEUTRAL", "BEARISH", "STRONG_BEARISH")
+    )
+
+
+def test_analyze_without_credentials_fails_cleanly(capsys):
+    assert main(["analyze", "--symbols", "AAPL"]) == EXIT_FAILURE
+    assert "credentials are missing" in capsys.readouterr().err
+
+
+def test_analyze_respects_a_bar_count(capsys):
+    main(["analyze", "--demo", "--symbols", "AAPL", "--bars", "300"])
+    assert "Bars analysed : 300" in capsys.readouterr().out
