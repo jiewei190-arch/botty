@@ -1,0 +1,28 @@
+# Streamlit theme.
+#
+# Only the accent is set here. Light/dark is deliberately NOT forced: Streamlit
+# follows the viewer's preference, `st.context.theme` reports what it actually
+# rendered, and the chart palette is chosen from that — so the chrome and the
+# charts can never disagree. Pinning `base` here caused exactly that mismatch:
+# dark widgets under a light page.
+#
+# primaryColor is the categorical slot-1 blue from the validated palette, NOT
+# Streamlit's default red. That default paints widget accents *and* dataframe
+# progress columns, which rendered a STRONG_BULLISH trend with a red bar —
+# contradicting the rule that red means bearish everywhere in this app.
+
+[theme]
+# `base` is the single source of truth for light/dark. The app reads it back
+# with st.get_option("theme.base") to pick the chart palette, so the chrome and
+# the charts cannot disagree. Browser-preference detection was tried first and
+# was not stable across reruns — it rendered a light chart inside a dark app.
+# Change this one value to switch the whole dashboard.
+base = "dark"
+primaryColor = "#3987e5"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
