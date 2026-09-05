@@ -324,7 +324,7 @@ def _hunt(settings, controls: dict, palette) -> None:
 
     warning = feed_liquidity_warning(settings.alpaca.data_feed, float(min_turnover))
     if warning:
-        st.warning(warning, icon="📉")
+        st.warning(_md(warning), icon="📉")
 
     if submitted:
         if not strategy_names:
@@ -346,7 +346,7 @@ def _hunt(settings, controls: dict, palette) -> None:
                     include_leveraged=bool(include_leveraged),
                 )
             except Exception as error:  # noqa: BLE001 - surfaced in the UI
-                st.error(f"Hunt failed: {error}")
+                st.error(f"Hunt failed: {_md(error)}")
                 return
         st.session_state["hunt_sweep"] = sweep
         st.session_state["hunt_equity"] = float(equity)
@@ -387,7 +387,7 @@ def _hunt_results(sweep, equity: float, palette) -> None:
     )
 
     if sweep.halt_reason:
-        st.error(f"Trading halted: {sweep.halt_reason}")
+        st.error(f"Trading halted: {_md(sweep.halt_reason)}")
 
     with st.expander("Where the symbols went"):
         for line in sweep.summary_lines():
@@ -487,12 +487,12 @@ def _entry_plan_card(opportunity, palette) -> None:
                 f"{decision.sizing.binding_constraint.description}"
             )
         elif decision is not None:
-            st.warning(f"Not sized — {decision.rejection_reason}")
+            st.warning(f"Not sized — {_md(decision.rejection_reason)}")
 
         if signal.reasons:
             with st.expander("Why this fired"):
                 for reason in signal.reasons:
-                    st.markdown(f"- {reason}")
+                    st.markdown(f"- {_md(reason)}")
 
 
 def _overview(settings, controls: dict, palette) -> None:
@@ -661,7 +661,7 @@ def _scanner(settings, controls: dict, palette) -> None:
         )
 
     if result.halt_reason:
-        st.error(f"**Trading halted** — {result.halt_reason}", icon="🛑")
+        st.error(f"**Trading halted** — {_md(result.halt_reason)}", icon="🛑")
 
     st.caption(
         f"{result.summary()} · sizing against ${float(portfolio.equity):,.2f} equity"
@@ -893,7 +893,7 @@ def _chart(settings, controls: dict, palette) -> None:
         controls["demo"], settings, indicators,
     )
     if not loaded.ok:
-        st.error(f"Could not load {chosen}: {loaded.error}")
+        st.error(f"Could not load {chosen}: {_md(loaded.error)}")
         return
 
     frame = loaded.frame
@@ -1042,7 +1042,7 @@ def _backtest(settings, controls: dict, palette) -> None:
             try:
                 result = dashboard_data.run_backtest_cached(request, settings)
             except Exception as error:  # noqa: BLE001 - surfaced in the UI
-                st.error(f"Backtest failed: {error}")
+                st.error(f"Backtest failed: {_md(error)}")
                 return
         st.session_state["backtest_result"] = result
         st.session_state["backtest_frames"] = dashboard_data.backtest_frames(
@@ -1057,15 +1057,27 @@ def _backtest(settings, controls: dict, palette) -> None:
     _backtest_result(result, palette)
 
 
-def _dollars(value: float) -> str:
-    """Currency for a markdown context, with the dollar sign escaped.
+def _md(text: str) -> str:
+    """Escape a string for a Streamlit markdown context.
 
-    Streamlit renders markdown, where a pair of unescaped ``$`` delimits LaTeX
-    math: "$55.10** to make **$220.39" loses both signs and italicises the words
-    between them. Anything written with st.markdown needs this; the HTML metric
-    cards do not, because they are not parsed as markdown.
+    Streamlit renders markdown everywhere it shows text — ``st.markdown``, but
+    also ``st.warning``, ``st.error``, ``st.info`` and ``st.caption``. In
+    markdown a pair of unescaped ``$`` delimits LaTeX math, so any message
+    carrying two dollar amounts loses both signs and italicises everything
+    between them. It has bitten twice: once on the entry cards, and once on the
+    feed warning, where advice about turnover thresholds rendered as an
+    equation and became unreadable.
+
+    Apply this to any string produced elsewhere — a warning, an exception, a
+    risk rejection — rather than trusting it to stay free of dollar signs. The
+    HTML metric cards do not need it: they are not parsed as markdown.
     """
-    return f"\\${abs(value):,.2f}" if value >= 0 else f"-\\${abs(value):,.2f}"
+    return str(text).replace("$", "\\$")
+
+
+def _dollars(value: float) -> str:
+    """Currency for a markdown context, with the dollar sign escaped."""
+    return f"-\\${abs(value):,.2f}" if value < 0 else f"\\${abs(value):,.2f}"
 
 
 def _money(value: float) -> str:
@@ -1077,7 +1089,7 @@ def _backtest_result(result, palette) -> None:
     """Render a completed backtest."""
     metrics = result.metrics
     if metrics.sample_warning:
-        st.warning(metrics.sample_warning)
+        st.warning(_md(metrics.sample_warning))
 
     columns = st.columns(5)
     columns[0].markdown(
@@ -1263,7 +1275,7 @@ def _strategy_settings(controls: dict, palette) -> None:
             swing_strength=int(swing_strength),
         )
     except ValueError as error:
-        st.error(f"Invalid combination: {error}")
+        st.error(f"Invalid combination: {_md(error)}")
         return
 
     controls["indicator_overrides"] = {
