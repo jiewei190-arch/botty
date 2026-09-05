@@ -161,6 +161,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
 | `python main.py signals` | Run strategies and report trade setups (Phase 3) |
 | `python main.py scan` | Rank the watchlist by trade confidence (Phase 5) |
+| `python main.py backtest` | Simulate a strategy over historical bars (Phase 6) |
 | `python main.py dashboard` | Launch the Streamlit dashboard |
 
 Global flags: `--mode {backtest,paper,live}` and `--log-level {DEBUG,INFO,WARNING,ERROR}`.
@@ -503,6 +504,119 @@ reports its *would-be* size — exactly what you need to decide which limit to t
 
 ---
 
+## Backtesting
+
+```bash
+python main.py backtest --demo --symbols AAPL,MSFT,NVDA   # no API keys needed
+python main.py backtest --symbols AAPL,MSFT --strategy momentum \
+    --start 2025-01-02 --end 2025-06-30 --capital 25000
+python main.py backtest --symbols AAPL --trades --csv trades.csv
+```
+
+Output from the first of those, which needs no credentials and is reproducible:
+
+```
+====================================================================
+BACKTEST — AAPL, MSFT, NVDA · momentum
+15Min bars · 550 bars simulated
+====================================================================
+
+Starting equity   : $10,000.00
+Ending equity     : $10,149.96
+Net profit        : $149.96  (+1.50%)
+
+Trades            : 20  (7 win / 13 loss)
+Win rate          : 35.0%
+Profit factor     : 2.08
+Expectancy        : +0.412 R per trade
+
+Max drawdown      : 0.67%  ($68.40 over 118 bars)
+Sharpe ratio      : 5.31
+Time in market    : 9.6%
+Slippage cost     : $33.99
+
+!! Only 20 trade(s). Win rate, profit factor and Sharpe are dominated by luck
+   below about 30; treat them as anecdotes rather than measurements.
+```
+
+Those figures describe a **random walk**, not any real instrument — `--demo`
+generates synthetic bars. The warning at the bottom is the engine's, not a note
+added here for the README.
+
+The same run is available on the dashboard's **Backtest** page, with an equity
+curve, a drawdown panel, every trade in R, and entry/exit markers on price.
+
+### The four assumptions that decide whether a backtest is honest
+
+Most backtests flatter themselves in the same few places, so each is made
+explicit here rather than buried in the engine.
+
+**1. You cannot trade at a price you have only just observed.** A signal
+generated from bar `i`'s close fills at bar `i + 1`'s **open**. Filling at the
+signal bar's own close assumes you saw the close and traded at it, which is not
+a thing that can happen; on a trending instrument it quietly awards every trade
+a free bar of profit.
+
+**2. Gaps blow through stops.** A stop is a trigger, not a guaranteed price.
+When a bar opens beyond the stop, the fill is the *open*. A backtester that
+always fills stops exactly at the stop understates the tail of the loss
+distribution — the part that actually matters.
+
+**3. Costs are paid on both sides.** Commission, plus slippage that always
+moves *against* the trade. Slippage that sometimes helped would be modelling a
+friendlier market than the one you trade in.
+
+**4. An ambiguous bar resolves against you.** When a bar touches both the stop
+and the target, the stop wins. The intrabar path is unknowable, and assuming
+the good outcome is how a backtest manufactures an edge.
+
+The one place the model is *conservative* rather than pessimistic: a target
+fills exactly at its limit, never better, even when the bar traded well through
+it — a resting limit order would not have captured the overshoot.
+
+### The bar loop
+
+Each bar is processed in a fixed order, and nothing generated on a bar can act
+on that same bar:
+
+1. Exits queued on the previous bar fill at this bar's open.
+2. Entries queued on the previous bar fill at this bar's open.
+3. Stops and targets the bar traded through are executed.
+4. Equity is marked to market.
+5. Strategies read this bar's close and queue intentions for the *next* bar.
+
+Discretionary exits go through the same queue as entries. Deciding from a bar's
+close and filling at that bar's open would be selling at a price that came
+before the information behind the decision — a subtle lookahead that produces
+trades opening and closing on the same bar at the same price.
+
+### Metrics, and what they are worth
+
+Return, win rate, profit factor, expectancy in R, drawdown depth *and*
+duration, Sharpe, Sortino, exposure, cost totals and an exit breakdown.
+
+Two details worth knowing:
+
+- **Ratios annualise by the bar size**, not by a hardcoded 252. A Sharpe
+  computed from 15-minute bars and scaled by `sqrt(252)` would be overstated
+  about fivefold.
+- **Runs under 30 trades carry a warning.** Win rate, profit factor and Sharpe
+  are dominated by luck below that, so the result is labelled an anecdote
+  rather than presented as a measurement.
+
+Warm-up bars are excluded from the results. No position can exist during
+warm-up, so including them would pad the bar count, understate exposure, and
+drag Sharpe toward zero.
+
+### Every backtest is a measurement, not a forecast
+
+The engine tells you what a strategy *would have done* on that data under those
+assumptions. It cannot tell you what it will do next. Vary the date range,
+symbols and costs before believing any single number, and treat a strategy that
+only works on one window as untested rather than proven.
+
+---
+
 ## The strategy engine
 
 Three strategies with deliberately different edges, behind one interface:
@@ -713,16 +827,19 @@ indicator's maths against independently derived reference values.
 | Area | File | Tests |
 |---|---|---|
 | Risk gate and portfolio state | `tests/test_risk_manager.py` | 40 |
-| Scanner scoring and ranking | `tests/test_scanner.py` | 35 |
+| Scanner scoring and ranking | `tests/test_scanner.py` | 34 |
 | Position sizing arithmetic | `tests/test_position_sizing.py` | 32 |
-| Dashboard charts, palette, pages | `tests/test_dashboard.py` | 59 |
-| Strategy contract and registry | `tests/test_strategies.py` | 52 |
+| Dashboard charts, palette, pages | `tests/test_dashboard.py` | 87 |
+| Strategy contract and registry | `tests/test_strategies.py` | 57 |
 | Per-strategy behaviour | `tests/test_strategy_signals.py` | 36 |
-| Indicator maths and validation | `tests/test_indicators.py` | 91 |
-| Swing points and levels | `tests/test_price_action.py` | 33 |
+| Backtest engine and lookahead guards | `tests/test_backtest_engine.py` | 36 |
+| Performance metrics | `tests/test_backtest_metrics.py` | 28 |
+| Fill and cost model | `tests/test_backtest_execution.py` | 24 |
+| Indicator maths and validation | `tests/test_indicators.py` | 100 |
+| Swing points and levels | `tests/test_price_action.py` | 49 |
 | Trend classification | `tests/test_trend_analysis.py` | 17 |
 | Volume analysis | `tests/test_volume_analysis.py` | 30 |
-| Phase 1 foundation and CLI | 9 further files | 168 |
+| Phase 1 foundation and CLI | 10 further files | 186 |
 
 ---
 
@@ -735,7 +852,7 @@ indicator's maths against independently derived reference values.
 | 3 | Strategy engine (momentum, mean reversion, breakout) | **Complete** |
 | 4 | Risk management and position sizing | **Complete** |
 | 5 | Market scanner with confidence scoring | **Complete** |
-| 6 | Backtesting engine | Planned |
+| 6 | Backtesting engine | **Complete** |
 | 7 | Alpaca paper trading execution | Planned |
 | 8 | Position monitoring and automated exits | Planned |
 | 9 | Streamlit dashboard | **Read-only version shipped**; trade controls with Phase 7 |

@@ -452,3 +452,377 @@ def equity_placeholder(palette: Palette) -> go.Figure:
         yaxis={"visible": False},
     )
     return figure
+
+
+# ============================================================================
+# Backtest results
+#
+# Equity and drawdown are two measures of different scale, so they are two
+# stacked panels rather than one plot with two y-axes. Drawdown is drawn as a
+# filled area below zero because it only ever goes one way: filling it makes the
+# depth and the duration readable at a glance, which the equity line alone hides.
+# ============================================================================
+
+
+def equity_chart(
+    equity_curve: pd.Series,
+    drawdown: pd.Series,
+    palette: Palette,
+    *,
+    starting_equity: float | None = None,
+    height: int = 420,
+) -> go.Figure:
+    """Equity over the run, with its drawdown beneath.
+
+    Parameters
+    ----------
+    equity_curve:
+        Account equity marked to market on every bar.
+    drawdown:
+        Percentage below the running peak, as produced by ``drawdown_curve``.
+    starting_equity:
+        Drawn as a reference line, so profit and loss are readable without
+        arithmetic. Defaults to the curve's first value.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.66, 0.34],
+        subplot_titles=("Equity", "Drawdown from peak (%)"),
+    )
+    if equity_curve.empty:
+        return _empty_figure(palette, "No equity to plot", height=height)
+
+    baseline = (
+        float(starting_equity)
+        if starting_equity is not None
+        else float(equity_curve.iloc[0])
+    )
+
+    figure.add_trace(
+        go.Scatter(
+            x=equity_curve.index,
+            y=equity_curve.to_numpy(),
+            name="Equity",
+            mode="lines",
+            line={"color": palette.series_1, "width": 2},
+            hovertemplate="%{x|%d %b %H:%M}<br>$%{y:,.2f}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    # The starting line turns the curve into a profit-or-loss reading rather
+    # than a shape whose baseline the reader has to infer.
+    figure.add_hline(
+        y=baseline,
+        line={"color": palette.muted, "width": 1, "dash": "dot"},
+        row=1,
+        col=1,
+    )
+    figure.add_annotation(
+        x=equity_curve.index[-1],
+        y=baseline,
+        text=f" start ${baseline:,.0f}",
+        showarrow=False,
+        xanchor="left",
+        font={"color": palette.muted, "size": 11},
+        row=1,
+        col=1,
+    )
+    figure.add_annotation(
+        x=equity_curve.index[-1],
+        y=float(equity_curve.iloc[-1]),
+        text=f" ${float(equity_curve.iloc[-1]):,.0f}",
+        showarrow=False,
+        xanchor="left",
+        font={"color": palette.series_1, "size": 11},
+        row=1,
+        col=1,
+    )
+
+    if not drawdown.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=drawdown.index,
+                y=drawdown.to_numpy(),
+                name="Drawdown",
+                mode="lines",
+                line={"color": palette.bearish, "width": 1.5},
+                fill="tozeroy",
+                fillcolor=_translucent(palette.bearish, 0.18),
+                hovertemplate="%{x|%d %b %H:%M}<br>%{y:.2f}%<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+        worst = float(drawdown.min())
+        if worst < 0:
+            trough = drawdown.idxmin()
+            figure.add_annotation(
+                x=trough,
+                y=worst,
+                text=f"worst {abs(worst):.2f}%",
+                showarrow=True,
+                arrowhead=0,
+                arrowcolor=palette.muted,
+                ax=0,
+                ay=18,
+                font={"color": palette.text_secondary, "size": 11},
+                row=2,
+                col=1,
+            )
+
+    _apply_result_layout(figure, palette, height=height, rows=2)
+    figure.update_yaxes(tickprefix="$", row=1, col=1)
+    figure.update_yaxes(ticksuffix="%", row=2, col=1)
+    return figure
+
+
+def trade_chart(
+    data: pd.DataFrame,
+    trades: pd.DataFrame,
+    symbol: str,
+    palette: Palette,
+    *,
+    height: int = 420,
+) -> go.Figure:
+    """Price with entry and exit markers for one symbol.
+
+    Entries and exits are distinguished by *shape* as well as colour —
+    triangle-up for a long entry, triangle-down for a short — so the chart
+    survives colourblindness and greyscale. Exits are hollow squares, which
+    reads as "closing" without competing with the entry markers.
+    """
+    if data.empty:
+        return _empty_figure(palette, f"No bars for {symbol}", height=height)
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["close"].to_numpy(),
+            name="Close",
+            mode="lines",
+            line={"color": palette.muted, "width": 1.4},
+            hovertemplate="%{x|%d %b %H:%M}<br>$%{y:,.2f}<extra></extra>",
+        )
+    )
+
+    rows = (
+        trades[trades["symbol"] == symbol]
+        if not trades.empty and "symbol" in trades.columns
+        else trades.iloc[0:0]
+    )
+    if not rows.empty:
+        longs = rows[rows["direction"] == "LONG"]
+        shorts = rows[rows["direction"] != "LONG"]
+        for subset, marker, colour, label in (
+            (longs, "triangle-up", palette.bullish, "Long entry"),
+            (shorts, "triangle-down", palette.bearish, "Short entry"),
+        ):
+            if subset.empty:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=subset["entry_time"],
+                    y=subset["entry_price"],
+                    name=label,
+                    mode="markers",
+                    marker={
+                        "symbol": marker,
+                        "size": 11,
+                        "color": colour,
+                        "line": {"color": palette.surface, "width": 1.5},
+                    },
+                    hovertemplate=(
+                        f"{label}<br>%{{x|%d %b %H:%M}}<br>$%{{y:,.2f}}<extra></extra>"
+                    ),
+                )
+            )
+
+        # Exits are coloured by outcome, but the win/loss split is also written
+        # into the hover text — colour alone never carries the meaning.
+        wins = rows[rows["pnl"] > 0]
+        losses = rows[rows["pnl"] <= 0]
+        for subset, colour, label in (
+            (wins, palette.bullish, "Exit (profit)"),
+            (losses, palette.bearish, "Exit (loss)"),
+        ):
+            if subset.empty:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=subset["exit_time"],
+                    y=subset["exit_price"],
+                    name=label,
+                    mode="markers",
+                    marker={
+                        "symbol": "square-open",
+                        "size": 10,
+                        "color": colour,
+                        "line": {"width": 2},
+                    },
+                    customdata=subset[["pnl", "exit_reason"]].to_numpy(),
+                    hovertemplate=(
+                        "%{x|%d %b %H:%M}<br>$%{y:,.2f}"
+                        "<br>P&L $%{customdata[0]:,.2f}"
+                        "<br>%{customdata[1]}<extra></extra>"
+                    ),
+                )
+            )
+
+    _apply_result_layout(figure, palette, height=height, rows=1)
+    figure.update_layout(
+        title={
+            "text": f"{symbol} — trades",
+            "font": {"color": palette.text_primary, "size": 15},
+            "x": 0.005,
+            "xanchor": "left",
+        },
+    )
+    figure.update_yaxes(tickprefix="$")
+    return figure
+
+
+def r_multiple_chart(
+    trades: pd.DataFrame, palette: Palette, *, height: int = 260
+) -> go.Figure:
+    """Each trade's outcome in R, ordered as they happened.
+
+    R is the unit that makes trades comparable: a 2R win on a small position and
+    on a large one are the same result. Zero is drawn as the reference because
+    that, not the average, is the line a trade has to clear.
+    """
+    if trades.empty or "r_multiple" not in trades.columns:
+        return _empty_figure(palette, "No trades to plot", height=height)
+
+    values = trades["r_multiple"].astype("float64")
+    valid = values.notna()
+    if not valid.any():
+        return _empty_figure(palette, "No R multiples recorded", height=height)
+
+    ordered = trades.loc[valid].reset_index(drop=True)
+    outcomes = ordered["r_multiple"].astype("float64")
+    figure = go.Figure()
+    figure.add_trace(
+        go.Bar(
+            x=list(range(1, len(outcomes) + 1)),
+            y=outcomes.to_numpy(),
+            name="Result (R)",
+            marker={
+                "color": [
+                    palette.bullish if value > 0 else palette.bearish
+                    for value in outcomes
+                ],
+                "line": {"color": palette.surface, "width": 1},
+            },
+            customdata=ordered[["symbol", "exit_reason"]].to_numpy(),
+            hovertemplate=(
+                "Trade %{x}<br>%{customdata[0]}<br>%{y:.2f}R"
+                "<br>%{customdata[1]}<extra></extra>"
+            ),
+        )
+    )
+    figure.add_hline(y=0, line={"color": palette.axis, "width": 1})
+    _apply_result_layout(figure, palette, height=height, rows=1, legend=False)
+    figure.update_layout(
+        title={
+            "text": "Every trade, in R",
+            "font": {"color": palette.text_primary, "size": 15},
+            "x": 0.005,
+            "xanchor": "left",
+        },
+        bargap=0.25,
+    )
+    figure.update_xaxes(title_text="Trade number")
+    figure.update_yaxes(ticksuffix="R")
+    return figure
+
+
+def _translucent(colour: str, alpha: float) -> str:
+    """A hex colour as rgba, for fills that must not compete with lines."""
+    value = colour.lstrip("#")
+    if len(value) != 6:
+        return colour
+    red, green, blue = (int(value[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({red},{green},{blue},{alpha})"
+
+
+def _empty_figure(palette: Palette, message: str, *, height: int) -> go.Figure:
+    """A labelled blank, so an empty result reads as empty rather than broken."""
+    figure = go.Figure()
+    figure.update_layout(
+        template=palette.plotly_template,
+        height=height,
+        paper_bgcolor=palette.page,
+        plot_bgcolor=palette.surface,
+        margin={"l": 8, "r": 8, "t": 8, "b": 8},
+        annotations=[
+            {
+                "text": message,
+                "showarrow": False,
+                "font": {"color": palette.muted, "size": 13},
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.5,
+                "y": 0.5,
+            }
+        ],
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+    )
+    return figure
+
+
+def _apply_result_layout(
+    figure: go.Figure,
+    palette: Palette,
+    *,
+    height: int,
+    rows: int,
+    legend: bool = True,
+) -> None:
+    """Shared chrome for the result charts."""
+    axis = _axis_style(palette)
+    figure.update_layout(
+        template=palette.plotly_template,
+        height=height,
+        margin={"l": 8, "r": 112, "t": 44, "b": 34},  # right margin holds the end labels
+        paper_bgcolor=palette.page,
+        plot_bgcolor=palette.surface,
+        font={"color": palette.text_secondary, "size": 12},
+        showlegend=legend,
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.005,
+            "xanchor": "right",
+            "x": 1,
+            "font": {"color": palette.text_secondary, "size": 11},
+            "bgcolor": "rgba(0,0,0,0)",
+        },
+        hovermode="x unified" if rows > 1 else "closest",
+        dragmode="pan",
+    )
+    if rows == 1:
+        # A plain go.Figure has no subplot grid, and addressing an axis by
+        # row/col on one raises rather than being ignored.
+        figure.update_xaxes(**axis)
+        figure.update_yaxes(**axis)
+    else:
+        for row in range(1, rows + 1):
+            figure.update_xaxes(**axis, row=row, col=1)
+            figure.update_yaxes(**axis, row=row, col=1)
+
+    for annotation in figure.layout.annotations:
+        if annotation.xref == "paper":
+            annotation.font.color = palette.text_secondary
+            annotation.font.size = 12
+            annotation.x = 0.005
+            annotation.xanchor = "left"

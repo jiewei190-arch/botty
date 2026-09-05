@@ -15,8 +15,11 @@ import pytest
 from tests.conftest import make_bars
 from trading_bot.dashboard.charts import (
     confidence_bar,
+    equity_chart,
     equity_placeholder,
     price_chart,
+    r_multiple_chart,
+    trade_chart,
 )
 from trading_bot.dashboard.theme import (
     CONTEXT_EMA,
@@ -320,9 +323,195 @@ def test_the_scanner_page_ranks_and_sizes_opportunities(app_path):
     assert "probability of profit" in rendered
 
 
+def _click(app, label: str):
+    """Press a button by label. Form submit buttons appear in ``app.button``."""
+    for button in app.button:
+        if button.label == label:
+            return button.click()
+    raise AssertionError(f"no button labelled {label!r}: {[b.label for b in app.button]}")
+
+
+def test_the_backtest_page_runs_and_renders_a_result(app_path):
+    """Submitting the form is what exercises the result charts.
+
+    Loading the page only builds the form; every result chart is built after
+    the run, so a figure that raises at render time (addressing a subplot axis
+    on a plain figure, say) is invisible until the button is pressed.
+    """
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file(app_path, default_timeout=900)
+    app.run()
+    app.radio[0].set_value("Backtest").run()
+    _click(app, "Run backtest").run()
+
+    assert not app.exception, f"backtest page raised: {app.exception}"
+    rendered = " ".join(str(item.value) for item in app.markdown)
+    assert "Net profit" in rendered
+    assert "Max drawdown" in rendered
+    # A result is never presented as a forecast.
+    captions = " ".join(str(item.value) for item in app.caption)
+    assert "not a forecast" in captions
+
+
+def test_the_backtest_page_rejects_a_backwards_date_range(app_path):
+    from datetime import date, timedelta
+
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file(app_path, default_timeout=900)
+    app.run()
+    app.radio[0].set_value("Backtest").run()
+    # Push the start past the end.
+    app.date_input[0].set_value(date.today())
+    app.date_input[1].set_value(date.today() - timedelta(days=30))
+    _click(app, "Run backtest").run()
+
+    assert not app.exception
+    assert any("before the end date" in str(item.value) for item in app.error)
+
+
 def test_the_app_uses_no_deprecated_streamlit_apis(app_path):
     """`use_container_width` was removed after 2025-12-31."""
     from pathlib import Path
 
     source = Path(app_path).read_text()
     assert "use_container_width" not in source
+
+
+# ============================================================================
+# Backtest result charts
+#
+# These figures are built from a backtest's output, which is a shape the price
+# chart never sees: an equity Series, a drawdown Series, and a trade table. The
+# render-time failures they can hit — addressing a subplot axis on a plain
+# figure, an empty trade list, a symbol with no trades — do not show up at
+# import time, so each has a test.
+# ============================================================================
+
+
+@pytest.fixture(scope="module")
+def backtest_result():
+    """A real backtest over generated bars, so the charts see real output."""
+    from datetime import UTC, datetime
+
+    from trading_bot.backtesting import BacktestConfig, Backtester
+    from trading_bot.strategies import build_strategy
+
+    strategy = build_strategy("momentum")
+    frames = {
+        symbol: strategy.prepare(
+            make_bars(400, start=datetime(2025, 6, 2, tzinfo=UTC), seed=seed)
+        )
+        for symbol, seed in (("AAA", 11), ("BBB", 23))
+    }
+    result = Backtester([strategy], BacktestConfig(starting_equity=25_000.0)).run(frames)
+    return result, frames
+
+
+def test_equity_chart_stacks_equity_over_drawdown(backtest_result, palette):
+    result, _ = backtest_result
+    figure = equity_chart(result.equity_curve, result.drawdown, palette)
+    axes = {trace.yaxis or "y" for trace in figure.data}
+    assert len(axes) == 2, "equity and drawdown must be separate panels"
+
+
+def test_equity_chart_has_no_secondary_y_axis(backtest_result, palette):
+    """Two scales on one plot is the most common way a chart misleads."""
+    result, _ = backtest_result
+    figure = equity_chart(result.equity_curve, result.drawdown, palette)
+    for name in dir(figure.layout):
+        if name.startswith("yaxis"):
+            axis = getattr(figure.layout, name, None)
+            if axis is not None:
+                assert getattr(axis, "overlaying", None) is None
+
+
+def test_equity_chart_marks_the_starting_equity(backtest_result, palette):
+    result, _ = backtest_result
+    figure = equity_chart(
+        result.equity_curve, result.drawdown, palette, starting_equity=25_000.0
+    )
+    labels = [a.text for a in figure.layout.annotations if a.text]
+    assert any("25,000" in text for text in labels)
+
+
+def test_equity_chart_handles_an_empty_curve(palette):
+    figure = equity_chart(pd.Series(dtype="float64"), pd.Series(dtype="float64"), palette)
+    assert figure.layout.annotations
+    assert "No equity" in figure.layout.annotations[0].text
+
+
+def test_trade_chart_marks_entries_by_shape_not_only_colour(backtest_result, palette):
+    result, frames = backtest_result
+    figure = trade_chart(frames["AAA"], result.trade_frame, "AAA", palette)
+    markers = {
+        trace.marker.symbol
+        for trace in figure.data
+        if trace.mode == "markers" and trace.marker.symbol
+    }
+    assert markers, "no trade markers were drawn"
+    # Entry and exit must differ in shape, not just in colour.
+    assert len(markers) >= 2
+
+
+def test_trade_chart_names_every_marker_series(backtest_result, palette):
+    result, frames = backtest_result
+    figure = trade_chart(frames["AAA"], result.trade_frame, "AAA", palette)
+    for trace in figure.data:
+        assert trace.name, "an unnamed trace cannot appear in the legend"
+
+
+def test_trade_chart_only_draws_the_chosen_symbol(backtest_result, palette):
+    result, frames = backtest_result
+    trades = result.trade_frame
+    if trades.empty:
+        pytest.skip("this run produced no trades")
+    figure = trade_chart(frames["AAA"], trades, "AAA", palette)
+    plotted = sum(
+        len(trace.x) for trace in figure.data if trace.mode == "markers"
+    )
+    expected = len(trades[trades["symbol"] == "AAA"]) * 2  # an entry and an exit
+    assert plotted == expected
+
+
+def test_trade_chart_handles_a_symbol_with_no_trades(backtest_result, palette):
+    result, frames = backtest_result
+    figure = trade_chart(frames["AAA"], result.trade_frame.iloc[0:0], "AAA", palette)
+    assert len(figure.data) == 1  # just the price line
+
+
+def test_trade_chart_handles_an_empty_frame(palette):
+    figure = trade_chart(pd.DataFrame(), pd.DataFrame(), "AAA", palette)
+    assert "No bars" in figure.layout.annotations[0].text
+
+
+def test_r_multiple_chart_builds_without_a_subplot_grid(backtest_result, palette):
+    """A plain figure raises if an axis is addressed by row and column."""
+    result, _ = backtest_result
+    figure = r_multiple_chart(result.trade_frame, palette)
+    assert figure.data
+
+
+def test_r_multiple_chart_handles_no_trades(palette):
+    figure = r_multiple_chart(pd.DataFrame(), palette)
+    assert "No trades" in figure.layout.annotations[0].text
+
+
+def test_r_multiple_chart_handles_missing_r_values(palette):
+    trades = pd.DataFrame({"r_multiple": [None, None], "symbol": ["A", "A"],
+                           "exit_reason": ["STOP_LOSS", "STOP_LOSS"]})
+    figure = r_multiple_chart(trades, palette)
+    assert "No R multiples" in figure.layout.annotations[0].text
+
+
+def test_result_charts_paint_the_palette_background(backtest_result, palette):
+    """A transparent background would borrow the host's theme."""
+    result, frames = backtest_result
+    for figure in (
+        equity_chart(result.equity_curve, result.drawdown, palette),
+        trade_chart(frames["AAA"], result.trade_frame, "AAA", palette),
+        r_multiple_chart(result.trade_frame, palette),
+    ):
+        assert figure.layout.paper_bgcolor == palette.page
+        assert figure.layout.plot_bgcolor == palette.surface

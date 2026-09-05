@@ -17,6 +17,12 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from trading_bot.backtesting.runner import (
+    BacktestRequest,
+    build_strategies,
+    load_data,
+    run_backtest,
+)
 from trading_bot.config.settings import Settings, TradingMode, load_settings
 from trading_bot.data.database import Database
 from trading_bot.data.market_data import build_market_data, drop_incomplete_bars
@@ -31,6 +37,10 @@ logger = logging.getLogger(__name__)
 #: Seconds a fetched frame stays cached. Short enough to feel live, long enough
 #: that clicking around does not burn rate limit.
 FETCH_TTL = 60
+
+#: Backtest results are cached longer than quotes: the inputs are historical
+#: and settled, so a result only changes when the request does.
+BACKTEST_TTL = 900
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,3 +292,34 @@ def database_summary(settings: Settings) -> dict[str, Any]:
     except Exception as error:  # noqa: BLE001
         logger.warning("Could not read the database: %s", error)
         return {"error": str(error)}
+
+
+@st.cache_data(ttl=BACKTEST_TTL, show_spinner=False, hash_funcs={Settings: id})
+def run_backtest_cached(_request: BacktestRequest, _settings: Settings):
+    """Run a backtest, caching on the request.
+
+    Backtests are expensive enough that re-running one on every rerender would
+    make the page unusable — Streamlit reruns the whole script on each widget
+    change. The request is a frozen dataclass, so caching on it is safe: two
+    equal requests describe the same simulation.
+    """
+    return run_backtest(_request, _settings)
+
+
+@st.cache_data(ttl=BACKTEST_TTL, show_spinner=False, hash_funcs={Settings: id})
+def backtest_frames(
+    _request: BacktestRequest, _settings: Settings
+) -> dict[str, Any]:
+    """Bars for the charts, over the same window the backtest ran on.
+
+    Fetched through the same loader as the run itself, so the markers land on
+    the bars that produced them rather than on a window that has since moved.
+    """
+    request, settings = _request, _settings
+    try:
+        strategies = build_strategies(request)
+        warmup = max(strategy.min_bars for strategy in strategies)
+        return load_data(request, settings, warmup=warmup).frames
+    except Exception:  # noqa: BLE001 - charts are optional, the result is not
+        logger.exception("Could not reload frames for the backtest charts")
+        return {}

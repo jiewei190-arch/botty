@@ -17,6 +17,7 @@ or directly::
 from __future__ import annotations
 
 import sys
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 if __package__ in (None, ""):  # pragma: no cover - streamlit runs this as a script
@@ -26,11 +27,16 @@ import pandas as pd
 import streamlit as st
 
 from trading_bot import __version__
+from trading_bot.backtesting import CostModel
+from trading_bot.backtesting.runner import BacktestRequest
 from trading_bot.dashboard import data as dashboard_data
 from trading_bot.dashboard.charts import (
     confidence_bar,
+    equity_chart,
     equity_placeholder,
     price_chart,
+    r_multiple_chart,
+    trade_chart,
 )
 from trading_bot.dashboard.theme import app_css, direction_marker, get_palette
 from trading_bot.indicators import (
@@ -47,7 +53,7 @@ from trading_bot.indicators import (
 from trading_bot.strategies import available_strategies
 from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES
 
-PAGES = ("Overview", "Market Scanner", "Chart", "Strategy Settings")
+PAGES = ("Overview", "Market Scanner", "Chart", "Backtest", "Strategy Settings")
 
 
 def main() -> None:
@@ -77,6 +83,8 @@ def main() -> None:
         _scanner(settings, controls, palette)
     elif page == "Chart":
         _chart(settings, controls, palette)
+    elif page == "Backtest":
+        _backtest(settings, controls, palette)
     else:
         _strategy_settings(controls, palette)
 
@@ -655,6 +663,252 @@ def _chart(settings, controls: dict, palette) -> None:
             {"Indicator": wanted, "Value": [latest[c] for c in wanted]}
         )
         st.dataframe(table, width="stretch", hide_index=True)
+
+
+def _backtest(settings, controls: dict, palette) -> None:
+    """Run a backtest from the browser and read the result.
+
+    The run is deliberately explicit rather than automatic: backtests are slow
+    enough that firing one on every widget change would make the page unusable,
+    and cheap enough to re-run that a button is no hardship.
+    """
+    st.subheader("Backtest")
+    st.caption(
+        "Simulates a strategy candle by candle over historical bars. Entries fill "
+        "at the next bar's open, stops honour gaps, and costs are charged both "
+        "ways — so the result is a measurement under stated assumptions, not a "
+        "forecast."
+    )
+
+    with st.form("backtest"):
+        first, second, third = st.columns(3)
+        symbols_raw = first.text_input(
+            "Symbols", value=", ".join(controls["symbols"][:5]),
+            help="Comma-separated. More symbols means a longer run.",
+        )
+        strategy_names = second.multiselect(
+            "Strategies", available_strategies(), default=["momentum"],
+        )
+        capital = third.number_input(
+            "Starting capital", min_value=100.0, value=10_000.0, step=1_000.0,
+        )
+
+        fourth, fifth, sixth = st.columns(3)
+        today = date.today()
+        start_date = fourth.date_input(
+            "Start", value=today - timedelta(days=60), max_value=today,
+        )
+        end_date = fifth.date_input("End", value=today, max_value=today)
+        slippage = sixth.number_input(
+            "Slippage %", min_value=0.0, max_value=5.0, value=0.05, step=0.01,
+            format="%.3f",
+            help="Applied to every fill, always against the trade.",
+        )
+
+        seventh, eighth, ninth = st.columns(3)
+        commission = seventh.number_input(
+            "Commission per fill", min_value=0.0, value=0.0, step=0.5,
+        )
+        risk_pct = eighth.number_input(
+            "Risk per trade %", min_value=0.05, max_value=10.0,
+            value=float(settings.risk.max_risk_per_trade_pct), step=0.25,
+        )
+        max_positions = ninth.number_input(
+            "Max open positions", min_value=1, max_value=20,
+            value=int(settings.risk.max_open_positions), step=1,
+        )
+        submitted = st.form_submit_button("Run backtest", type="primary")
+
+    if submitted:
+        symbols = tuple(
+            item.strip().upper() for item in symbols_raw.split(",") if item.strip()
+        )
+        if not symbols:
+            st.error("Enter at least one symbol.")
+            return
+        if not strategy_names:
+            st.error("Choose at least one strategy.")
+            return
+        if start_date >= end_date:
+            st.error("The start date must be before the end date.")
+            return
+
+        request = BacktestRequest(
+            symbols=symbols,
+            strategies=tuple(strategy_names),
+            timeframe=controls["timeframe"],
+            start=datetime.combine(start_date, time.min, tzinfo=UTC),
+            end=datetime.combine(end_date, time.min, tzinfo=UTC),
+            starting_equity=float(capital),
+            costs=CostModel(
+                commission_per_trade=float(commission),
+                slippage_pct=float(slippage),
+            ),
+            risk=settings.risk.model_copy(
+                update={
+                    "max_risk_per_trade_pct": float(risk_pct),
+                    "max_open_positions": int(max_positions),
+                }
+            ),
+            demo=controls["demo"],
+        )
+        with st.spinner(f"Simulating {len(symbols)} symbol(s)…"):
+            try:
+                result = dashboard_data.run_backtest_cached(request, settings)
+            except Exception as error:  # noqa: BLE001 - surfaced in the UI
+                st.error(f"Backtest failed: {error}")
+                return
+        st.session_state["backtest_result"] = result
+        st.session_state["backtest_frames"] = dashboard_data.backtest_frames(
+            request, settings
+        )
+
+    result = st.session_state.get("backtest_result")
+    if result is None:
+        st.info("Set the parameters above and run a backtest to see results here.")
+        return
+
+    _backtest_result(result, palette)
+
+
+def _money(value: float) -> str:
+    """Currency with the sign in front of the symbol, not after it."""
+    return f"-${abs(value):,.2f}" if value < 0 else f"${value:,.2f}"
+
+
+def _backtest_result(result, palette) -> None:
+    """Render a completed backtest."""
+    metrics = result.metrics
+    if metrics.sample_warning:
+        st.warning(metrics.sample_warning)
+
+    columns = st.columns(5)
+    columns[0].markdown(
+        _metric(
+            "Net profit",
+            _money(metrics.net_profit),
+            f"{metrics.total_return_pct:+.2f}% on ${metrics.starting_equity:,.0f}",
+        ),
+        unsafe_allow_html=True,
+    )
+    columns[1].markdown(
+        _metric(
+            "Trades", f"{metrics.total_trades}",
+            f"{metrics.wins} win / {metrics.losses} loss · {metrics.win_rate:.0f}%",
+        ),
+        unsafe_allow_html=True,
+    )
+    columns[2].markdown(
+        _metric(
+            "Profit factor",
+            "∞" if metrics.profit_factor == float("inf") else f"{metrics.profit_factor:.2f}",
+            f"expectancy {metrics.expectancy_r:+.2f}R per trade",
+        ),
+        unsafe_allow_html=True,
+    )
+    columns[3].markdown(
+        _metric(
+            "Max drawdown", f"{metrics.max_drawdown_pct:.2f}%",
+            f"${metrics.max_drawdown_value:,.0f} lost over "
+            f"{metrics.max_drawdown_bars} bars",
+        ),
+        unsafe_allow_html=True,
+    )
+    columns[4].markdown(
+        _metric(
+            "Sharpe", f"{metrics.sharpe_ratio:.2f}",
+            f"Sortino {metrics.sortino_ratio:.2f} · {metrics.exposure_pct:.0f}% in market",
+        ),
+        unsafe_allow_html=True,
+    )
+
+    st.plotly_chart(
+        equity_chart(
+            result.equity_curve, result.drawdown, palette,
+            starting_equity=metrics.starting_equity,
+        ),
+        width="stretch",
+        config={"displaylogo": False},
+    )
+
+    trades = result.trade_frame
+    if not trades.empty:
+        st.plotly_chart(
+            r_multiple_chart(trades, palette),
+            width="stretch",
+            config={"displaylogo": False},
+        )
+
+    left, right = st.columns([2, 3])
+    with left:
+        st.markdown("**Costs and exits**")
+        st.markdown(
+            f"- Commission paid: **${metrics.total_commission:,.2f}**\n"
+            f"- Slippage cost: **${metrics.total_slippage:,.2f}**\n"
+            f"- Stops that gapped: **{metrics.gapped_stops}**\n"
+            f"- Signals generated: **{result.signals_generated}** "
+            f"({result.signals_rejected} rejected by risk)"
+        )
+    with right:
+        if metrics.exit_breakdown:
+            st.markdown("**How trades ended**")
+            st.dataframe(
+                pd.DataFrame(
+                    sorted(
+                        metrics.exit_breakdown.items(),
+                        key=lambda item: -item[1],
+                    ),
+                    columns=["Exit reason", "Count"],
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+    if not trades.empty:
+        symbols = sorted(trades["symbol"].unique())
+        chosen = st.selectbox("Trades on chart", symbols, key="backtest_symbol")
+        frame = st.session_state.get("backtest_frames", {}).get(chosen)
+        if frame is not None:
+            st.plotly_chart(
+                trade_chart(frame, trades, chosen, palette),
+                width="stretch",
+                config={"scrollZoom": True, "displaylogo": False},
+            )
+
+        with st.expander(f"All {len(trades)} trades"):
+            st.dataframe(
+                trades[
+                    [
+                        "symbol", "direction", "entry_time", "entry_price",
+                        "exit_time", "exit_price", "quantity", "pnl",
+                        "r_multiple", "bars_held", "exit_reason",
+                    ]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        st.download_button(
+            "Download trades as CSV",
+            trades.to_csv(index=False),
+            file_name="backtest_trades.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info(
+            "No trades were taken. Widen the date range, lower the confidence "
+            "floor on the Strategy Settings page, or try another strategy."
+        )
+
+    if result.rejection_reasons:
+        with st.expander("Why signals were rejected by risk"):
+            st.dataframe(
+                pd.DataFrame(
+                    sorted(result.rejection_reasons.items(), key=lambda i: -i[1]),
+                    columns=["Failed check", "Count"],
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
 
 def _strategy_settings(controls: dict, palette) -> None:
