@@ -59,6 +59,11 @@ from trading_bot.indicators import (
 
 logger = logging.getLogger(__name__)
 
+#: Relative tolerance when checking a strategy-supplied target against the
+#: reward:risk floor. The ratio is recovered from three prices, so a target
+#: placed exactly on the floor can come back a fraction below it.
+RATIO_TOLERANCE = 1e-9
+
 
 class StrategyError(Exception):
     """Base class for strategy-layer failures."""
@@ -716,7 +721,9 @@ class BaseStrategy(ABC):
         if target_override is not None:
             risk = abs(entry_price - stop_loss)
             reward = abs(target_override - entry_price)
-            pays = risk > 0 and reward / risk >= self.config.min_risk_reward
+            pays = risk > 0 and reward / risk >= self.config.min_risk_reward * (
+                1 - RATIO_TOLERANCE
+            )
             if pays:
                 take_profit = target_override
                 notes.append("Target set by the strategy's own thesis")

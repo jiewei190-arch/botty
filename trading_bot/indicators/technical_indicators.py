@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, Literal
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -56,6 +57,55 @@ logger = logging.getLogger(__name__)
 
 #: Columns an input frame must provide (the Phase 1 normalized bar schema).
 REQUIRED_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
+
+#: Key under which a frame records that it has already been content-validated.
+#: Stored in ``DataFrame.attrs``, which pandas propagates through slicing.
+_VALIDATED_KEY = "_trading_bot_validated_rows"
+
+#: Proves the mark was written by this process rather than restored from a
+#: pickle or copied in from foreign data. It is a string because pandas
+#: *deep-copies* ``attrs`` when propagating them through a slice: an ``object()``
+#: sentinel comes back as a different object and would never match, while an
+#: immutable string is returned as-is. Randomising it per process keeps a
+#: serialised frame from carrying a stale proof into a later run.
+_VALIDATION_TOKEN = f"trading-bot-ohlcv-validated-{uuid4().hex}"
+
+
+def mark_validated(data: pd.DataFrame) -> pd.DataFrame:
+    """Record that ``data`` has passed the expensive content checks.
+
+    Why this exists
+    ---------------
+    Every content check in :func:`validate_ohlcv` scans whole columns, so it
+    costs O(rows). A backtest calls a strategy once per bar with an expanding
+    prefix of the same frame, which makes revalidation O(rows^2) — it measured as
+    47% of a backtest's runtime. Every one of those checks is a "for all rows"
+    predicate, and sortedness is prefix-closed too, so validating a frame once
+    proves every prefix of it valid. This marks that proof.
+
+    The mark records the row count it covers, and is honoured only for frames no
+    longer than that. Appending bars (a live loop doing ``pd.concat``) therefore
+    revalidates, even though pandas would carry the attribute across. The cheap
+    structural checks — shape, required columns, index type, ``min_rows`` — still
+    run every time, so dropping a column cannot slip through either.
+
+    Marking does not validate. Call this only just after ``validate_ohlcv``
+    itself has passed on the same frame.
+    """
+    # A single string, not a (token, rows) tuple: pandas deep-copies attrs on
+    # every operation that propagates them, and deepcopy returns an immutable
+    # string as-is while rebuilding a tuple element by element.
+    data.attrs[_VALIDATED_KEY] = f"{_VALIDATION_TOKEN}:{len(data)}"
+    return data
+
+
+def _content_already_validated(data: pd.DataFrame) -> bool:
+    """Whether ``data`` is a prefix of a frame that passed the content checks."""
+    mark = data.attrs.get(_VALIDATED_KEY)
+    if not isinstance(mark, str):
+        return False
+    token, _, rows = mark.rpartition(":")
+    return token == _VALIDATION_TOKEN and rows.isdigit() and len(data) <= int(rows)
 
 # Column names for indicators that do not vary with a period.
 MACD_COL = "MACD"
@@ -260,6 +310,10 @@ def validate_ohlcv(
     present; the index is a sorted, duplicate-free ``DatetimeIndex``; price and
     volume columns are numeric, finite and non-negative; and enough rows exist.
 
+    The column-scanning checks are skipped for a frame carrying a
+    :func:`mark_validated` proof that covers it; the structural checks always
+    run. See that function for why, and for what the proof does not cover.
+
     Parameters
     ----------
     data:
@@ -296,43 +350,49 @@ def validate_ohlcv(
             f"Present columns: {list(data.columns)}"
         )
 
-    if require_index:
-        if not isinstance(data.index, pd.DatetimeIndex):
-            raise InvalidDataError(
-                f"{name} must be indexed by timestamp, got {type(data.index).__name__}"
-            )
-        if not data.index.is_monotonic_increasing:
-            raise InvalidDataError(
-                f"{name} is not sorted by timestamp. Indicators assume chronological "
-                "order; sort with data.sort_index() first."
-            )
-        if data.index.has_duplicates:
-            duplicates = data.index[data.index.duplicated()].unique()[:3].tolist()
-            raise InvalidDataError(
-                f"{name} contains duplicate timestamps (e.g. {duplicates}). "
-                "Deduplicate before calculating indicators."
-            )
+    if require_index and not isinstance(data.index, pd.DatetimeIndex):
+        raise InvalidDataError(
+            f"{name} must be indexed by timestamp, got {type(data.index).__name__}"
+        )
 
-    for column in REQUIRED_COLUMNS:
-        series = data[column]
-        if not pd.api.types.is_numeric_dtype(series):
-            raise InvalidDataError(
-                f"{name}['{column}'] must be numeric, got dtype {series.dtype}"
-            )
-        if series.isna().any():
-            count = int(series.isna().sum())
-            raise InvalidDataError(
-                f"{name}['{column}'] contains {count} missing value(s). "
-                "Indicators would propagate them silently; clean the data first."
-            )
-        if np.isinf(series.to_numpy(dtype="float64")).any():
-            raise InvalidDataError(f"{name}['{column}'] contains infinite values")
+    # Everything below scans whole columns. A frame already proved valid at this
+    # length or longer has proved all of it — see :func:`mark_validated`.
+    if not _content_already_validated(data):
+        if require_index:
+            if not data.index.is_monotonic_increasing:
+                raise InvalidDataError(
+                    f"{name} is not sorted by timestamp. Indicators assume chronological "
+                    "order; sort with data.sort_index() first."
+                )
+            if data.index.has_duplicates:
+                duplicates = data.index[data.index.duplicated()].unique()[:3].tolist()
+                raise InvalidDataError(
+                    f"{name} contains duplicate timestamps (e.g. {duplicates}). "
+                    "Deduplicate before calculating indicators."
+                )
 
-    for column in ("open", "high", "low", "close"):
-        if (data[column] <= 0).any():
-            raise InvalidDataError(f"{name}['{column}'] contains non-positive prices")
-    if (data["volume"] < 0).any():
-        raise InvalidDataError(f"{name}['volume'] contains negative values")
+        for column in REQUIRED_COLUMNS:
+            series = data[column]
+            if not pd.api.types.is_numeric_dtype(series):
+                raise InvalidDataError(
+                    f"{name}['{column}'] must be numeric, got dtype {series.dtype}"
+                )
+            values = series.to_numpy(dtype="float64", na_value=np.nan)
+            if np.isnan(values).any():
+                count = int(np.isnan(values).sum())
+                raise InvalidDataError(
+                    f"{name}['{column}'] contains {count} missing value(s). "
+                    "Indicators would propagate them silently; clean the data first."
+                )
+            if np.isinf(values).any():
+                raise InvalidDataError(f"{name}['{column}'] contains infinite values")
+            if column != "volume":
+                if (values <= 0).any():
+                    raise InvalidDataError(
+                        f"{name}['{column}'] contains non-positive prices"
+                    )
+            elif (values < 0).any():
+                raise InvalidDataError(f"{name}['volume'] contains negative values")
 
     if min_rows is not None and len(data) < min_rows:
         raise InsufficientDataError(
@@ -851,7 +911,11 @@ def calculate_all_indicators(
             rows,
             ", ".join(skipped),
         )
-    return result
+
+    # The OHLCV columns were validated above and are copied unchanged, so every
+    # prefix of this frame is valid. Recording that turns a backtest's per-bar
+    # revalidation from O(bars^2) into O(bars).
+    return mark_validated(result)
 
 
 def _normalize_columns(data: pd.DataFrame) -> pd.DataFrame:

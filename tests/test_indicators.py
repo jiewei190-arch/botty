@@ -43,8 +43,10 @@ from trading_bot.indicators import (
     detect_macd_signal,
     detect_rsi_condition,
     latest_values,
+    mark_validated,
     validate_ohlcv,
 )
+from trading_bot.indicators.technical_indicators import _content_already_validated
 
 # Wilder's published example series from "New Concepts in Technical Trading Systems".
 WILDER_CLOSES = [
@@ -596,6 +598,87 @@ def test_validation_enforces_a_minimum_row_count():
 
 def test_validation_accepts_a_well_formed_frame():
     validate_ohlcv(make_bars(50, seed=51), min_rows=50)
+
+
+# ----------------------------------------------------------------------------
+# The validation memo
+#
+# Skipping the column scans on a frame already proved valid is what keeps a
+# backtest from re-validating O(bars^2) rows. It is only safe while the memo
+# cannot be inherited by data that was never checked, so that is what these
+# tests attack.
+# ----------------------------------------------------------------------------
+
+
+def test_calculated_frames_carry_the_validation_mark():
+    enriched = calculate_all_indicators(make_bars(60, seed=52))
+    assert _content_already_validated(enriched)
+
+
+def test_the_mark_survives_slicing():
+    """The reason the memo works at all: a backtest passes expanding prefixes."""
+    enriched = calculate_all_indicators(make_bars(60, seed=53))
+    assert _content_already_validated(enriched.iloc[:30])
+    assert _content_already_validated(enriched.tail(10))
+
+
+def test_the_mark_does_not_cover_appended_rows():
+    """A live loop appends bars; pandas would carry the attribute across."""
+    enriched = calculate_all_indicators(make_bars(60, seed=54))
+    grown = pd.concat([enriched, enriched])
+    assert not _content_already_validated(grown)
+
+
+def test_appended_bad_rows_are_still_rejected():
+    enriched = calculate_all_indicators(make_bars(60, seed=55))
+    step = enriched.index[-1] - enriched.index[-2]
+    bad = enriched.tail(1).copy()
+    bad.index = bad.index + step  # a genuinely new bar, not a duplicate
+    bad["close"] = np.nan
+    with pytest.raises(InvalidDataError, match="missing value"):
+        validate_ohlcv(pd.concat([enriched, bad]))
+
+
+def test_a_marked_frame_missing_a_column_is_still_rejected():
+    """Structural checks run every time, mark or no mark."""
+    enriched = calculate_all_indicators(make_bars(60, seed=56))
+    with pytest.raises(InvalidDataError, match="missing required column"):
+        validate_ohlcv(enriched.drop(columns=["volume"]))
+
+
+def test_a_marked_frame_still_honours_min_rows():
+    enriched = calculate_all_indicators(make_bars(60, seed=57))
+    with pytest.raises(InsufficientDataError):
+        validate_ohlcv(enriched.iloc[:10], min_rows=50)
+
+
+def test_a_forged_mark_is_ignored():
+    """Only a token minted by this process counts."""
+    bars = make_bars(40, seed=58)
+    bars.loc[bars.index[5], "close"] = np.nan
+    bars.attrs["_trading_bot_validated_rows"] = "trading-bot-ohlcv-validated-forged:40"
+    with pytest.raises(InvalidDataError, match="missing value"):
+        validate_ohlcv(bars)
+
+
+def test_a_malformed_mark_is_ignored():
+    bars = make_bars(40, seed=59)
+    bars.loc[bars.index[5], "close"] = -1.0
+    for forged in (None, 42, ("tuple", 40), "no-colon"):
+        bars.attrs["_trading_bot_validated_rows"] = forged
+        with pytest.raises(InvalidDataError, match="non-positive"):
+            validate_ohlcv(bars)
+
+
+def test_marking_does_not_validate():
+    """mark_validated records a proof; it must never be mistaken for making one."""
+    bars = make_bars(40, seed=60)
+    bars.loc[bars.index[5], "close"] = np.nan
+    mark_validated(bars)
+    # The mark is honoured, so the bad row slips past — which is exactly why
+    # calculate_all_indicators only marks *after* validate_ohlcv has passed.
+    validate_ohlcv(bars)
+    assert _content_already_validated(bars)
 
 
 # ============================================================================

@@ -301,3 +301,94 @@ def test_swing_points_validate_their_input():
 def test_support_resistance_validates_its_input():
     with pytest.raises(InvalidDataError):
         find_support_resistance(make_bars(50, seed=70).drop(columns=["high"]))
+
+
+# ----------------------------------------------------------------------------
+# Vectorised pivot detection
+#
+# The neighbour comparison is done with shifted numpy views rather than a
+# per-bar DataFrame, because the original was 64% of a backtest's runtime. The
+# tie-breaking rule is what makes it subtle: strict on the earlier side and
+# inclusive on the later one, so a flat double top is a pivot but a flat series
+# is not every pivot at once.
+# ----------------------------------------------------------------------------
+
+
+def _reference_pivots(data: pd.DataFrame, span: int) -> tuple[np.ndarray, np.ndarray]:
+    """The pivot rule stated plainly, one bar at a time.
+
+    Deliberately naive and O(n * span): it exists to disagree with the fast
+    implementation if the fast one is ever wrong.
+    """
+    highs = data["high"].to_numpy(dtype="float64")
+    lows = data["low"].to_numpy(dtype="float64")
+    count = len(highs)
+    is_high = np.zeros(count, dtype=bool)
+    is_low = np.zeros(count, dtype=bool)
+    for i in range(span, count - span):
+        before = slice(i - span, i)
+        after = slice(i + 1, i + span + 1)
+        is_high[i] = (highs[i] > highs[before]).all() and (highs[i] >= highs[after]).all()
+        is_low[i] = (lows[i] < lows[before]).all() and (lows[i] <= lows[after]).all()
+    return is_high, is_low
+
+
+def _pivot_masks(data: pd.DataFrame, span: int) -> tuple[np.ndarray, np.ndarray]:
+    is_high = np.zeros(len(data), dtype=bool)
+    is_low = np.zeros(len(data), dtype=bool)
+    for point in find_swing_points(data, span):
+        (is_high if point.kind == "high" else is_low)[point.index] = True
+    return is_high, is_low
+
+
+@pytest.mark.parametrize("span", [1, 2, 3, 5, 8])
+def test_pivots_match_a_naive_implementation(span):
+    for seed in range(6):
+        data = make_bars(120, seed=seed)
+        fast_high, fast_low = _pivot_masks(data, span)
+        slow_high, slow_low = _reference_pivots(data, span)
+        assert (fast_high == slow_high).all()
+        assert (fast_low == slow_low).all()
+
+
+@pytest.mark.parametrize("span", [1, 2, 3])
+def test_a_flat_series_has_no_pivots(span):
+    """Every bar ties with every other; none of them is a turning point."""
+    data = staircase([100.0] * 30)
+    assert find_swing_points(data, span) == []
+
+
+def test_a_flat_double_top_is_still_a_pivot():
+    """Inclusive on the later side, so an exact retest does not erase the high."""
+    closes = [100.0, 101, 102, 103, 110, 103, 102, 110, 102, 101, 100]
+    points = find_swing_points(staircase(closes), 2)
+    assert any(point.kind == "high" for point in points)
+
+
+@pytest.mark.parametrize("length", [0, 1, 2, 3])
+def test_short_frames_yield_no_pivots_rather_than_failing(length):
+    if length == 0:
+        pytest.skip("an empty frame is rejected by validation, not by the pivot rule")
+    data = staircase([100.0 + i for i in range(length)])
+    assert find_swing_points(data, 2) == []
+
+
+def test_pivot_prices_come_from_the_right_column():
+    data = make_bars(80, seed=9)
+    for point in find_swing_points(data, 3):
+        column = "high" if point.kind == "high" else "low"
+        assert point.price == pytest.approx(float(data[column].iloc[point.index]))
+        assert point.timestamp == data.index[point.index]
+
+
+def test_validation_can_be_skipped_by_internal_callers():
+    """The flag is an internal optimisation; it must not change what is found."""
+    data = make_bars(100, seed=13)
+    assert find_swing_points(data, 3, validate=False) == find_swing_points(data, 3)
+
+
+def test_validation_still_runs_by_default():
+    data = make_bars(50, seed=14)
+    data.loc[data.index[10], "high"] = np.nan
+    with pytest.raises(InvalidDataError):
+        find_swing_points(data, 3)

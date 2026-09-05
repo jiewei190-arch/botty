@@ -135,6 +135,16 @@ class Timeframe:
         }
         return f"{self.amount}{mapping[self.unit]}"
 
+    @property
+    def periods_per_year(self) -> float:
+        """Bars in a trading year, for annualising risk-adjusted returns.
+
+        Uses 252 trading days. A Sharpe ratio computed from 15-minute bars must
+        be scaled by the square root of this, not by the square root of 252 —
+        getting it wrong inflates the figure by roughly five times.
+        """
+        return _BARS_PER_TRADING_DAY[self.unit] / self.amount * 252
+
     def calendar_span_for_bars(self, bars: int) -> timedelta:
         """Calendar time needed to collect ``bars`` bars.
 

@@ -73,6 +73,7 @@ from trading_bot.indicators.technical_indicators import (
     ema_column,
     is_bollinger_squeeze,
     latest_values,
+    mark_validated,
     rsi_column,
     sma_column,
     validate_ohlcv,
@@ -103,6 +104,7 @@ __all__ = [
     "InvalidDataError",
     "InsufficientDataError",
     "REQUIRED_COLUMNS",
+    "mark_validated",
     "validate_ohlcv",
     # Core calculations
     "calculate_all_indicators",

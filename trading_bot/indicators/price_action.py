@@ -139,6 +139,8 @@ def find_swing_points(
     data: pd.DataFrame,
     strength: int | None = None,
     config: IndicatorConfig | None = None,
+    *,
+    validate: bool = True,
 ) -> list[SwingPoint]:
     """Locate swing highs and lows with a symmetric pivot rule.
 
@@ -154,6 +156,10 @@ def find_swing_points(
         significant pivots and take longer to confirm.
     config:
         Supplies ``swing_strength`` when ``strength`` is not given.
+    validate:
+        Check the frame first. Internal callers that have already validated pass
+        False: this runs once per bar in a backtest, and a full-column scan of
+        the whole history each time makes the run O(n^2).
 
     Returns
     -------
@@ -170,7 +176,8 @@ def find_swing_points(
     span = strength if strength is not None else settings.swing_strength
     if span < 1:
         raise ValueError(f"strength must be >= 1, got {span}")
-    validate_ohlcv(data, name="data")
+    if validate:
+        validate_ohlcv(data, name="data")
 
     window = 2 * span + 1
     if len(data) < window:
@@ -182,35 +189,46 @@ def find_swing_points(
     # Compare each bar against the `span` bars before and after it. The forward
     # look is what a pivot *is*; the lookahead it implies is carried by
     # confirmed_index, which every consumer must respect.
-    prior = pd.concat([highs.shift(offset) for offset in range(1, span + 1)], axis=1)
-    later = pd.concat([highs.shift(-offset) for offset in range(1, span + 1)], axis=1)
-    prior_low = pd.concat([lows.shift(offset) for offset in range(1, span + 1)], axis=1)
-    later_low = pd.concat([lows.shift(-offset) for offset in range(1, span + 1)], axis=1)
+    # Neighbour extremes via shifted numpy views. The equivalent built from
+    # pd.concat plus DataFrame.max(axis=1) measured as 64% of a backtest's total
+    # runtime; this is the same comparison without constructing a frame per bar.
+    high_values = highs.to_numpy(dtype="float64")
+    low_values = lows.to_numpy(dtype="float64")
+    count = len(high_values)
+
+    prior_max = np.full(count, -np.inf)
+    later_max = np.full(count, -np.inf)
+    prior_min = np.full(count, np.inf)
+    later_min = np.full(count, np.inf)
+
+    for offset in range(1, span + 1):
+        prior_max[offset:] = np.maximum(prior_max[offset:], high_values[:-offset])
+        later_max[:-offset] = np.maximum(later_max[:-offset], high_values[offset:])
+        prior_min[offset:] = np.minimum(prior_min[offset:], low_values[:-offset])
+        later_min[:-offset] = np.minimum(later_min[:-offset], low_values[offset:])
 
     # Edges have an incomplete window and cannot host a pivot.
-    complete = (prior.notna().sum(axis=1) == span) & (later.notna().sum(axis=1) == span)
+    complete = np.zeros(count, dtype=bool)
+    if count > 2 * span:
+        complete[span : count - span] = True
 
     # Strict on one side, inclusive on the other. Requiring strict inequality on
     # both sides would miss a flat double top; requiring neither would make every
     # bar of a flat series a pivot, fabricating levels out of nothing.
-    is_high = (
-        complete & (highs > prior.max(axis=1)) & (highs >= later.max(axis=1))
-    )
-    is_low = (
-        complete & (lows < prior_low.min(axis=1)) & (lows <= later_low.min(axis=1))
-    )
+    is_high = complete & (high_values > prior_max) & (high_values >= later_max)
+    is_low = complete & (low_values < prior_min) & (low_values <= later_min)
 
     points: list[SwingPoint] = []
-    positions = np.arange(len(data))
+    positions = np.arange(count)
     for position, timestamp, high_flag, low_flag in zip(
-        positions, data.index, is_high.to_numpy(), is_low.to_numpy(), strict=True
+        positions, data.index, is_high, is_low, strict=True
     ):
         if high_flag:
             points.append(
                 SwingPoint(
                     index=int(position),
                     timestamp=timestamp,
-                    price=float(highs.iloc[position]),
+                    price=float(high_values[position]),
                     kind="high",
                     confirmed_index=int(position) + span,
                 )
@@ -220,7 +238,7 @@ def find_swing_points(
                 SwingPoint(
                     index=int(position),
                     timestamp=timestamp,
-                    price=float(lows.iloc[position]),
+                    price=float(low_values[position]),
                     kind="low",
                     confirmed_index=int(position) + span,
                 )
@@ -346,7 +364,9 @@ def find_support_resistance(
             index=point.index + window_start,
             confirmed_index=point.confirmed_index + window_start,
         )
-        for point in find_swing_points(window, settings.swing_strength, settings)
+        for point in find_swing_points(
+            window, settings.swing_strength, settings, validate=False
+        )
     ]
 
     relevant_from = max(0, position - settings.level_lookback)
@@ -412,7 +432,9 @@ def detect_market_structure(
     points = [
         replace(point, index=point.index + window_start,
                 confirmed_index=point.confirmed_index + window_start)
-        for point in find_swing_points(window, settings.swing_strength, settings)
+        for point in find_swing_points(
+            window, settings.swing_strength, settings, validate=False
+        )
     ]
     points = [point for point in points if point.confirmed_index <= position]
 
