@@ -59,6 +59,40 @@ STRUCTURE_MARKERS: tuple[str, ...] = (
 DERIVATIVE_SUFFIX = re.compile(r"[.\-+](W|WS|R|RT|U|UN|P[A-Z]?)$", re.IGNORECASE)
 
 
+#: Roughly what share of a US stock's consolidated volume prints on IEX. IEX is
+#: one venue among many, and the free Alpaca feed reports only what crossed it —
+#: so turnover computed from those bars is a small fraction of the real figure.
+#: Deliberately a range, not a precise number: it varies by symbol and by day,
+#: and pretending otherwise would invite a "correction factor" that is really a
+#: guess.
+IEX_VOLUME_SHARE = (0.015, 0.04)
+
+
+def feed_liquidity_warning(feed: str, min_dollar_volume: float) -> str | None:
+    """Warn when the turnover floor is measured against a single-venue feed.
+
+    The ``iex`` feed reports only trades that crossed IEX, so a symbol turning
+    over $20M a day across all venues may show well under $1M here. A filter
+    written as "$10M a day" then behaves like a far stricter one, and the
+    result is a scan that returns almost nothing and looks broken rather than
+    strict.
+
+    Returns ``None`` when there is nothing to warn about.
+    """
+    if feed.strip().lower() != "iex" or min_dollar_volume <= 0:
+        return None
+    low, high = IEX_VOLUME_SHARE
+    return (
+        f"Turnover is measured from the 'iex' feed, which sees only trades that "
+        f"crossed IEX — very roughly {low:.1%}-{high:.1%} of a symbol's real "
+        f"volume. Your ${min_dollar_volume:,.0f}/day floor therefore behaves "
+        f"more like ${min_dollar_volume / high:,.0f}-${min_dollar_volume / low:,.0f} "
+        f"of consolidated turnover. If the scan returns almost nothing, lower "
+        f"--min-dollar-volume before concluding the market is quiet; a paid "
+        f"'sip' feed reports the consolidated tape and needs no adjustment."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class UniverseFilter:
     """What counts as a scannable symbol.

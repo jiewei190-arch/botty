@@ -52,6 +52,7 @@ from trading_bot.indicators import (
     rsi_column,
 )
 from trading_bot.strategies import available_strategies
+from trading_bot.universe import feed_liquidity_warning
 from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES
 
 PAGES = (
@@ -320,6 +321,10 @@ def _hunt(settings, controls: dict, palette) -> None:
             "not return 3x over a week.",
         )
         submitted = st.form_submit_button("Run hunt", type="primary")
+
+    warning = feed_liquidity_warning(settings.alpaca.data_feed, float(min_turnover))
+    if warning:
+        st.warning(warning, icon="📉")
 
     if submitted:
         if not strategy_names:

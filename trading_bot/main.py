@@ -33,6 +33,7 @@ import argparse
 import json
 import logging
 import sys
+import textwrap
 from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -92,6 +93,7 @@ from trading_bot.universe import (
     UniverseError,
     UniverseFilter,
     build_universe,
+    feed_liquidity_warning,
     profile_liquidity,
 )
 from trading_bot.utils.logging_setup import (
@@ -1253,6 +1255,12 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     print("=" * width)
     print("MARKET HUNT — scanning for swing entries")
     print("=" * width)
+
+    warning = feed_liquidity_warning(settings.alpaca.data_feed, args.min_dollar_volume)
+    if warning:
+        print()
+        for index, line in enumerate(textwrap.wrap(warning, width - 6)):
+            print(f"  {'!' if index == 0 else ' '} {line}")
 
     def show(done: int, total: int) -> None:
         pct = done / total * 100 if total else 0

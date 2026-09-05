@@ -9,6 +9,7 @@ contradicts its own meaning.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -702,3 +703,39 @@ def test_result_charts_paint_the_palette_background(backtest_result, palette):
     ):
         assert figure.layout.paper_bgcolor == palette.page
         assert figure.layout.plot_bgcolor == palette.surface
+
+
+def test_streamlit_secrets_populate_the_environment(monkeypatch):
+    """A hosted deploy has no .env — credentials arrive as Streamlit secrets."""
+    import trading_bot.dashboard.data as dashboard_data
+
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.setattr(
+        dashboard_data.st, "secrets", {"ALPACA_API_KEY": "PKFROMSECRETS"}
+    )
+    dashboard_data._adopt_streamlit_secrets()
+    assert os.environ["ALPACA_API_KEY"] == "PKFROMSECRETS"
+
+
+def test_an_existing_environment_variable_wins(monkeypatch):
+    """A value set on the host must not be overridden by a stale secret."""
+    import trading_bot.dashboard.data as dashboard_data
+
+    monkeypatch.setenv("ALPACA_API_KEY", "PKFROMENV")
+    monkeypatch.setattr(
+        dashboard_data.st, "secrets", {"ALPACA_API_KEY": "PKFROMSECRETS"}
+    )
+    dashboard_data._adopt_streamlit_secrets()
+    assert os.environ["ALPACA_API_KEY"] == "PKFROMENV"
+
+
+def test_missing_secrets_are_not_an_error(monkeypatch):
+    """Running locally with no secrets file is the normal case, not a failure."""
+    import trading_bot.dashboard.data as dashboard_data
+
+    class Exploding:
+        def __getitem__(self, key):
+            raise FileNotFoundError("no secrets.toml")
+
+    monkeypatch.setattr(dashboard_data.st, "secrets", Exploding())
+    dashboard_data._adopt_streamlit_secrets()  # must not raise
