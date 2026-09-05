@@ -143,6 +143,20 @@ because its API is built for this — one request returns bars for a hundred
 symbols, and the full tradable-symbol list comes down in one call — which is what
 makes a whole-market sweep finish in minutes instead of hours.
 
+#### One thing to know about the free feed
+
+The free tier serves the **`iex`** feed: real trades, but only the ones that
+crossed IEX, which is one venue among many. Prices are sound; **volume is not
+the whole picture** — a symbol turning over $20M a day across all venues may
+report well under $1M here.
+
+That matters because the liquidity filter measures turnover. A `$10M/day` floor
+on this feed behaves like a far stricter one, so a scan can come back nearly
+empty and look broken when it is merely over-strict. `hunt` warns about this
+before it runs, and the fix is to lower `--min-dollar-volume` rather than to
+conclude the market is quiet. `ALPACA_DATA_FEED=sip` reports the consolidated
+tape and needs no adjustment, but is a paid subscription.
+
 Then set the balance you actually trade, because every share count is derived
 from it:
 

@@ -239,3 +239,45 @@ class TestFilterValidation:
     def test_max_symbols_must_be_positive(self):
         with pytest.raises(ValueError, match="max_symbols"):
             UniverseFilter(max_symbols=0)
+
+
+class TestFeedWarning:
+    """The turnover floor assumes consolidated volume; the free feed is one venue.
+
+    Without this warning, a scan on the free feed returns almost nothing and
+    reads as a broken tool rather than an over-strict filter.
+    """
+
+    def test_the_free_feed_is_flagged(self):
+        from trading_bot.universe import feed_liquidity_warning
+
+        warning = feed_liquidity_warning("iex", 10_000_000)
+        assert warning is not None
+        assert "iex" in warning
+        # It says what to do, not just what is wrong.
+        assert "min-dollar-volume" in warning
+
+    def test_the_consolidated_feed_is_not_flagged(self):
+        from trading_bot.universe import feed_liquidity_warning
+
+        assert feed_liquidity_warning("sip", 10_000_000) is None
+
+    def test_no_turnover_floor_means_no_warning(self):
+        """With no filter there is nothing for the feed to distort."""
+        from trading_bot.universe import feed_liquidity_warning
+
+        assert feed_liquidity_warning("iex", 0) is None
+
+    def test_the_warning_scales_with_the_threshold(self):
+        from trading_bot.universe import feed_liquidity_warning
+
+        small = feed_liquidity_warning("iex", 1_000_000)
+        large = feed_liquidity_warning("iex", 50_000_000)
+        assert "$1,000,000" in small
+        assert "$50,000,000" in large
+
+    def test_feed_names_are_matched_case_insensitively(self):
+        from trading_bot.universe import feed_liquidity_warning
+
+        assert feed_liquidity_warning("IEX", 10_000_000) is not None
+        assert feed_liquidity_warning(" SIP ", 10_000_000) is None
