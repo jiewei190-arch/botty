@@ -112,13 +112,25 @@ def _sidebar(settings) -> dict:
         st.divider()
 
         has_keys = settings.alpaca.has_credentials
+        # Never defaults on. Silently substituting generated prices when a key
+        # is missing means the app looks like it is working while showing
+        # numbers that describe nothing — the one failure mode a person cannot
+        # catch by looking. Missing credentials are reported as the error they
+        # are, and demo data stays something you switch on deliberately.
         demo = st.toggle(
             "Demo data",
-            value=not has_keys,
-            help="Generated sample data, so the dashboard works without API keys.",
+            value=False,
+            help="Generated sample data for trying the interface without a key. "
+            "Never enabled automatically, and every page says so while it is on.",
         )
         if not has_keys and not demo:
-            st.warning("No Alpaca credentials — live data will fail.", icon="⚠️")
+            st.error(
+                "**No market-data credentials.** Add `ALPACA_API_KEY` and "
+                "`ALPACA_SECRET_KEY` to your `.env` and restart. A free "
+                "data-only account is enough — no funding, and no order is ever "
+                "placed through it.",
+                icon="🔑",
+            )
 
         st.caption(
             f"{_active_theme().title()} theme — set `theme.base` in "

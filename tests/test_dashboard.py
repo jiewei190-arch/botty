@@ -277,12 +277,23 @@ def app_path() -> str:
     return str(Path(__file__).resolve().parents[1] / "trading_bot" / "dashboard" / "app.py")
 
 
-def _run(app_path, **widgets):
+def _enable_demo(app):
+    """Switch on demo data. It no longer enables itself when a key is absent."""
+    for toggle in app.get("toggle"):
+        if "Demo" in toggle.label:
+            toggle.set_value(True)
+            return app
+    raise AssertionError("the demo toggle is missing")
+
+
+def _run(app_path, *, demo=False, **widgets):
     """Run the app headlessly, optionally setting sidebar widgets first."""
     from streamlit.testing.v1 import AppTest
 
     app = AppTest.from_file(app_path, default_timeout=300)
     app.run()
+    if demo:
+        _enable_demo(app).run()
     if widgets:
         if "bars" in widgets:
             app.slider[0].set_value(widgets["bars"])
@@ -305,7 +316,10 @@ def test_every_page_renders(app_path):
     from trading_bot.dashboard.app import PAGES
 
     for page in PAGES:
-        app = _run(app_path, page=page, symbols=["AAPL"], strategies=["momentum"])
+        app = _run(
+            app_path, demo=True, page=page, symbols=["AAPL"],
+            strategies=["momentum"],
+        )
         assert not app.exception, f"{page} raised"
 
 
@@ -313,7 +327,7 @@ def test_the_scanner_page_ranks_and_sizes_opportunities(app_path):
     """850 bars of AAPL demo data yields a momentum signal, which must be
     ranked, scored and sized."""
     app = _run(
-        app_path, page="Market Scanner", bars=850, symbols=["AAPL"],
+        app_path, demo=True, page="Market Scanner", bars=850, symbols=["AAPL"],
         strategies=["momentum"],
     )
     assert not app.exception
@@ -345,6 +359,7 @@ def test_the_backtest_page_runs_and_renders_a_result(app_path):
 
     app = AppTest.from_file(app_path, default_timeout=900)
     app.run()
+    _enable_demo(app).run()
     app.radio[0].set_value("Backtest").run()
     _click(app, "Run backtest").run()
 
@@ -494,6 +509,33 @@ def test_the_direction_marker_is_not_doubled_up(app_path):
     source = Path(app_path).read_text()
     assert "{arrow} {signal.direction.value}" not in source
     assert direction_marker("LONG") == "\u25b2 LONG"
+
+
+def test_demo_data_never_enables_itself(app_path):
+    """Missing credentials must read as an error, not as working software.
+
+    Auto-substituting generated prices when a key is absent is the one failure
+    mode a person cannot catch by looking: the app appears to work, and every
+    number on it describes nothing.
+    """
+    app = _run(app_path)
+    assert not app.exception
+    toggles = [t for t in app.get("toggle") if "Demo" in t.label]
+    assert toggles, "the demo toggle is missing"
+    assert toggles[0].value is False
+
+    # And the missing key is surfaced as an error.
+    messages = " ".join(str(item.value) for item in app.error)
+    assert "ALPACA_API_KEY" in messages
+
+
+def test_the_hunt_command_has_no_demo_mode():
+    """A scan of generated noise looks exactly like a scan of the market."""
+    from trading_bot.main import build_parser
+
+    parser = build_parser()
+    actions = parser.parse_args(["hunt"])
+    assert not hasattr(actions, "demo")
 
 
 def test_the_app_uses_no_deprecated_streamlit_apis(app_path):
