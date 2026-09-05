@@ -281,3 +281,70 @@ class TestFeedWarning:
 
         assert feed_liquidity_warning("IEX", 10_000_000) is not None
         assert feed_liquidity_warning(" SIP ", 10_000_000) is None
+
+
+class TestAuthFailureDiagnostics:
+    """Alpaca answers every rejected credential with the same body.
+
+    A newly created account whose compliance review has not cleared reads
+    exactly like a mistyped secret, which sends people to check the wrong
+    thing. The message must name the real causes rather than pass the vendor's
+    single word through.
+    """
+
+    ERROR = '{"message": "unauthorized."}'
+
+    def test_the_account_review_cause_is_listed_first(self):
+        from trading_bot.universe import explain_auth_failure
+
+        message = explain_auth_failure("PKABC123", self.ERROR)
+        assert "under review" in message
+        # It is cause 1, because it is the most common on a new account.
+        assert message.index("under review") < message.index("different pairs")
+
+    def test_it_admits_it_cannot_tell_the_causes_apart(self):
+        """Claiming to know which one would be a guess dressed as a diagnosis."""
+        from trading_bot.universe import explain_auth_failure
+
+        assert "cannot tell the causes apart" in explain_auth_failure("PKABC", self.ERROR)
+
+    def test_a_paper_key_rules_out_the_wrong_endpoint(self):
+        from trading_bot.universe import explain_auth_failure
+
+        message = explain_auth_failure("PKOVMPQ9UNOVE6ZVDAJB", self.ERROR)
+        assert "Ruled out here" in message
+
+    def test_a_live_key_is_called_out(self):
+        """The one cause a rejected credential can still be checked against."""
+        from trading_bot.universe import explain_auth_failure
+
+        message = explain_auth_failure("AKXXXXXXXXXXXX", self.ERROR)
+        assert "look like live-account keys" in message
+        assert "Paper dashboard" in message
+
+    def test_the_vendor_message_is_still_included(self):
+        from trading_bot.universe import explain_auth_failure
+
+        assert self.ERROR in explain_auth_failure("PKABC", self.ERROR)
+
+    def test_a_missing_key_does_not_crash_the_explanation(self):
+        from trading_bot.universe import explain_auth_failure
+
+        assert "under review" in explain_auth_failure("", self.ERROR)
+        assert "under review" in explain_auth_failure(None, self.ERROR)
+
+    @pytest.mark.parametrize(
+        "error", ["unauthorized.", "HTTP 401", "403 Forbidden", "Unauthorized"]
+    )
+    def test_auth_failures_are_recognised(self, error):
+        from trading_bot.universe.discovery import _is_auth_failure
+
+        assert _is_auth_failure(error)
+
+    @pytest.mark.parametrize(
+        "error", ["connection reset", "500 server error", "timed out"]
+    )
+    def test_other_failures_are_not_dressed_up_as_auth_problems(self, error):
+        from trading_bot.universe.discovery import _is_auth_failure
+
+        assert not _is_auth_failure(error)
