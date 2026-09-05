@@ -276,3 +276,122 @@ def test_backtest_accepts_multiple_strategies(capsys):
     )
     assert result == EXIT_OK
     assert "momentum" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------------
+# hunt
+#
+# The hunt reads live market data, so these tests substitute the data layer.
+# There is deliberately no demo mode on this command: a market scan whose
+# output is generated noise looks exactly like one whose output is real, and
+# the whole point of the command is to be acted on.
+# ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_market(monkeypatch):
+    """Stand in for Alpaca with a small synthetic market."""
+    from tests.conftest import make_bars
+    from trading_bot.data.market_data import StaticMarketData
+
+    frames = {
+        f"S{index:03d}": make_bars(
+            300, seed=index, freq="1D", start_price=float(20 + (index * 17) % 300)
+        )
+        for index in range(120)
+    }
+
+    class Provider(StaticMarketData):
+        def fetch_watchlist(self, symbols, timeframe, *, lookback_bars=300,
+                            end=None, progress=None, batch_size=100):
+            from trading_bot.data.models import DataFetchReport
+
+            report = DataFetchReport(requested=list(symbols))
+            picked = {s: frames[s] for s in symbols if s in frames}
+            report.succeeded = {s: len(f) for s, f in picked.items()}
+            if progress is not None:
+                progress(len(symbols), len(symbols))
+            return picked, report
+
+    provider = Provider(frames)
+    monkeypatch.setattr("trading_bot.main.build_market_data", lambda *a, **k: provider)
+
+    records = [
+        {
+            "symbol": symbol, "name": f"Company {symbol}", "exchange": "NASDAQ",
+            "asset_class": "us_equity", "status": "active", "tradable": True,
+            "shortable": True, "fractionable": True, "marginable": True,
+        }
+        for symbol in frames
+    ]
+    monkeypatch.setattr(
+        "trading_bot.universe.discovery.AssetCatalogue.fetch",
+        lambda self, use_cache=True: records,
+    )
+    return frames
+
+
+def test_hunt_scans_the_market_and_ranks_setups(fake_market, capsys):
+    assert main(["hunt", "--min-dollar-volume", "0", "--top", "5"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "MARKET HUNT" in out
+    assert "symbols considered" in out
+
+
+def test_hunt_sizes_against_stated_equity_not_a_broker(fake_market, capsys):
+    """Equity is stated because the data feed is not the account you trade."""
+    main(["hunt", "--min-dollar-volume", "0", "--equity", "25000"])
+    assert "$25,000 account" in capsys.readouterr().out
+
+
+def test_hunt_says_share_counts_are_per_trade(fake_market, capsys):
+    """Otherwise the list implies every setup can be taken at full size."""
+    main(["hunt", "--min-dollar-volume", "0"])
+    out = capsys.readouterr().out
+    if "SETUP(S)" in out:
+        assert "only trade you take" in out
+        assert "at once" in out
+
+
+def test_hunt_states_that_a_score_is_not_a_probability(fake_market, capsys):
+    main(["hunt", "--min-dollar-volume", "0"])
+    out = capsys.readouterr().out
+    if "SETUP(S)" in out:
+        assert "not a probability" in out
+
+
+def test_hunt_places_no_orders(fake_market, capsys):
+    main(["hunt", "--min-dollar-volume", "0"])
+    assert "nothing here has been placed" in capsys.readouterr().out.replace("\n", " ")
+
+
+def test_hunt_explains_a_quiet_market(fake_market, capsys):
+    """A scan returning nothing must be distinguishable from a broken one."""
+    main(["hunt", "--min-dollar-volume", "0", "--min-score", "99.9"])
+    out = capsys.readouterr().out
+    assert "No setups met the criteria" in out or "SETUP(S)" in out
+
+
+def test_hunt_can_scan_named_symbols_only(fake_market, capsys):
+    assert main(["hunt", "--symbols", "S001,S002,S003"]) == EXIT_OK
+    assert "3 named symbol(s)" in capsys.readouterr().out
+
+
+def test_hunt_rejects_an_unknown_strategy(fake_market, capsys):
+    assert main(["hunt", "--strategy", "nonsense"]) == EXIT_FAILURE
+    assert "Unknown strategy" in capsys.readouterr().err
+
+
+def test_hunt_writes_a_csv(fake_market, tmp_path):
+    target = tmp_path / "setups.csv"
+    main(["hunt", "--min-dollar-volume", "0", "--csv", str(target)])
+    if target.exists():
+        assert "symbol" in target.read_text().splitlines()[0]
+
+
+def test_hunt_reports_the_universe_funnel(fake_market, capsys):
+    """Where symbols went is the only way to tell a filter mistake from a quiet day."""
+    main(["hunt", "--min-dollar-volume", "0"])
+    out = capsys.readouterr().out
+    assert "Static filters" in out
+    assert "Swept" in out

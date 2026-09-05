@@ -136,6 +136,14 @@ class RiskSettings(BaseSettings):
     cooldown_minutes: int = Field(default=60, ge=0)
     #: Minimum confidence (0-100) a signal needs before it may be traded.
     min_confidence: float = Field(default=60.0, ge=0, le=100)
+    #: Equity every position size is calculated from.
+    #:
+    #: Set this to the balance of the account you actually trade. It is stated
+    #: rather than read from a broker on purpose: the data feed and the account
+    #: you trade need not be the same place, and sizing a real position against
+    #: an unrelated broker's balance — a data-only account holding nothing —
+    #: would produce share counts with no relationship to the money at risk.
+    account_equity: float = Field(default=10_000.0, gt=0)
 
     @model_validator(mode="after")
     def _validate_coherence(self) -> RiskSettings:

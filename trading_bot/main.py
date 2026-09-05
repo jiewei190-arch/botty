@@ -79,11 +79,20 @@ from trading_bot.indicators import (
 )
 from trading_bot.risk import RiskManager, build_portfolio_state
 from trading_bot.scanner import MarketScanner, ScannerConfig
+from trading_bot.scanner.market_scan import HuntConfig, sweep_market
 from trading_bot.strategies import (
     StrategyError,
     available_strategies,
     build_strategy,
     explain_blockers,
+)
+from trading_bot.universe import (
+    AssetCatalogue,
+    Universe,
+    UniverseError,
+    UniverseFilter,
+    build_universe,
+    profile_liquidity,
 )
 from trading_bot.utils.logging_setup import (
     configure_logging,
@@ -216,6 +225,76 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo", action="store_true", help="Use generated sample data — no API keys needed."
     )
     scan.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+
+    hunt = subparsers.add_parser(
+        "hunt",
+        help="Scan the whole market for swing setups and rank the best entries.",
+    )
+    hunt.add_argument(
+        "--strategy", default="all",
+        help="Strategy name, comma-separated list, or 'all' (default). "
+        f"Available: {', '.join(available_strategies())}",
+    )
+    hunt.add_argument(
+        "--timeframe", default="1Day",
+        help="Bars to analyse (default 1Day, for swing trades).",
+    )
+    hunt.add_argument(
+        "--top", type=int, default=10, help="How many setups to show (default 10)."
+    )
+    hunt.add_argument(
+        "--min-score", type=float, default=0.0, help="Only show scores at or above this."
+    )
+    hunt.add_argument(
+        "--min-risk-reward", type=float, default=2.0,
+        help="Reject setups paying less than this multiple of the risk (default 2).",
+    )
+    hunt.add_argument(
+        "--max-age", type=int, default=1,
+        help="Drop setups that triggered more than this many bars ago (default 1).",
+    )
+    hunt.add_argument(
+        "--equity", type=float, default=None,
+        help="Account equity to size against. Defaults to RISK_ACCOUNT_EQUITY.",
+    )
+    hunt.add_argument(
+        "--risk-per-trade", type=float, default=None,
+        help="Percent of equity risked per trade (default: RISK_MAX_RISK_PER_TRADE_PCT).",
+    )
+    hunt.add_argument(
+        "--min-dollar-volume", type=float, default=10_000_000.0,
+        help="Skip symbols turning over less than this per day (default 10,000,000).",
+    )
+    hunt.add_argument(
+        "--min-price", type=float, default=5.0, help="Skip symbols below this price."
+    )
+    hunt.add_argument(
+        "--max-price", type=float, default=1_000.0,
+        help="Skip symbols above this price — one share can exceed a small "
+        "account's risk budget.",
+    )
+    hunt.add_argument(
+        "--max-symbols", type=int, default=4_000,
+        help="Cap the universe after ranking by turnover (default 4000).",
+    )
+    hunt.add_argument(
+        "--include-leveraged", action="store_true",
+        help="Include leveraged and inverse ETFs, which decay over a multi-day hold.",
+    )
+    hunt.add_argument(
+        "--allow-short", action="store_true", help="Include short setups (off by default)."
+    )
+    hunt.add_argument(
+        "--symbols", help="Scan only these symbols instead of the whole market."
+    )
+    hunt.add_argument(
+        "--show-all", action="store_true",
+        help="Include setups that failed risk validation, with their reasons.",
+    )
+    hunt.add_argument("--csv", help="Write the ranked setups to this CSV file.")
+    hunt.add_argument("--refresh-universe", action="store_true",
+                      help="Re-download the asset list instead of using the cache.")
+    hunt.add_argument("--no-cache", action="store_true", help="Bypass the parquet bar cache.")
 
     backtest = subparsers.add_parser(
         "backtest", help="Simulate a strategy over historical bars."
@@ -1100,6 +1179,233 @@ def _render_opportunity(opportunity, width: int) -> None:
         print(f"Risk Validation : REJECTED — {decision.rejection_reason}")
 
 
+def _stated_portfolio(settings: Settings, args: argparse.Namespace):
+    """Portfolio state built from stated equity, never from a broker balance.
+
+    The hunt reads market data from one place and assumes you trade somewhere
+    else entirely. Reading equity from the data provider's account would size
+    positions against a balance that has nothing to do with the money at risk —
+    typically zero, on a data-only key.
+    """
+    from trading_bot.risk import PortfolioState
+    from trading_bot.risk.position_sizing import to_decimal
+
+    equity = float(
+        getattr(args, "equity", None) or settings.risk.account_equity
+    )
+    if equity <= 0:
+        raise ValueError(
+            f"Account equity must be positive, got {equity}. Set RISK_ACCOUNT_EQUITY "
+            "in your .env or pass --equity."
+        )
+    amount = to_decimal(equity)
+    return PortfolioState(
+        equity=amount,
+        cash=amount,
+        buying_power=amount,
+        positions=(),
+    )
+
+
+def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
+    """Scan the market for swing setups and print an entry plan for each.
+
+    This places nothing and connects to no broker for trading. It reads market
+    data, ranks what it finds, and prints the prices to work — the orders are
+    yours to place, wherever you trade.
+    """
+    names = (
+        available_strategies()
+        if args.strategy.strip().lower() == "all"
+        else [item.strip() for item in args.strategy.split(",") if item.strip()]
+    )
+    overrides: dict[str, Any] = {"allow_short": True} if args.allow_short else {}
+    try:
+        strategies = [build_strategy(name, **overrides) for name in names]
+    except StrategyError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    filters = UniverseFilter(
+        min_price=args.min_price,
+        max_price=args.max_price,
+        min_dollar_volume=args.min_dollar_volume,
+        max_symbols=args.max_symbols,
+        exclude_leveraged=not args.include_leveraged,
+        always_include=frozenset(
+            item.strip().upper()
+            for item in (args.symbols or "").split(",")
+            if item.strip()
+        ),
+    )
+
+    provider = build_market_data(
+        settings.alpaca, settings.data, use_cache=not args.no_cache
+    )
+    try:
+        portfolio = _stated_portfolio(settings, args)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    width = 78
+    print()
+    print("=" * width)
+    print("MARKET HUNT — scanning for swing entries")
+    print("=" * width)
+
+    def show(done: int, total: int) -> None:
+        pct = done / total * 100 if total else 0
+        print(f"\r  fetching daily bars… {done:,}/{total:,} ({pct:.0f}%)", end="", flush=True)
+
+    try:
+        if args.symbols:
+            symbols = [
+                item.strip().upper()
+                for item in args.symbols.split(",")
+                if item.strip()
+            ]
+            print(f"\nScanning {len(symbols)} named symbol(s)...")
+            frames, _ = provider.fetch_watchlist(
+                symbols, "1Day", lookback_bars=300, progress=show
+            )
+            print()
+            profiles = {
+                symbol: profile
+                for symbol, frame in frames.items()
+                if (profile := profile_liquidity(symbol, frame)) is not None
+            }
+            universe = Universe(
+                symbols=tuple(frames), profiles=profiles, frames=frames
+            )
+        else:
+            catalogue = AssetCatalogue(settings.alpaca, cache_dir=settings.data.cache_dir)
+            print("\nDiscovering the tradable universe...")
+            universe = build_universe(
+                catalogue,
+                provider,
+                filters,
+                use_cache=not args.refresh_universe,
+                progress=show,
+            )
+            print()
+            for line in universe.summary_lines():
+                print(f"  {line}")
+    except (UniverseError, MarketDataError) as error:
+        print(f"\nError: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    if not universe.frames:
+        print("\nNo symbols to scan.", file=sys.stderr)
+        return EXIT_FAILURE
+
+    print(f"\nAnalysing {len(universe.frames):,} symbols with "
+          f"{', '.join(names)}...")
+    sweep = sweep_market(
+        universe,
+        strategies,
+        portfolio=portfolio,
+        risk_manager=RiskManager(settings.risk),
+        config=HuntConfig(
+            timeframe=args.timeframe,
+            max_signal_age_bars=args.max_age,
+            min_score=args.min_score,
+            top_n=args.top,
+            min_risk_reward=args.min_risk_reward,
+            require_risk_approval=not args.show_all,
+        ),
+    )
+
+    print()
+    for line in sweep.summary_lines():
+        print(f"  {line}")
+
+    if sweep.halt_reason:
+        print(f"\n*** TRADING HALTED: {sweep.halt_reason} ***")
+
+    if not sweep.opportunities:
+        print("\nNo setups met the criteria today. That is a normal outcome —")
+        print("most days most stocks are not at an entry.")
+        if sweep.blockers:
+            print("\nMost common blockers:")
+            for name, count in sorted(
+                sweep.blockers.items(), key=lambda item: -item[1]
+            )[:6]:
+                print(f"  {count:>6,}x  {name}")
+        return EXIT_OK
+
+    equity = float(portfolio.equity)
+    print()
+    print("=" * width)
+    print(f"{len(sweep.opportunities)} SETUP(S) — sized for a ${equity:,.0f} account")
+    print("=" * width)
+    for opportunity in sweep.opportunities:
+        _render_entry_plan(opportunity, width)
+
+    print()
+    print("-" * width)
+    print(
+        f"Each share count assumes this is the only trade you take. Your account "
+        f"supports\nabout {sweep.concurrent_capacity} of these at once — taking "
+        "more means sizing each one smaller."
+    )
+    print("-" * width)
+
+    if args.csv:
+        path = Path(args.csv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sweep.as_frame().to_csv(path, index=False)
+        print(f"\nRanked setups written to {path}")
+
+    print(
+        "\nThese are candidates, ranked against each other. The score is not a "
+        "probability\nof profit, and nothing here has been placed as an order."
+    )
+    return EXIT_OK
+
+
+def _render_entry_plan(opportunity, width: int) -> None:
+    """Print one setup as a plan you could work from."""
+    signal = opportunity.signal
+    decision = opportunity.decision
+    shares = int(decision.shares) if decision else 0
+    is_long = signal.direction.value == "LONG"
+
+    stop_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
+    target_pct = abs(signal.take_profit - signal.entry_price) / signal.entry_price * 100
+
+    print()
+    print("-" * width)
+    print(
+        f"#{opportunity.rank}  {signal.symbol}  ·  {signal.direction.value}  ·  "
+        f"{signal.strategy}  ·  score {opportunity.confidence:.0f}/100"
+    )
+    print("-" * width)
+
+    if signal.reasons:
+        for reason in signal.reasons[:4]:
+            print(f"  \u2713 {reason}")
+        print()
+
+    verb = "Buy" if is_long else "Sell short"
+    print(f"  {verb:<12} {shares:>6} shares near ${signal.entry_price:,.2f}"
+          f"   (${shares * signal.entry_price:,.0f})")
+    print(f"  {'Stop':<12} {'':>6}        ${signal.stop_loss:,.2f}"
+          f"   ({stop_pct:.2f}% away)")
+    print(f"  {'Target':<12} {'':>6}        ${signal.take_profit:,.2f}"
+          f"   ({target_pct:.2f}% away)")
+
+    if decision is not None and decision.approved:
+        print(
+            f"\n  Risking ${float(decision.risk_amount):,.2f} to make "
+            f"${float(decision.risk_amount) * signal.risk_reward_ratio:,.2f} "
+            f"({signal.risk_reward_ratio:.2f}:1)"
+        )
+        print(f"  Sized by: {decision.sizing.binding_constraint.description}")
+    elif decision is not None:
+        print(f"\n  NOT SIZED — {decision.rejection_reason}")
+
+
 def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
     """Simulate a strategy over historical bars and report what it would have done.
 
@@ -1306,6 +1612,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_signals(settings, args)
         if args.command == "scan":
             return cmd_scan(settings, args)
+        if args.command == "hunt":
+            return cmd_hunt(settings, args)
         if args.command == "backtest":
             return cmd_backtest(settings, args)
         if args.command == "dashboard":

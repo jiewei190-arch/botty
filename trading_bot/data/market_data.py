@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -207,11 +207,28 @@ class MarketDataProvider(ABC):
         *,
         lookback_bars: int = 300,
         end: datetime | None = None,
+        progress: Callable[[int, int], None] | None = None,
+        batch_size: int = MAX_SYMBOLS_PER_REQUEST,
     ) -> tuple[dict[str, pd.DataFrame], DataFetchReport]:
-        """Fetch history for a watchlist, reporting per-symbol success or failure.
+        """Fetch history for a list of symbols, reporting success or failure.
 
         One bad symbol must never abort a scan, so failures are collected rather
         than raised.
+
+        Sized for a market-wide sweep as well as a ten-name watchlist: symbols
+        are fetched in batches, and a batch that fails degrades to per-symbol
+        requests *within that batch only*. Falling back across the whole list
+        would turn one transient error during a five-thousand-symbol scan into
+        five thousand sequential requests.
+
+        Parameters
+        ----------
+        progress:
+            Called as ``progress(done, total)`` after each batch. A full-market
+            fetch takes minutes; without this it is indistinguishable from a
+            hang.
+        batch_size:
+            Symbols per request.
         """
         parsed = Timeframe.parse(timeframe)
         finish = ensure_utc(end or datetime.now(timezone.utc))
@@ -219,19 +236,33 @@ class MarketDataProvider(ABC):
         report = DataFetchReport(requested=list(symbols))
         frames: dict[str, pd.DataFrame] = {}
 
-        try:
-            fetched = self.get_bars_multi(symbols, parsed, start=start, end=finish)
-        except Exception as error:  # noqa: BLE001 - degrade to per-symbol fetches
-            logger.warning("Batch fetch failed (%s); falling back to per-symbol requests", error)
-            fetched = {}
-            for symbol in symbols:
-                try:
-                    fetched[symbol] = self.get_bars(symbol, parsed, start=start, end=finish)
-                except Exception as symbol_error:  # noqa: BLE001
-                    report.failed[symbol] = str(symbol_error)
+        ordered = list(symbols)
+        fetched: dict[str, pd.DataFrame] = {}
+        done = 0
+        for batch in _chunk(ordered, max(1, batch_size)):
+            try:
+                fetched.update(
+                    self.get_bars_multi(batch, parsed, start=start, end=finish)
+                )
+            except Exception as error:  # noqa: BLE001 - isolate to this batch
+                logger.warning(
+                    "Batch of %d failed (%s); retrying those symbols individually",
+                    len(batch),
+                    error,
+                )
+                for symbol in batch:
+                    try:
+                        fetched[symbol] = self.get_bars(
+                            symbol, parsed, start=start, end=finish
+                        )
+                    except Exception as symbol_error:  # noqa: BLE001
+                        report.failed[symbol] = str(symbol_error)
+            done += len(batch)
+            if progress is not None:
+                progress(done, len(ordered))
 
         cutoff = pd.Timestamp(finish)
-        for symbol in symbols:
+        for symbol in ordered:
             frame = fetched.get(symbol)
             if frame is None or frame.empty:
                 report.failed.setdefault(symbol, "no bars returned")
