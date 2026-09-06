@@ -326,6 +326,28 @@ def screen_liquidity(
             continue
         profiles[symbol] = profile
 
+    # Staleness, judged against the rest of the universe rather than the clock.
+    #
+    # A delisted or indefinitely halted stock keeps its full history, so every
+    # per-symbol check passes: it screens as liquid on a year-old record and
+    # ranks like anything else. What gives it away is that the market moved on
+    # without it — so the newest bar anyone has is the reference, and a symbol
+    # far behind that has stopped trading. Comparing to the universe rather
+    # than to now also means replaying a past date behaves like a live scan
+    # instead of rejecting everything.
+    stamped = [p.last_bar for p in profiles.values() if p.last_bar is not None]
+    if stamped and filters.max_staleness_days > 0:
+        newest = max(stamped)
+        cutoff = newest - pd.Timedelta(days=filters.max_staleness_days)
+        fresh: dict[str, LiquidityProfile] = {}
+        for symbol, profile in profiles.items():
+            if profile.last_bar is not None and profile.last_bar < cutoff:
+                behind = (newest - profile.last_bar).days
+                report.drop(f"last traded {behind} days behind the market")
+                continue
+            fresh[symbol] = profile
+        profiles = fresh
+
     ranked = sorted(
         profiles.values(), key=lambda item: -item.median_dollar_volume
     )

@@ -403,3 +403,83 @@ class TestTurnoverIsRobustToSpikes:
         bars = self.steady()
         bars.loc[bars.index[-15:], "volume"] = 0.0  # halted for the recent window
         assert profile_liquidity("AAA", bars).median_dollar_volume == 0.0
+
+
+class TestStaleAndHaltedSymbolsCannotRank:
+    """A stock that stopped trading keeps its history, and every per-symbol
+    check passes on that history. What gives it away is that the market moved
+    on without it.
+    """
+
+    def liquid(self, seed=1, periods=250, start=None):
+        bars = make_bars(periods, seed=seed, freq="1D", start_price=50.0, start=start)
+        bars["volume"] = 4_000_000.0
+        return bars
+
+    def universe(self, extra):
+        frames = {f"OK{i}": self.liquid(seed=i) for i in range(20)}
+        frames.update(extra)
+        return frames
+
+    def test_a_symbol_that_stopped_trading_is_dropped(self):
+        stale = self.liquid(seed=99, start=pd.Timestamp("2025-01-02", tz="UTC"))
+        symbols, _, report = screen_liquidity(
+            self.universe({"STALE": stale}), UniverseFilter(min_dollar_volume=0.0)
+        )
+        assert "STALE" not in symbols
+        assert any("behind the market" in reason for reason in report.dropped)
+
+    def test_staleness_is_judged_against_the_universe_not_the_clock(self):
+        """So replaying a past date behaves like a live scan."""
+        old = pd.Timestamp("2024-03-01", tz="UTC")
+        frames = {
+            f"OK{i}": self.liquid(seed=i, start=old) for i in range(10)
+        }
+        symbols, _, _ = screen_liquidity(frames, UniverseFilter(min_dollar_volume=0.0))
+        # Everything is equally old, so nothing is stale relative to the rest.
+        assert len(symbols) == 10
+
+    def test_a_halted_symbol_is_dropped(self):
+        halted = self.liquid(seed=98)
+        halted.loc[halted.index[-15:], "volume"] = 0.0
+        symbols, _, _ = screen_liquidity(
+            self.universe({"HALTED": halted}), UniverseFilter(min_dollar_volume=0.0)
+        )
+        assert "HALTED" not in symbols
+
+    def test_the_active_day_check_names_its_reason(self):
+        halted = self.liquid(seed=97)
+        halted.loc[halted.index[-10:], "volume"] = 0.0
+        profile = profile_liquidity("HALTED", halted)
+        report = FilterReport()
+        assert not passes_liquidity_filters(
+            profile, UniverseFilter(min_dollar_volume=0.0), report
+        )
+        assert any("recent sessions" in reason for reason in report.dropped)
+
+    def test_an_occasional_quiet_day_is_tolerated(self):
+        """One dead session is normal; a filter that rejects it is too strict."""
+        bars = self.liquid(seed=96)
+        bars.loc[bars.index[-2], "volume"] = 0.0
+        profile = profile_liquidity("AAA", bars)
+        assert passes_liquidity_filters(profile, UniverseFilter(min_dollar_volume=0.0))
+
+    def test_a_fully_traded_symbol_reports_every_session_active(self):
+        assert profile_liquidity("AAA", self.liquid()).active_day_pct == 1.0
+
+    def test_the_checks_can_be_disabled(self):
+        stale = self.liquid(seed=95, start=pd.Timestamp("2025-01-02", tz="UTC"))
+        symbols, _, _ = screen_liquidity(
+            self.universe({"STALE": stale}),
+            UniverseFilter(min_dollar_volume=0.0, max_staleness_days=0),
+        )
+        assert "STALE" in symbols
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.5])
+    def test_the_active_day_share_is_bounded(self, bad):
+        with pytest.raises(ValueError, match="min_active_day_pct"):
+            UniverseFilter(min_active_day_pct=bad)
+
+    def test_negative_staleness_is_rejected(self):
+        with pytest.raises(ValueError, match="max_staleness_days"):
+            UniverseFilter(max_staleness_days=-1)

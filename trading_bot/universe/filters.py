@@ -124,6 +124,20 @@ class UniverseFilter:
         Bars required before a symbol can be analysed. A recent IPO has no
         200-day average and no established structure; indicators computed on
         it are arithmetic without meaning.
+    min_active_day_pct:
+        Share of the recent window that must have actually traded. A symbol
+        halted for a stretch still carries bars — the exchange repeats the
+        last price at zero volume — and every indicator computed across that
+        stretch describes a period when nothing changed hands. The turnover
+        median alone does not catch it: a name halted for 30 of 250 days can
+        still show a healthy typical day.
+    max_staleness_days:
+        How far behind the rest of the market a symbol's last bar may fall
+        before it is dropped. A delisted or indefinitely halted stock keeps
+        its history, so nothing else in the pipeline notices that it stopped
+        trading — it screens as liquid on a year-old record and ranks
+        normally. Measured against the newest bar in the universe rather than
+        the clock, so replaying a past date behaves the same as a live scan.
     exclude_leveraged:
         Drop leveraged and inverse funds — see :data:`LEVERAGED_MARKERS`.
     exclude_structures:
@@ -143,6 +157,8 @@ class UniverseFilter:
     max_price: float | None = 1_000.0
     min_dollar_volume: float = 10_000_000.0
     min_history_bars: int = 200
+    min_active_day_pct: float = 0.9
+    max_staleness_days: int = 5
     exclude_leveraged: bool = True
     exclude_structures: bool = True
     exclude_derivatives: bool = True
@@ -166,6 +182,14 @@ class UniverseFilter:
             )
         if self.max_symbols is not None and self.max_symbols < 1:
             raise ValueError(f"max_symbols must be >= 1, got {self.max_symbols}")
+        if not 0 <= self.min_active_day_pct <= 1:
+            raise ValueError(
+                f"min_active_day_pct must be within 0-1, got {self.min_active_day_pct}"
+            )
+        if self.max_staleness_days < 0:
+            raise ValueError(
+                f"max_staleness_days must be >= 0, got {self.max_staleness_days}"
+            )
 
 
 @dataclass(slots=True)
@@ -261,6 +285,11 @@ class LiquidityProfile:
     median_dollar_volume: float
     median_volume: float
     bars: int
+    #: Fraction of the recent window that actually traded. Below 1.0 means
+    #: some sessions printed no volume — a halt, or a symbol barely quoted.
+    active_day_pct: float = 1.0
+    #: Timestamp of the most recent bar, for the staleness check.
+    last_bar: pd.Timestamp | None = None
     #: Average true range as a percentage of price — how much room a swing
     #: trade has to work with. A stock that moves 0.3% a day cannot pay for a
     #: stop plus costs, whatever its chart looks like.
@@ -302,6 +331,7 @@ def profile_liquidity(
     # a lot of volume recently". A stock that is normally thin but had three
     # busy days is still thin on the day you go to trade it, and sizing a
     # position against those busy days is how a fill goes wrong.
+    traded = int((volume > 0).sum())
     turnover = (close * volume).median()
     ranges = (recent["high"].astype("float64") - recent["low"].astype("float64")).median()
     last = float(close.iloc[-1])
@@ -312,6 +342,8 @@ def profile_liquidity(
         median_dollar_volume=float(turnover) if pd.notna(turnover) else 0.0,
         median_volume=float(volume.median()) if pd.notna(volume.median()) else 0.0,
         bars=len(bars),
+        active_day_pct=(traded / len(recent)) if len(recent) else 0.0,
+        last_bar=bars.index[-1] if len(bars) else None,
         atr_pct=float(ranges / last * 100) if pd.notna(ranges) and last > 0 else None,
     )
 
@@ -335,4 +367,8 @@ def passes_liquidity_filters(
         return note(f"price over ${filters.max_price:,.2f}")
     if profile.median_dollar_volume < filters.min_dollar_volume:
         return note(f"turnover under ${filters.min_dollar_volume:,.0f}/day")
+    if profile.active_day_pct < filters.min_active_day_pct:
+        return note(
+            f"traded on only {profile.active_day_pct:.0%} of recent sessions"
+        )
     return True
