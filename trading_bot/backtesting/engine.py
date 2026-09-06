@@ -615,6 +615,11 @@ class Backtester:
                 "r_multiple": r_multiple,
                 "bars_held": position.bars_held,
                 "exit_reason": reason,
+                # The score this setup carried when it was entered. Without it
+                # a backtest can say how the strategy did overall but not
+                # whether its own ranking meant anything, which is the question
+                # that decides if the ranking is worth reading.
+                "confidence": position.signal.confidence,
                 "gapped": fill.gapped,
             }
         )

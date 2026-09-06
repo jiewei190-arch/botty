@@ -47,7 +47,7 @@ if __package__ in (None, ""):  # pragma: no cover - script execution path
 from pydantic import ValidationError
 
 from trading_bot import __version__
-from trading_bot.backtesting import FRICTIONLESS, CostModel
+from trading_bot.backtesting import FRICTIONLESS, CostModel, calibrate
 from trading_bot.backtesting.runner import (
     BacktestDataError,
     BacktestRequest,
@@ -227,6 +227,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo", action="store_true", help="Use generated sample data — no API keys needed."
     )
     scan.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+
+    calibrate_cmd = subparsers.add_parser(
+        "calibrate",
+        help="Measure whether the confidence score actually predicts outcomes.",
+    )
+    calibrate_cmd.add_argument(
+        "--symbols", help="Comma-separated symbols (default: watchlist)."
+    )
+    calibrate_cmd.add_argument(
+        "--strategy", default="all",
+        help=f"Strategy name, list, or 'all'. Available: {', '.join(available_strategies())}",
+    )
+    calibrate_cmd.add_argument(
+        "--timeframe", default="1Day", help="Bar size (default 1Day)."
+    )
+    calibrate_cmd.add_argument("--start", help="First date, YYYY-MM-DD.")
+    calibrate_cmd.add_argument("--end", help="Last date, YYYY-MM-DD.")
+    calibrate_cmd.add_argument(
+        "--capital", type=float, default=100_000.0,
+        help="Starting equity. Larger than a real account on purpose: sizing "
+        "limits would otherwise reject setups and bias the sample.",
+    )
+    calibrate_cmd.add_argument(
+        "--csv", help="Write the per-trade record to this CSV file."
+    )
+    calibrate_cmd.add_argument("--no-cache", action="store_true",
+                               help="Bypass the parquet bar cache.")
 
     hunt = subparsers.add_parser(
         "hunt",
@@ -1209,6 +1236,71 @@ def _stated_portfolio(settings: Settings, args: argparse.Namespace):
     )
 
 
+def cmd_calibrate(settings: Settings, args: argparse.Namespace) -> int:
+    """Measure whether the confidence score predicts anything.
+
+    Backtests the requested symbols, buckets every closed trade by the score it
+    entered on, and reports how each bucket actually resolved. This is the only
+    honest way to attach odds to a ranking: measure them.
+    """
+    symbols = (
+        [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else list(settings.data.watchlist)
+    )
+    names = (
+        available_strategies()
+        if args.strategy.strip().lower() == "all"
+        else [item.strip() for item in args.strategy.split(",") if item.strip()]
+    )
+    start = _parse_date(args.start)
+    end = _parse_date(args.end)
+
+    width = 74
+    print()
+    print("=" * width)
+    print("SCORE CALIBRATION — does a higher score mean a better setup?")
+    print("=" * width)
+    print(f"\nBacktesting {len(symbols)} symbol(s) with {', '.join(names)}...")
+
+    try:
+        request = BacktestRequest(
+            symbols=tuple(symbols),
+            strategies=tuple(names),
+            timeframe=args.timeframe,
+            start=start,
+            end=end,
+            starting_equity=args.capital,
+            risk=settings.risk,
+            use_cache=not args.no_cache,
+        )
+        result = run_backtest(request, settings)
+    except (BacktestDataError, StrategyError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    calibration = calibrate(result.trades)
+    print()
+    for line in calibration.summary_lines():
+        print(line)
+
+    if args.csv and result.trades:
+        path = Path(args.csv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result.trade_frame.to_csv(path, index=False)
+        print(f"\nPer-trade record written to {path}")
+
+    print()
+    print("-" * width)
+    print(
+        "These are historical frequencies, not forward probabilities. A band's\n"
+        "win rate says how setups like it resolved on this data — not what the\n"
+        "next one will do. Read the sample size and the error before the rate."
+    )
+    print("-" * width)
+    return EXIT_OK
+
+
 def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     """Scan the market for swing setups and print an entry plan for each.
 
@@ -1620,6 +1712,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_signals(settings, args)
         if args.command == "scan":
             return cmd_scan(settings, args)
+        if args.command == "calibrate":
+            return cmd_calibrate(settings, args)
         if args.command == "hunt":
             return cmd_hunt(settings, args)
         if args.command == "backtest":
