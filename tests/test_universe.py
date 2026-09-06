@@ -153,14 +153,14 @@ class TestLiquidityProfile:
         bars["volume"] = 1_000_000.0
         profile = profile_liquidity("AAA", bars)
         # ~50 x 1,000,000, allowing for the price path drifting.
-        assert profile.avg_dollar_volume == pytest.approx(50_000_000, rel=0.4)
+        assert profile.median_dollar_volume == pytest.approx(50_000_000, rel=0.4)
 
     def test_volume_alone_does_not_imply_liquidity(self):
         """A million shares of a $0.40 stock is $400k, not $1m."""
         cheap = make_bars(60, seed=4, freq="1D", start_price=0.40)
         cheap["volume"] = 1_000_000.0
         profile = profile_liquidity("PENNY", cheap)
-        assert profile.avg_dollar_volume < 1_000_000
+        assert profile.median_dollar_volume < 1_000_000
 
     def test_an_empty_frame_yields_no_profile(self):
         assert profile_liquidity("AAA", pd.DataFrame()) is None
@@ -184,31 +184,31 @@ class TestLiquidityFilters:
 
     def test_a_liquid_symbol_passes(self):
         assert passes_liquidity_filters(
-            self.make_profile(avg_dollar_volume=50_000_000.0), UniverseFilter()
+            self.make_profile(median_dollar_volume=50_000_000.0), UniverseFilter()
         )
 
     def test_thin_turnover_is_rejected(self):
         assert not passes_liquidity_filters(
-            self.make_profile(avg_dollar_volume=80_000.0), UniverseFilter()
+            self.make_profile(median_dollar_volume=80_000.0), UniverseFilter()
         )
 
     def test_a_cheap_stock_is_rejected(self):
         assert not passes_liquidity_filters(
-            self.make_profile(last_close=2.0, avg_dollar_volume=50_000_000.0),
+            self.make_profile(last_close=2.0, median_dollar_volume=50_000_000.0),
             UniverseFilter(),
         )
 
     def test_an_expensive_stock_is_rejected(self):
         """One share of a $2,000 stock can exceed a small account's risk budget."""
         assert not passes_liquidity_filters(
-            self.make_profile(last_close=2_500.0, avg_dollar_volume=50_000_000.0),
+            self.make_profile(last_close=2_500.0, median_dollar_volume=50_000_000.0),
             UniverseFilter(),
         )
 
     def test_a_recent_listing_is_rejected(self):
         """No 200-day average exists yet, so its indicators are arithmetic only."""
         assert not passes_liquidity_filters(
-            self.make_profile(bars=30, avg_dollar_volume=50_000_000.0),
+            self.make_profile(bars=30, median_dollar_volume=50_000_000.0),
             UniverseFilter(),
         )
 
@@ -281,3 +281,205 @@ class TestFeedWarning:
 
         assert feed_liquidity_warning("IEX", 10_000_000) is not None
         assert feed_liquidity_warning(" SIP ", 10_000_000) is None
+
+
+class TestAuthFailureDiagnostics:
+    """Alpaca answers every rejected credential with the same body.
+
+    A newly created account whose compliance review has not cleared reads
+    exactly like a mistyped secret, which sends people to check the wrong
+    thing. The message must name the real causes rather than pass the vendor's
+    single word through.
+    """
+
+    ERROR = '{"message": "unauthorized."}'
+
+    def test_the_account_review_cause_is_listed_first(self):
+        from trading_bot.universe import explain_auth_failure
+
+        message = explain_auth_failure("PKABC123", self.ERROR)
+        assert "under review" in message
+        # It is cause 1, because it is the most common on a new account.
+        assert message.index("under review") < message.index("different pairs")
+
+    def test_it_admits_it_cannot_tell_the_causes_apart(self):
+        """Claiming to know which one would be a guess dressed as a diagnosis."""
+        from trading_bot.universe import explain_auth_failure
+
+        assert "cannot tell the causes apart" in explain_auth_failure("PKABC", self.ERROR)
+
+    def test_a_paper_key_rules_out_the_wrong_endpoint(self):
+        from trading_bot.universe import explain_auth_failure
+
+        message = explain_auth_failure("PKOVMPQ9UNOVE6ZVDAJB", self.ERROR)
+        assert "Ruled out here" in message
+
+    def test_a_live_key_is_called_out(self):
+        """The one cause a rejected credential can still be checked against."""
+        from trading_bot.universe import explain_auth_failure
+
+        message = explain_auth_failure("AKXXXXXXXXXXXX", self.ERROR)
+        assert "look like live-account keys" in message
+        assert "Paper dashboard" in message
+
+    def test_the_vendor_message_is_still_included(self):
+        from trading_bot.universe import explain_auth_failure
+
+        assert self.ERROR in explain_auth_failure("PKABC", self.ERROR)
+
+    def test_a_missing_key_does_not_crash_the_explanation(self):
+        from trading_bot.universe import explain_auth_failure
+
+        assert "under review" in explain_auth_failure("", self.ERROR)
+        assert "under review" in explain_auth_failure(None, self.ERROR)
+
+    @pytest.mark.parametrize(
+        "error", ["unauthorized.", "HTTP 401", "403 Forbidden", "Unauthorized"]
+    )
+    def test_auth_failures_are_recognised(self, error):
+        from trading_bot.universe.discovery import _is_auth_failure
+
+        assert _is_auth_failure(error)
+
+    @pytest.mark.parametrize(
+        "error", ["connection reset", "500 server error", "timed out"]
+    )
+    def test_other_failures_are_not_dressed_up_as_auth_problems(self, error):
+        from trading_bot.universe.discovery import _is_auth_failure
+
+        assert not _is_auth_failure(error)
+
+
+class TestTurnoverIsRobustToSpikes:
+    """Turnover is a median because the universe is *ranked* by it.
+
+    A single abnormal print — an index rebalance, a buyout, a fat finger —
+    inflates a 20-bar mean by three orders of magnitude. Ranked by that, the
+    thinnest stock in the market lands at the top of the list, which is exactly
+    the symbol you least want shown first.
+    """
+
+    def steady(self, seed=8, shares=2_000_000.0):
+        bars = make_bars(250, seed=seed, freq="1D", start_price=40.0)
+        bars["volume"] = shares
+        return bars
+
+    def test_one_enormous_print_does_not_move_it(self):
+        bars = self.steady()
+        clean = profile_liquidity("AAA", bars).median_dollar_volume
+
+        spiked = bars.copy()
+        spiked.loc[spiked.index[-1], "volume"] = 5e10
+        after = profile_liquidity("AAA", spiked).median_dollar_volume
+
+        assert after == pytest.approx(clean, rel=0.01)
+
+    def test_a_mean_would_have_been_wrecked_by_it(self):
+        """The contrast that justifies the choice."""
+        bars = self.steady()
+        spiked = bars.copy()
+        spiked.loc[spiked.index[-1], "volume"] = 5e10
+
+        recent = spiked.tail(20)
+        mean = float((recent["close"] * recent["volume"]).mean())
+        median = profile_liquidity("AAA", spiked).median_dollar_volume
+        assert mean > median * 100
+
+    def test_a_thin_stock_cannot_spike_its_way_into_the_universe(self):
+        """The consequence that matters: it must still be filtered out."""
+        thin = self.steady(shares=5_000.0)  # ~$200k/day, genuinely untradable
+        thin.loc[thin.index[-1], "volume"] = 5e10
+        profile = profile_liquidity("THIN", thin)
+        assert not passes_liquidity_filters(profile, UniverseFilter())
+
+    def test_sustained_volume_is_still_reflected(self):
+        """It must not be so insensitive that real liquidity never registers."""
+        quiet = profile_liquidity("AAA", self.steady(shares=1_000_000.0))
+        busy = profile_liquidity("AAA", self.steady(shares=50_000_000.0))
+        assert busy.median_dollar_volume > quiet.median_dollar_volume * 10
+
+    def test_a_halt_does_not_read_as_liquid(self):
+        """Zero-volume days pull the median down, as they should."""
+        bars = self.steady()
+        bars.loc[bars.index[-15:], "volume"] = 0.0  # halted for the recent window
+        assert profile_liquidity("AAA", bars).median_dollar_volume == 0.0
+
+
+class TestStaleAndHaltedSymbolsCannotRank:
+    """A stock that stopped trading keeps its history, and every per-symbol
+    check passes on that history. What gives it away is that the market moved
+    on without it.
+    """
+
+    def liquid(self, seed=1, periods=250, start=None):
+        bars = make_bars(periods, seed=seed, freq="1D", start_price=50.0, start=start)
+        bars["volume"] = 4_000_000.0
+        return bars
+
+    def universe(self, extra):
+        frames = {f"OK{i}": self.liquid(seed=i) for i in range(20)}
+        frames.update(extra)
+        return frames
+
+    def test_a_symbol_that_stopped_trading_is_dropped(self):
+        stale = self.liquid(seed=99, start=pd.Timestamp("2025-01-02", tz="UTC"))
+        symbols, _, report = screen_liquidity(
+            self.universe({"STALE": stale}), UniverseFilter(min_dollar_volume=0.0)
+        )
+        assert "STALE" not in symbols
+        assert any("behind the market" in reason for reason in report.dropped)
+
+    def test_staleness_is_judged_against_the_universe_not_the_clock(self):
+        """So replaying a past date behaves like a live scan."""
+        old = pd.Timestamp("2024-03-01", tz="UTC")
+        frames = {
+            f"OK{i}": self.liquid(seed=i, start=old) for i in range(10)
+        }
+        symbols, _, _ = screen_liquidity(frames, UniverseFilter(min_dollar_volume=0.0))
+        # Everything is equally old, so nothing is stale relative to the rest.
+        assert len(symbols) == 10
+
+    def test_a_halted_symbol_is_dropped(self):
+        halted = self.liquid(seed=98)
+        halted.loc[halted.index[-15:], "volume"] = 0.0
+        symbols, _, _ = screen_liquidity(
+            self.universe({"HALTED": halted}), UniverseFilter(min_dollar_volume=0.0)
+        )
+        assert "HALTED" not in symbols
+
+    def test_the_active_day_check_names_its_reason(self):
+        halted = self.liquid(seed=97)
+        halted.loc[halted.index[-10:], "volume"] = 0.0
+        profile = profile_liquidity("HALTED", halted)
+        report = FilterReport()
+        assert not passes_liquidity_filters(
+            profile, UniverseFilter(min_dollar_volume=0.0), report
+        )
+        assert any("recent sessions" in reason for reason in report.dropped)
+
+    def test_an_occasional_quiet_day_is_tolerated(self):
+        """One dead session is normal; a filter that rejects it is too strict."""
+        bars = self.liquid(seed=96)
+        bars.loc[bars.index[-2], "volume"] = 0.0
+        profile = profile_liquidity("AAA", bars)
+        assert passes_liquidity_filters(profile, UniverseFilter(min_dollar_volume=0.0))
+
+    def test_a_fully_traded_symbol_reports_every_session_active(self):
+        assert profile_liquidity("AAA", self.liquid()).active_day_pct == 1.0
+
+    def test_the_checks_can_be_disabled(self):
+        stale = self.liquid(seed=95, start=pd.Timestamp("2025-01-02", tz="UTC"))
+        symbols, _, _ = screen_liquidity(
+            self.universe({"STALE": stale}),
+            UniverseFilter(min_dollar_volume=0.0, max_staleness_days=0),
+        )
+        assert "STALE" in symbols
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.5])
+    def test_the_active_day_share_is_bounded(self, bad):
+        with pytest.raises(ValueError, match="min_active_day_pct"):
+            UniverseFilter(min_active_day_pct=bad)
+
+    def test_negative_staleness_is_rejected(self):
+        with pytest.raises(ValueError, match="max_staleness_days"):
+            UniverseFilter(max_staleness_days=-1)
