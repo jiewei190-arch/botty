@@ -112,7 +112,7 @@ class Universe:
 
     @property
     def total_dollar_volume(self) -> float:
-        return sum(profile.avg_dollar_volume for profile in self.profiles.values())
+        return sum(profile.median_dollar_volume for profile in self.profiles.values())
 
     def summary_lines(self) -> list[str]:
         lines = ["Static filters (no price data needed):"]
@@ -131,15 +131,15 @@ class Universe:
             {
                 "symbol": profile.symbol,
                 "last_close": profile.last_close,
-                "avg_dollar_volume": profile.avg_dollar_volume,
-                "avg_volume": profile.avg_volume,
+                "median_dollar_volume": profile.median_dollar_volume,
+                "median_volume": profile.median_volume,
                 "atr_pct": profile.atr_pct,
                 "bars": profile.bars,
             }
             for profile in self.profiles.values()
         ]
         frame = pd.DataFrame(rows)
-        return frame.sort_values("avg_dollar_volume", ascending=False, ignore_index=True)
+        return frame.sort_values("median_dollar_volume", ascending=False, ignore_index=True)
 
 
 class AssetCatalogue:
@@ -327,7 +327,7 @@ def screen_liquidity(
         profiles[symbol] = profile
 
     ranked = sorted(
-        profiles.values(), key=lambda item: -item.avg_dollar_volume
+        profiles.values(), key=lambda item: -item.median_dollar_volume
     )
     if filters.max_symbols is not None and len(ranked) > filters.max_symbols:
         report.drop(

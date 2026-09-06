@@ -116,9 +116,10 @@ class UniverseFilter:
         makes position sizing impossible — one share may already exceed the
         risk budget. ``None`` disables the check.
     min_dollar_volume:
-        Average daily turnover — price times volume, not volume alone. A
+        Typical daily turnover — price times volume, not volume alone. A
         million shares of a $0.40 stock is $400,000 of liquidity, not a
-        million dollars of it, and volume alone hides that.
+        million dollars of it, and volume alone hides that. Measured as a
+        median so one abnormal print cannot make a thin stock look liquid.
     min_history_bars:
         Bars required before a symbol can be analysed. A recent IPO has no
         200-day average and no established structure; indicators computed on
@@ -255,8 +256,10 @@ class LiquidityProfile:
 
     symbol: str
     last_close: float
-    avg_dollar_volume: float
-    avg_volume: float
+    #: Typical daily turnover — the *median* of price x volume, not the mean.
+    #: See :func:`profile_liquidity` for why the distinction matters.
+    median_dollar_volume: float
+    median_volume: float
     bars: int
     #: Average true range as a percentage of price — how much room a swing
     #: trade has to work with. A stock that moves 0.3% a day cannot pay for a
@@ -265,7 +268,7 @@ class LiquidityProfile:
 
     @property
     def is_liquid_enough(self) -> bool:
-        return self.avg_dollar_volume > 0
+        return self.median_dollar_volume > 0
 
 
 def profile_liquidity(
@@ -288,15 +291,26 @@ def profile_liquidity(
     if close.empty or not float(close.iloc[-1]) > 0:
         return None
 
-    turnover = (close * volume).mean()
-    ranges = (recent["high"].astype("float64") - recent["low"].astype("float64")).mean()
+    # Median, not mean. A single abnormal print — an index rebalance, a buyout
+    # announcement, a fat finger — inflates a 20-bar mean enormously: measured
+    # at 1,307x on an otherwise steady $100m-a-day name. Since the universe is
+    # ranked by turnover, that one bar would put a thin stock at the top of the
+    # list, which is precisely the symbol you least want to be shown first.
+    #
+    # The median is unmoved by it, and it also answers the right question. A
+    # liquidity floor asks "can I get filled on a typical day?", not "was there
+    # a lot of volume recently". A stock that is normally thin but had three
+    # busy days is still thin on the day you go to trade it, and sizing a
+    # position against those busy days is how a fill goes wrong.
+    turnover = (close * volume).median()
+    ranges = (recent["high"].astype("float64") - recent["low"].astype("float64")).median()
     last = float(close.iloc[-1])
 
     return LiquidityProfile(
         symbol=symbol,
         last_close=last,
-        avg_dollar_volume=float(turnover) if pd.notna(turnover) else 0.0,
-        avg_volume=float(volume.mean()) if pd.notna(volume.mean()) else 0.0,
+        median_dollar_volume=float(turnover) if pd.notna(turnover) else 0.0,
+        median_volume=float(volume.median()) if pd.notna(volume.median()) else 0.0,
         bars=len(bars),
         atr_pct=float(ranges / last * 100) if pd.notna(ranges) and last > 0 else None,
     )
@@ -319,6 +333,6 @@ def passes_liquidity_filters(
         return note(f"price under ${filters.min_price:,.2f}")
     if filters.max_price is not None and profile.last_close > filters.max_price:
         return note(f"price over ${filters.max_price:,.2f}")
-    if profile.avg_dollar_volume < filters.min_dollar_volume:
+    if profile.median_dollar_volume < filters.min_dollar_volume:
         return note(f"turnover under ${filters.min_dollar_volume:,.0f}/day")
     return True

@@ -153,14 +153,14 @@ class TestLiquidityProfile:
         bars["volume"] = 1_000_000.0
         profile = profile_liquidity("AAA", bars)
         # ~50 x 1,000,000, allowing for the price path drifting.
-        assert profile.avg_dollar_volume == pytest.approx(50_000_000, rel=0.4)
+        assert profile.median_dollar_volume == pytest.approx(50_000_000, rel=0.4)
 
     def test_volume_alone_does_not_imply_liquidity(self):
         """A million shares of a $0.40 stock is $400k, not $1m."""
         cheap = make_bars(60, seed=4, freq="1D", start_price=0.40)
         cheap["volume"] = 1_000_000.0
         profile = profile_liquidity("PENNY", cheap)
-        assert profile.avg_dollar_volume < 1_000_000
+        assert profile.median_dollar_volume < 1_000_000
 
     def test_an_empty_frame_yields_no_profile(self):
         assert profile_liquidity("AAA", pd.DataFrame()) is None
@@ -184,31 +184,31 @@ class TestLiquidityFilters:
 
     def test_a_liquid_symbol_passes(self):
         assert passes_liquidity_filters(
-            self.make_profile(avg_dollar_volume=50_000_000.0), UniverseFilter()
+            self.make_profile(median_dollar_volume=50_000_000.0), UniverseFilter()
         )
 
     def test_thin_turnover_is_rejected(self):
         assert not passes_liquidity_filters(
-            self.make_profile(avg_dollar_volume=80_000.0), UniverseFilter()
+            self.make_profile(median_dollar_volume=80_000.0), UniverseFilter()
         )
 
     def test_a_cheap_stock_is_rejected(self):
         assert not passes_liquidity_filters(
-            self.make_profile(last_close=2.0, avg_dollar_volume=50_000_000.0),
+            self.make_profile(last_close=2.0, median_dollar_volume=50_000_000.0),
             UniverseFilter(),
         )
 
     def test_an_expensive_stock_is_rejected(self):
         """One share of a $2,000 stock can exceed a small account's risk budget."""
         assert not passes_liquidity_filters(
-            self.make_profile(last_close=2_500.0, avg_dollar_volume=50_000_000.0),
+            self.make_profile(last_close=2_500.0, median_dollar_volume=50_000_000.0),
             UniverseFilter(),
         )
 
     def test_a_recent_listing_is_rejected(self):
         """No 200-day average exists yet, so its indicators are arithmetic only."""
         assert not passes_liquidity_filters(
-            self.make_profile(bars=30, avg_dollar_volume=50_000_000.0),
+            self.make_profile(bars=30, median_dollar_volume=50_000_000.0),
             UniverseFilter(),
         )
 
@@ -348,3 +348,58 @@ class TestAuthFailureDiagnostics:
         from trading_bot.universe.discovery import _is_auth_failure
 
         assert not _is_auth_failure(error)
+
+
+class TestTurnoverIsRobustToSpikes:
+    """Turnover is a median because the universe is *ranked* by it.
+
+    A single abnormal print — an index rebalance, a buyout, a fat finger —
+    inflates a 20-bar mean by three orders of magnitude. Ranked by that, the
+    thinnest stock in the market lands at the top of the list, which is exactly
+    the symbol you least want shown first.
+    """
+
+    def steady(self, seed=8, shares=2_000_000.0):
+        bars = make_bars(250, seed=seed, freq="1D", start_price=40.0)
+        bars["volume"] = shares
+        return bars
+
+    def test_one_enormous_print_does_not_move_it(self):
+        bars = self.steady()
+        clean = profile_liquidity("AAA", bars).median_dollar_volume
+
+        spiked = bars.copy()
+        spiked.loc[spiked.index[-1], "volume"] = 5e10
+        after = profile_liquidity("AAA", spiked).median_dollar_volume
+
+        assert after == pytest.approx(clean, rel=0.01)
+
+    def test_a_mean_would_have_been_wrecked_by_it(self):
+        """The contrast that justifies the choice."""
+        bars = self.steady()
+        spiked = bars.copy()
+        spiked.loc[spiked.index[-1], "volume"] = 5e10
+
+        recent = spiked.tail(20)
+        mean = float((recent["close"] * recent["volume"]).mean())
+        median = profile_liquidity("AAA", spiked).median_dollar_volume
+        assert mean > median * 100
+
+    def test_a_thin_stock_cannot_spike_its_way_into_the_universe(self):
+        """The consequence that matters: it must still be filtered out."""
+        thin = self.steady(shares=5_000.0)  # ~$200k/day, genuinely untradable
+        thin.loc[thin.index[-1], "volume"] = 5e10
+        profile = profile_liquidity("THIN", thin)
+        assert not passes_liquidity_filters(profile, UniverseFilter())
+
+    def test_sustained_volume_is_still_reflected(self):
+        """It must not be so insensitive that real liquidity never registers."""
+        quiet = profile_liquidity("AAA", self.steady(shares=1_000_000.0))
+        busy = profile_liquidity("AAA", self.steady(shares=50_000_000.0))
+        assert busy.median_dollar_volume > quiet.median_dollar_volume * 10
+
+    def test_a_halt_does_not_read_as_liquid(self):
+        """Zero-volume days pull the median down, as they should."""
+        bars = self.steady()
+        bars.loc[bars.index[-15:], "volume"] = 0.0  # halted for the recent window
+        assert profile_liquidity("AAA", bars).median_dollar_volume == 0.0
