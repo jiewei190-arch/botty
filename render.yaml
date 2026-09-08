@@ -7,7 +7,6 @@ services:
     dockerCommand: python -m trading_bot.deploy
     healthCheckPath: /_stcore/health
     autoDeployTrigger: commit
-    maxShutdownDelaySeconds: 30
     disk:
       name: botty-data
       mountPath: /app/storage
