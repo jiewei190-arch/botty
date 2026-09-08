@@ -250,20 +250,18 @@ def _metric(label: str, value: str, note: str = "") -> str:
 
 def _automation(settings) -> None:
     """Read-only operating view of the unattended paper trader."""
-    from trading_bot.data.database import Database
+    from trading_bot.dashboard.automation_status import load_automation_status
 
-    database = Database(settings.data.database_path)
-    database.initialize()
-    heartbeat = database.state.get("automation_heartbeat")
-    market_open = database.state.get("market_open") or "unknown"
-    last_session = database.state.get("last_completed_session") or "never"
-    equity = database.equity.latest()
-    positions = database.positions.all()
-    orders = database.orders.open_orders()
-    trades = database.trades.open_trades()
-    errors = database.events.recent(limit=20, level="ERROR")
-    closed_stats = database.trades.statistics()
-    database.close()
+    status, status_error = load_automation_status(settings)
+    heartbeat = status.get("automation_heartbeat")
+    market_open = status.get("market_open", "unknown")
+    last_session = status.get("last_completed_session", "never")
+    equity = status.get("equity")
+    positions = status.get("positions") or []
+    orders = status.get("orders") or []
+    trades = status.get("open_trades") or []
+    errors = status.get("errors") or []
+    closed_stats = status.get("closed_stats") or {"total_trades": 0, "total_pnl": 0.0}
 
     age = None
     if heartbeat:
@@ -273,6 +271,8 @@ def _automation(settings) -> None:
     healthy = age is not None and age <= 15
     st.subheader("Automation")
     st.caption("Read-only health, broker reconciliation, and paper performance.")
+    if status_error:
+        st.warning(status_error)
     if healthy:
         st.success(f"Botty is online · heartbeat {age:.1f} minutes ago")
     else:

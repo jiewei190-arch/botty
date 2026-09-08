@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: botty-automation
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py hunt --strategy swing_quality --timeframe 1Day --paper-trade --watch-market
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TRADING_MODE
+        value: paper
+      - key: DATA_TIMEFRAME
+        value: 1Day
+      - key: DATA_LOOKBACK_BARS
+        value: 500
+      - key: RISK_MIN_CONFIDENCE
+        value: 70
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: AUTO_STATUS_TOKEN
+        sync: false
+      - key: AUTO_WEBHOOK_URL
+        sync: false
