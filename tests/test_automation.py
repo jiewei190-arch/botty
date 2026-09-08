@@ -20,20 +20,21 @@ class ClockBroker:
         return next(self.clocks)
 
 
-def clock(day, is_open=True):
+def clock(day, is_open=True, hour=14, minute=0):
     return SimpleNamespace(
-        timestamp=datetime(2026, 9, day, 14, 0, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 9, day, hour, minute, tzinfo=timezone.utc),
         is_open=is_open,
     )
 
 
-def test_runner_scans_once_per_open_session():
+def test_runner_scans_once_per_open_session_when_interval_disabled():
     scans = []
     notices = Recorder()
     runner = MarketOpenRunner(
         ClockBroker(clock(8), clock(8), clock(9)),
         lambda: scans.append("scan") or 0,
         notices,
+        open_scan_interval_seconds=None,
     )
     assert runner.step()
     assert not runner.step()
@@ -41,7 +42,24 @@ def test_runner_scans_once_per_open_session():
     assert scans == ["scan", "scan"]
 
 
-def test_closed_market_does_not_scan():
+def test_runner_rescans_hourly_by_default():
+    scans = []
+    runner = MarketOpenRunner(
+        ClockBroker(
+            clock(8, hour=14, minute=0),
+            clock(8, hour=14, minute=30),
+            clock(8, hour=15, minute=0),
+        ),
+        lambda: scans.append("scan") or 0,
+        Recorder(),
+    )
+    assert runner.step()
+    assert not runner.step()
+    assert runner.step()
+    assert scans == ["scan", "scan"]
+
+
+def test_closed_market_does_not_execute_scan():
     scans = []
     runner = MarketOpenRunner(
         ClockBroker(clock(8, False)), lambda: scans.append("scan") or 0, Recorder()
