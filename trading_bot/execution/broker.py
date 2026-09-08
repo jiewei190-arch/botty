@@ -20,8 +20,13 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    MarketOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
+)
 
 from trading_bot.config.settings import Settings, TradingMode
 from trading_bot.data.market_data import ensure_utc
@@ -57,6 +62,39 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
         return Decimal(default)
 
 
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value))
+
+
+def _optional_float(value: Any) -> float | None:
+    return float(value) if value is not None else None
+
+
+def _order_dict(order: Any, *, parent_order_id: str | None = None) -> dict[str, Any]:
+    """Normalize an Alpaca Order model without retaining credential-bearing clients."""
+    order_id = str(getattr(order, "id", ""))
+    return {
+        "id": order_id,
+        "parent_order_id": parent_order_id,
+        "client_order_id": str(getattr(order, "client_order_id", "") or ""),
+        "symbol": str(getattr(order, "symbol", "")),
+        "side": _enum_value(getattr(order, "side", "")),
+        "type": _enum_value(getattr(order, "type", getattr(order, "order_type", ""))),
+        "time_in_force": _enum_value(getattr(order, "time_in_force", "")),
+        "status": _enum_value(getattr(order, "status", "unknown")),
+        "qty": float(getattr(order, "qty", 0) or 0),
+        "filled_qty": float(getattr(order, "filled_qty", 0) or 0),
+        "filled_avg_price": _optional_float(getattr(order, "filled_avg_price", None)),
+        "limit_price": _optional_float(getattr(order, "limit_price", None)),
+        "stop_price": _optional_float(getattr(order, "stop_price", None)),
+        "created_at": _optional_utc(getattr(order, "created_at", None)),
+        "updated_at": _optional_utc(getattr(order, "updated_at", None)),
+        "filled_at": _optional_utc(getattr(order, "filled_at", None)),
+        "legs": [
+            _order_dict(leg, parent_order_id=order_id)
+            for leg in (getattr(order, "legs", None) or [])
+        ],
+    }
 class AlpacaBroker:
     """Read-only Alpaca trading-API client.
 
@@ -200,6 +238,18 @@ class AlpacaBroker:
             for position in positions
         ]
 
+    def get_orders(self, *, status: str = "all", nested: bool = True) -> list[dict[str, Any]]:
+        """Recent broker orders, normalized with bracket legs included."""
+        try:
+            query_status = QueryOrderStatus(status.lower())
+        except ValueError as error:
+            raise BrokerError(f"Unknown order query status {status!r}") from error
+        request = GetOrdersRequest(status=query_status, limit=500, nested=nested)
+        orders = self._call(
+            lambda: self._client.get_orders(filter=request), f"get_orders({status})"
+        )
+        return [_order_dict(order) for order in orders]
+
     def ping(self) -> bool:
         """True when the broker API is reachable and authenticated."""
         try:
@@ -255,7 +305,7 @@ class AlpacaBroker:
             "id": str(getattr(order, "id", "")),
             "client_order_id": str(getattr(order, "client_order_id", client_order_id)),
             "symbol": str(getattr(order, "symbol", symbol)),
-            "status": str(getattr(order, "status", "accepted")),
+            "status": _enum_value(getattr(order, "status", "accepted")),
             "qty": float(getattr(order, "qty", qty)),
         }
 

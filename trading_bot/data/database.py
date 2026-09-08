@@ -155,8 +155,16 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON bot_events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_category ON bot_events(category);
 """
 
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
 #: Ordered migrations. Index 0 upgrades user_version 0 -> 1, and so on.
-MIGRATIONS: tuple[str, ...] = (SCHEMA_V1,)
+MIGRATIONS: tuple[str, ...] = (SCHEMA_V1, SCHEMA_V2)
 
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -211,6 +219,7 @@ class Database:
         self.positions = PositionRepository(self)
         self.equity = EquityRepository(self)
         self.events = EventRepository(self)
+        self.state = StateRepository(self)
 
     # -- connection management ---------------------------------------------------
 
@@ -461,6 +470,38 @@ class OrderRepository(_Repository):
             (status, filled_qty, filled_avg_price, utc_now_iso(), broker_order_id),
         )
 
+    def upsert_broker_order(self, order: dict[str, Any]) -> int:
+        """Insert or refresh a broker snapshot, keyed by immutable broker id."""
+        broker_id = str(order["id"])
+        existing = self.db.query_one(
+            "SELECT id FROM orders WHERE broker_order_id = ?", (broker_id,)
+        )
+        values = {
+            "client_order_id": order.get("client_order_id"),
+            "status": str(order.get("status", "unknown")).lower(),
+            "filled_qty": float(order.get("filled_qty") or 0),
+            "filled_avg_price": order.get("filled_avg_price"),
+            "updated_at": to_iso(order.get("updated_at")) or utc_now_iso(),
+            "raw": _dumps(order),
+        }
+        if existing:
+            self.db.update("orders", int(existing["id"]), values)
+            return int(existing["id"])
+        return self.record(
+            broker_order_id=broker_id,
+            client_order_id=order.get("client_order_id"),
+            ts=order.get("created_at"),
+            symbol=str(order["symbol"]),
+            side=str(order["side"]),
+            qty=float(order.get("qty") or 0),
+            order_type=str(order.get("type") or "unknown"),
+            time_in_force=order.get("time_in_force"),
+            limit_price=order.get("limit_price"),
+            stop_price=order.get("stop_price"),
+            status=str(order.get("status") or "unknown").lower(),
+            raw=order,
+        )
+
     def open_orders(self) -> list[dict[str, Any]]:
         return self.db.query(
             "SELECT * FROM orders WHERE status NOT IN "
@@ -564,6 +605,29 @@ class TradeRepository(_Repository):
 
     def open_trades(self) -> list[dict[str, Any]]:
         return self.db.query("SELECT * FROM trades WHERE status = 'open' ORDER BY entry_ts")
+
+    def open_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        return self.db.query_one(
+            "SELECT * FROM trades WHERE status = 'open' AND symbol = ? "
+            "ORDER BY entry_ts DESC LIMIT 1",
+            (symbol.upper(),),
+        )
+
+    def by_broker_entry_order(self, broker_order_id: str) -> dict[str, Any] | None:
+        """Find a trade reconstructed from a specific immutable broker entry."""
+        rows = self.db.query(
+            "SELECT * FROM trades WHERE metadata LIKE ? ORDER BY id DESC",
+            (f"%{broker_order_id}%",),
+        )
+        for row in rows:
+            metadata = _loads(row.get("metadata"))
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("broker_entry_order_id") == broker_order_id
+            ):
+                row["metadata"] = metadata
+                return row
+        return None
 
     def history(self, limit: int = 100, *, symbol: str | None = None) -> list[dict[str, Any]]:
         if symbol:
@@ -782,3 +846,25 @@ class EventRepository(_Repository):
         for row in rows:
             row["payload"] = _loads(row.get("payload"))
         return rows
+
+
+class StateRepository(_Repository):
+    """Small durable key/value store for restart-safe automation state."""
+
+    def set(self, key: str, value: str) -> None:
+        self.db.execute(
+            """
+            INSERT INTO runtime_state (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, utc_now_iso()),
+        )
+
+    def get(self, key: str) -> str | None:
+        row = self.db.query_one("SELECT value FROM runtime_state WHERE key = ?", (key,))
+        return str(row["value"]) if row else None
+
+    def all(self) -> list[dict[str, Any]]:
+        return self.db.query("SELECT * FROM runtime_state ORDER BY key")

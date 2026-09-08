@@ -16,6 +16,7 @@ or directly::
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -57,6 +58,7 @@ from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES
 
 PAGES = (
     "Hunt",
+    "Automation",
     "Overview",
     "Market Scanner",
     "Chart",
@@ -88,6 +90,8 @@ def main() -> None:
     page = controls["page"]
     if page == "Hunt":
         _hunt(settings, controls, palette)
+    elif page == "Automation":
+        _automation(settings)
     elif page == "Overview":
         _overview(settings, controls, palette)
     elif page == "Market Scanner":
@@ -242,6 +246,59 @@ def _metric(label: str, value: str, note: str = "") -> str:
 
 
 # -- pages -------------------------------------------------------------------
+
+
+def _automation(settings) -> None:
+    """Read-only operating view of the unattended paper trader."""
+    from trading_bot.data.database import Database
+
+    database = Database(settings.data.database_path)
+    database.initialize()
+    heartbeat = database.state.get("automation_heartbeat")
+    market_open = database.state.get("market_open") or "unknown"
+    last_session = database.state.get("last_completed_session") or "never"
+    equity = database.equity.latest()
+    positions = database.positions.all()
+    orders = database.orders.open_orders()
+    trades = database.trades.open_trades()
+    errors = database.events.recent(limit=20, level="ERROR")
+    closed_stats = database.trades.statistics()
+    database.close()
+
+    age = None
+    if heartbeat:
+        with contextlib.suppress(ValueError):
+            elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(heartbeat)
+            age = elapsed.total_seconds() / 60
+    healthy = age is not None and age <= 15
+    st.subheader("Automation")
+    st.caption("Read-only health, broker reconciliation, and paper performance.")
+    if healthy:
+        st.success(f"Botty is online · heartbeat {age:.1f} minutes ago")
+    else:
+        st.error("Botty is not ready or its heartbeat is stale.")
+
+    first, second, third, fourth = st.columns(4)
+    first.metric("Market", "Open" if market_open == "true" else "Closed")
+    second.metric("Last scan", last_session)
+    third.metric("Open positions", len(positions))
+    fourth.metric("Open orders", len(orders))
+    fifth, sixth, seventh, eighth = st.columns(4)
+    fifth.metric("Paper equity", f"${float(equity['equity']):,.2f}" if equity else "—")
+    sixth.metric("Open Botty trades", len(trades))
+    seventh.metric("Closed trades", closed_stats["total_trades"])
+    eighth.metric("Realized P&L", f"${closed_stats['total_pnl']:,.2f}")
+
+    st.markdown("### Current positions")
+    if positions:
+        st.dataframe(pd.DataFrame(positions), width="stretch", hide_index=True)
+    else:
+        st.info("No positions are currently tracked.")
+    st.markdown("### Recent attention events")
+    if errors:
+        st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
+    else:
+        st.success("No recent automation errors.")
 
 
 def _hunt(settings, controls: dict, palette) -> None:

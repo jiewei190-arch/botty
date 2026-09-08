@@ -15,7 +15,8 @@ def test_initialize_creates_every_table(database):
         for row in database.query("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert {
-        "runs", "signals", "orders", "trades", "positions", "equity_snapshots", "bot_events"
+        "runs", "signals", "orders", "trades", "positions", "equity_snapshots",
+        "bot_events", "runtime_state",
     } <= tables
 
 
@@ -29,6 +30,13 @@ def test_migration_from_a_fresh_file(tmp_path):
     assert db.initialize() == SCHEMA_VERSION
     assert (tmp_path / "nested" / "bot.db").exists()
     db.close()
+
+
+def test_runtime_state_is_upserted(database):
+    database.state.set("last_completed_session", "2026-09-08")
+    database.state.set("last_completed_session", "2026-09-09")
+    assert database.state.get("last_completed_session") == "2026-09-09"
+    assert len(database.state.all()) == 1
 
 
 # -- signals ---------------------------------------------------------------------

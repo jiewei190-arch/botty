@@ -222,6 +222,9 @@ class AutomationSettings(BaseSettings):
 
     #: How often the service rechecks Alpaca's calendar while the market is closed.
     closed_poll_seconds: int = Field(default=300, ge=15, le=3600)
+    open_poll_seconds: int = Field(default=60, ge=15, le=900)
+    max_signal_age_hours: float = Field(default=120.0, gt=0, le=720)
+    max_order_failures_per_scan: int = Field(default=2, ge=1, le=20)
     #: Optional Discord or Slack incoming-webhook URL. Kept out of logs/config dumps.
     webhook_url: str | None = None
     webhook_kind: str = "discord"

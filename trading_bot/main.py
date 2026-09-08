@@ -37,7 +37,7 @@ import sys
 import textwrap
 from collections import Counter
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check", help="Run connectivity and configuration health checks.")
     subparsers.add_parser("clock", help="Show current market session state.")
     subparsers.add_parser("db-init", help="Create or migrate the SQLite database.")
+    status = subparsers.add_parser("status", help="Show automation health and paper state.")
+    status.add_argument(
+        "--max-heartbeat-age", type=float, default=15.0,
+        help="Fail if the automation heartbeat is older than this many minutes.",
+    )
 
     fetch = subparsers.add_parser("fetch", help="Download historical bars.")
     fetch.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
@@ -425,6 +430,48 @@ def cmd_config(settings: Settings) -> int:
 
     print(json.dumps(settings.redacted_dict(), indent=2, default=str))
     return EXIT_OK
+
+
+def cmd_status(settings: Settings, args: argparse.Namespace) -> int:
+    """Operator-facing readiness check; safe for Docker health checks."""
+    database = Database(settings.data.database_path)
+    database.initialize()
+    heartbeat = database.state.get("automation_heartbeat")
+    market_open = database.state.get("market_open")
+    last_session = database.state.get("last_completed_session")
+    latest_equity = database.equity.latest()
+    positions = database.positions.all()
+    open_orders = database.orders.open_orders()
+    open_trades = database.trades.open_trades()
+    recent_errors = database.events.recent(limit=5, level="ERROR")
+    database.close()
+
+    healthy = False
+    age_minutes = None
+    if heartbeat:
+        try:
+            stamp = datetime.fromisoformat(heartbeat)
+            age_minutes = (datetime.now(timezone.utc) - stamp).total_seconds() / 60
+            healthy = age_minutes <= args.max_heartbeat_age
+        except ValueError:
+            pass
+    print("BOTTY AUTOMATION STATUS")
+    print("-" * 64)
+    print(f"Health             : {'HEALTHY' if healthy else 'NOT READY'}")
+    print(f"Heartbeat          : {heartbeat or 'never'}")
+    if age_minutes is not None:
+        print(f"Heartbeat age      : {age_minutes:.1f} minutes")
+    print(f"Market open        : {market_open or 'unknown'}")
+    print(f"Last scanned       : {last_session or 'never'}")
+    print(f"Open broker orders : {len(open_orders)}")
+    print(f"Tracked positions  : {len(positions)}")
+    print(f"Open Botty trades  : {len(open_trades)}")
+    print(
+        f"Latest equity      : ${float(latest_equity['equity']):,.2f}"
+        if latest_equity else "Latest equity      : unavailable"
+    )
+    print(f"Recent errors      : {len(recent_errors)}")
+    return EXIT_OK if healthy else EXIT_FAILURE
 
 
 def cmd_check(settings: Settings) -> int:
@@ -1227,6 +1274,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     """
     if args.watch_market:
         from trading_bot.automation.notifications import build_notifier
+        from trading_bot.automation.reconciliation import BrokerReconciler
         from trading_bot.automation.runner import MarketOpenRunner
         from trading_bot.execution.broker import BrokerError, build_broker
 
@@ -1243,16 +1291,44 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             return EXIT_FAILURE
         child_args = argparse.Namespace(**vars(args))
         child_args.watch_market = False
+        child_args._automation_broker = broker
+        database = Database(settings.data.database_path)
+        database.initialize()
+        reconciler = BrokerReconciler(broker, database, build_notifier(settings))
+
+        def load_last_session() -> date | None:
+            value = database.state.get("last_completed_session")
+            return date.fromisoformat(value) if value else None
+
+        def save_last_session(session: date) -> None:
+            database.state.set("last_completed_session", session.isoformat())
+            database.events.record(
+                category="market_scan_completed",
+                message=f"Completed automated scan for {session.isoformat()}",
+                payload={"session": session.isoformat()},
+            )
+
+        def heartbeat(market_open: bool) -> None:
+            database.state.set("automation_heartbeat", datetime.now(timezone.utc).isoformat())
+            database.state.set("market_open", str(market_open).lower())
+
         runner = MarketOpenRunner(
             broker,
             lambda: cmd_hunt(settings, child_args),
             build_notifier(settings),
+            supervise_once=reconciler.reconcile,
             closed_poll_seconds=settings.automation.closed_poll_seconds,
+            open_poll_seconds=settings.automation.open_poll_seconds,
+            load_last_session=load_last_session,
+            save_last_session=save_last_session,
+            heartbeat=heartbeat,
         )
         try:
             runner.run_forever()
         except KeyboardInterrupt:
             print("\nBotty automation stopped.")
+        finally:
+            database.close()
         return EXIT_OK
 
     names = (
@@ -1284,8 +1360,23 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         settings.alpaca, settings.data, use_cache=not args.no_cache
     )
     try:
-        portfolio = _stated_portfolio(settings, args)
-    except ValueError as error:
+        if args.paper_trade:
+            from trading_bot.execution.broker import build_broker
+
+            sizing_broker = getattr(args, "_automation_broker", None) or build_broker(settings)
+            sizing_database = Database(settings.data.database_path)
+            sizing_database.initialize()
+            try:
+                portfolio = build_portfolio_state(
+                    account=sizing_broker.get_account(),
+                    broker_positions=sizing_broker.get_positions(),
+                    database=sizing_database,
+                )
+            finally:
+                sizing_database.close()
+        else:
+            portfolio = _stated_portfolio(settings, args)
+    except Exception as error:  # noqa: BLE001 - every broker/config error is actionable here
         print(f"Error: {error}", file=sys.stderr)
         return EXIT_FAILURE
 
@@ -1405,42 +1496,29 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         print(f"\nRanked setups written to {path}")
 
     if args.paper_trade:
+        from trading_bot.automation.execution import PaperExecutor
         from trading_bot.automation.notifications import build_notifier
-        from trading_bot.execution.broker import BrokerError, build_broker
+        from trading_bot.execution.broker import build_broker
 
         notifier = build_notifier(settings)
+        database = Database(settings.data.database_path)
         try:
-            broker = build_broker(settings)
-            if not broker.is_paper:
-                raise BrokerError("automated execution is paper-only in this release")
-            held = {item["symbol"] for item in broker.get_positions()}
-            placed = 0
-            for opportunity in sweep.opportunities[: sweep.concurrent_capacity]:
-                signal = opportunity.signal
-                if signal.symbol in held or opportunity.decision is None:
-                    continue
-                stamp = signal.timestamp.strftime("%Y%m%d")
-                client_id = f"botty-{stamp}-{signal.symbol}-{signal.strategy}".lower()
-                broker.submit_bracket_order(
-                    symbol=signal.symbol,
-                    qty=int(opportunity.decision.shares),
-                    side="buy" if signal.direction.value == "LONG" else "sell",
-                    take_profit=signal.take_profit,
-                    stop_loss=signal.stop_loss,
-                    client_order_id=client_id,
-                )
-                placed += 1
-                notifier.send(
-                    f"Botty paper order submitted: {signal.symbol} "
-                    f"{signal.direction.value} x{int(opportunity.decision.shares)}; "
-                    f"stop ${signal.stop_loss:,.2f}, target ${signal.take_profit:,.2f}."
-                )
-            print(f"\nSubmitted {placed} Alpaca paper bracket order(s).")
+            broker = getattr(args, "_automation_broker", None) or build_broker(settings)
+            database.initialize()
+            report = PaperExecutor(
+                broker, database, notifier, settings
+            ).execute(sweep.opportunities, sweep.concurrent_capacity)
+            print(
+                f"\nSubmitted {report.placed} Alpaca paper bracket order(s); "
+                f"{report.failed} failed, {report.stale_blocked} stale blocked."
+            )
         except Exception as error:  # notification must survive broker failures
             with contextlib.suppress(Exception):
                 notifier.send(f"BOTTY NEEDS ATTENTION: paper execution failed: {error}")
             print(f"\nPaper execution failed: {error}", file=sys.stderr)
             return EXIT_FAILURE
+        finally:
+            database.close()
 
     if args.paper_trade:
         print(
@@ -1695,6 +1773,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_clock(settings)
         if args.command == "db-init":
             return cmd_db_init(settings)
+        if args.command == "status":
+            return cmd_status(settings, args)
         if args.command == "fetch":
             return cmd_fetch(settings, args)
         if args.command == "analyze":

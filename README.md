@@ -196,6 +196,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | Command | What it does |
 |---|---|
 | `python main.py check` | Full health check: config, database, credentials, broker, data |
+| `python main.py status` | Automation heartbeat, scan, order, position, trade and error health |
 | `python main.py config` | Print resolved configuration (secrets masked) |
 | `python main.py clock` | Market session state |
 | `python main.py fetch` | Download and preview historical bars |
@@ -914,8 +915,9 @@ produce a fake signal.
 
 ## Data storage
 
-**`storage/trading_bot.db`** (SQLite, WAL mode) holds seven tables: `runs`,
+**`storage/trading_bot.db`** (SQLite, WAL mode) holds eight tables: `runs`,
 `signals`, `orders`, `trades`, `positions`, `equity_snapshots` and `bot_events`.
+`runtime_state` keeps restart-safe heartbeat and completed-session markers.
 
 Rejected signals are recorded alongside accepted ones with the reason for
 rejection — when the bot is not trading, that table tells you why. Schema changes
@@ -1024,9 +1026,10 @@ have been reviewed.
 | Dashboard (hunt, charts, backtests, settings) | **Complete** |
 | Market-clock runner and webhook alerts | **Complete (paper)** |
 | Broker-hosted bracket entries, stops and targets | **Complete (paper)** |
-| Tracking setups you took, to measure the scanner against reality | Planned |
-| Reconciliation of fills/orders/trades into SQLite | Planned |
-| Continuous intraday rescans and position supervision | Planned |
+| Order, fill, trade, position and equity reconciliation | **Complete (paper)** |
+| Restart-safe market-session state | **Complete (paper)** |
+| Continuous position supervision | **Complete (paper)** |
+| Dashboard automation health and paper performance | **Complete (paper)** |
 | Live unattended order placement | **Locked pending paper validation** |
 
 ### Always-on paper automation
@@ -1051,6 +1054,18 @@ per open session, submits at most the account's reported concurrent capacity,
 skips symbols already held, and attaches the strategy's stop and target as a
 bracket at order submission. Keep this process on an always-on host; closing the
 computer or terminal stops it.
+
+For an always-on Docker host:
+
+```bash
+docker compose up -d --build
+docker compose logs -f botty
+```
+
+The named volumes preserve the audit database, cache, and logs across container
+restarts. Secrets stay in the uncommitted `.env` file. See `HANDOFF.md` for the
+living cross-agent development state so Claude or Codex can continue without
+this chat history.
 
 ---
 

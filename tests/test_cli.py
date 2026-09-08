@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
+from trading_bot.data.database import Database
 from trading_bot.main import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, build_parser, main
 
 
@@ -33,12 +35,29 @@ def test_config_command_masks_secrets(capsys, monkeypatch):
 
 def test_db_init_creates_the_schema(capsys, tmp_path):
     assert main(["db-init"]) == EXIT_OK
-    assert "schema v1" in capsys.readouterr().out
+    assert "schema v2" in capsys.readouterr().out
     assert (tmp_path / "bot.db").exists()
 
 
 def test_db_init_is_repeatable():
     assert main(["db-init"]) == EXIT_OK
+
+
+def test_status_is_not_ready_before_automation_starts(capsys):
+    assert main(["status"]) == EXIT_FAILURE
+    assert "NOT READY" in capsys.readouterr().out
+
+
+def test_status_is_healthy_with_a_fresh_heartbeat(capsys, tmp_path):
+    database = Database(tmp_path / "bot.db")
+    database.initialize()
+    database.state.set("automation_heartbeat", datetime.now(timezone.utc).isoformat())
+    database.state.set("market_open", "true")
+    database.close()
+    assert main(["status"]) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "HEALTHY" in output
+    assert "Market open        : true" in output
     assert main(["db-init"]) == EXIT_OK
 
 

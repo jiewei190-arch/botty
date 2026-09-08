@@ -1,0 +1,15 @@
+services:
+  botty:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - botty-storage:/app/storage
+      - botty-logs:/app/logs
+    init: true
+    stop_grace_period: 30s
+
+volumes:
+  botty-storage:
+  botty-logs:
