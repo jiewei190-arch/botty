@@ -9,9 +9,10 @@ wherever you trade.
 python main.py hunt
 ```
 
-> **It places no orders and connects to no broker for trading.** Market data is
-> read from a data provider; execution is yours. That separation is deliberate,
-> not a missing feature — see [Where you trade](#where-you-trade-is-not-where-you-get-data).
+> **Automated execution is paper-only while it is being proven.** A normal hunt
+> remains read-only. `hunt --paper-trade` submits broker-hosted bracket orders
+> to Alpaca paper trading; live unattended orders are rejected even when the
+> account's global live locks are armed.
 
 > **Status: the scanner, the analysis behind it and the backtester are complete
 > and tested** — 850 tests, no credentials needed to run them. See the
@@ -203,6 +204,8 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
 | `python main.py signals` | Run strategies and report trade setups (Phase 3) |
 | `python main.py hunt` | **Scan the whole market and rank the best entries** |
+| `python main.py hunt --paper-trade` | Scan once and paper-trade approved setups |
+| `python main.py hunt --watch-market --paper-trade` | Stay online and run once per market-open session |
 | `python main.py scan` | Rank a watchlist by trade confidence |
 | `python main.py backtest` | Simulate a strategy over historical bars (Phase 6) |
 | `python main.py dashboard` | Launch the Streamlit dashboard |
@@ -1004,10 +1007,10 @@ exist.
 
 ## Roadmap
 
-The project began as a paper-trading bot and was redirected into a
-decision-support scanner: it finds and ranks entries, and a person executes
-them. Order placement and automated exits were dropped from the plan rather
-than deferred — they are not features this tool is missing.
+The project is moving from a decision-support scanner into a guarded automated
+trader. Automation graduates in stages: unattended paper bracket orders first,
+then live execution only after paper results and operational failure handling
+have been reviewed.
 
 | Scope | Status |
 |---|---|
@@ -1019,9 +1022,35 @@ than deferred — they are not features this tool is missing.
 | Backtesting engine | **Complete** |
 | Universe discovery and market-wide hunt | **Complete** |
 | Dashboard (hunt, charts, backtests, settings) | **Complete** |
-| Alerts when a setup appears (email/push, scheduled scans) | Planned |
+| Market-clock runner and webhook alerts | **Complete (paper)** |
+| Broker-hosted bracket entries, stops and targets | **Complete (paper)** |
 | Tracking setups you took, to measure the scanner against reality | Planned |
-| Broker order placement | **Not planned** — you execute |
+| Reconciliation of fills/orders/trades into SQLite | Planned |
+| Continuous intraday rescans and position supervision | Planned |
+| Live unattended order placement | **Locked pending paper validation** |
+
+### Always-on paper automation
+
+Set Alpaca paper credentials and your real paper-test account size in `.env`.
+Optionally add a Discord or Slack incoming webhook so Botty can reach you:
+
+```bash
+AUTO_WEBHOOK_KIND=discord
+AUTO_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+Then run:
+
+```bash
+python main.py hunt --watch-market --paper-trade
+```
+
+Botty uses Alpaca's market clock rather than assuming weekdays or fixed hours,
+so holidays and early closes follow the exchange calendar. It performs one hunt
+per open session, submits at most the account's reported concurrent capacity,
+skips symbols already held, and attaches the strategy's stop and target as a
+bracket at order submission. Keep this process on an always-on host; closing the
+computer or terminal stops it.
 
 ---
 

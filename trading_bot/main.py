@@ -30,6 +30,7 @@ Later phases add ``scan``, ``backtest``, ``run`` and ``dashboard``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import sys
@@ -297,6 +298,14 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("--refresh-universe", action="store_true",
                       help="Re-download the asset list instead of using the cache.")
     hunt.add_argument("--no-cache", action="store_true", help="Bypass the parquet bar cache.")
+    hunt.add_argument(
+        "--paper-trade", action="store_true",
+        help="Submit risk-approved setups as Alpaca paper bracket orders.",
+    )
+    hunt.add_argument(
+        "--watch-market", action="store_true",
+        help="Stay online and run once whenever Alpaca reports a new market session open.",
+    )
 
     backtest = subparsers.add_parser(
         "backtest", help="Simulate a strategy over historical bars."
@@ -1216,6 +1225,36 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     data, ranks what it finds, and prints the prices to work — the orders are
     yours to place, wherever you trade.
     """
+    if args.watch_market:
+        from trading_bot.automation.notifications import build_notifier
+        from trading_bot.automation.runner import MarketOpenRunner
+        from trading_bot.execution.broker import BrokerError, build_broker
+
+        if not args.paper_trade:
+            print("Error: --watch-market currently requires --paper-trade.", file=sys.stderr)
+            return EXIT_FAILURE
+        try:
+            broker = build_broker(settings)
+        except BrokerError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return EXIT_FAILURE
+        if not broker.is_paper:
+            print("Error: automated execution is paper-only in this release.", file=sys.stderr)
+            return EXIT_FAILURE
+        child_args = argparse.Namespace(**vars(args))
+        child_args.watch_market = False
+        runner = MarketOpenRunner(
+            broker,
+            lambda: cmd_hunt(settings, child_args),
+            build_notifier(settings),
+            closed_poll_seconds=settings.automation.closed_poll_seconds,
+        )
+        try:
+            runner.run_forever()
+        except KeyboardInterrupt:
+            print("\nBotty automation stopped.")
+        return EXIT_OK
+
     names = (
         available_strategies()
         if args.strategy.strip().lower() == "all"
@@ -1365,10 +1404,54 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         sweep.as_frame().to_csv(path, index=False)
         print(f"\nRanked setups written to {path}")
 
-    print(
-        "\nThese are candidates, ranked against each other. The score is not a "
-        "probability\nof profit, and nothing here has been placed as an order."
-    )
+    if args.paper_trade:
+        from trading_bot.automation.notifications import build_notifier
+        from trading_bot.execution.broker import BrokerError, build_broker
+
+        notifier = build_notifier(settings)
+        try:
+            broker = build_broker(settings)
+            if not broker.is_paper:
+                raise BrokerError("automated execution is paper-only in this release")
+            held = {item["symbol"] for item in broker.get_positions()}
+            placed = 0
+            for opportunity in sweep.opportunities[: sweep.concurrent_capacity]:
+                signal = opportunity.signal
+                if signal.symbol in held or opportunity.decision is None:
+                    continue
+                stamp = signal.timestamp.strftime("%Y%m%d")
+                client_id = f"botty-{stamp}-{signal.symbol}-{signal.strategy}".lower()
+                broker.submit_bracket_order(
+                    symbol=signal.symbol,
+                    qty=int(opportunity.decision.shares),
+                    side="buy" if signal.direction.value == "LONG" else "sell",
+                    take_profit=signal.take_profit,
+                    stop_loss=signal.stop_loss,
+                    client_order_id=client_id,
+                )
+                placed += 1
+                notifier.send(
+                    f"Botty paper order submitted: {signal.symbol} "
+                    f"{signal.direction.value} x{int(opportunity.decision.shares)}; "
+                    f"stop ${signal.stop_loss:,.2f}, target ${signal.take_profit:,.2f}."
+                )
+            print(f"\nSubmitted {placed} Alpaca paper bracket order(s).")
+        except Exception as error:  # notification must survive broker failures
+            with contextlib.suppress(Exception):
+                notifier.send(f"BOTTY NEEDS ATTENTION: paper execution failed: {error}")
+            print(f"\nPaper execution failed: {error}", file=sys.stderr)
+            return EXIT_FAILURE
+
+    if args.paper_trade:
+        print(
+            "\nThese were paper-trading candidates. The score ranks setups; it is "
+            "not a probability of profit."
+        )
+    else:
+        print(
+            "\nThese are candidates, ranked against each other. The score is not a "
+            "probability\nof profit, and nothing here has been placed as an order."
+        )
     return EXIT_OK
 
 

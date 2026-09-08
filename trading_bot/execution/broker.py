@@ -20,6 +20,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
 
 from trading_bot.config.settings import Settings, TradingMode
 from trading_bot.data.market_data import ensure_utc
@@ -206,6 +208,56 @@ class AlpacaBroker:
         except Exception as error:  # noqa: BLE001
             logger.error("Broker connectivity check failed: %s", error)
             return False
+
+    # -- guarded execution ------------------------------------------------------
+
+    def submit_bracket_order(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        side: str,
+        take_profit: float,
+        stop_loss: float,
+        client_order_id: str,
+        allow_live: bool = False,
+    ) -> dict[str, Any]:
+        """Submit an entry with broker-hosted stop and target protection.
+
+        Live submission requires both the global live locks *and* an explicit
+        per-call opt-in. The automated runner deliberately never opts in.
+        """
+        if qty < 1:
+            raise BrokerError(f"Order quantity must be positive, got {qty}")
+        if not self.is_paper and not allow_live:
+            raise BrokerError("Live order refused: this call is paper-only")
+        normalized_side = side.strip().lower()
+        if normalized_side not in {"buy", "sell"}:
+            raise BrokerError(f"Order side must be buy or sell, got {side!r}")
+        request = MarketOrderRequest(
+            symbol=symbol.strip().upper(),
+            qty=qty,
+            side=OrderSide.BUY if normalized_side == "buy" else OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=round(float(take_profit), 2)),
+            stop_loss=StopLossRequest(stop_price=round(float(stop_loss), 2)),
+            client_order_id=client_order_id[:48],
+        )
+        try:
+            order = self._call(
+                lambda: self._client.submit_order(order_data=request),
+                f"submit_bracket_order({symbol})",
+            )
+        except Exception as error:
+            raise BrokerError(f"Broker rejected {symbol} bracket order: {error}") from error
+        return {
+            "id": str(getattr(order, "id", "")),
+            "client_order_id": str(getattr(order, "client_order_id", client_order_id)),
+            "symbol": str(getattr(order, "symbol", symbol)),
+            "status": str(getattr(order, "status", "accepted")),
+            "qty": float(getattr(order, "qty", qty)),
+        }
 
 
 def build_broker(settings: Settings) -> AlpacaBroker:

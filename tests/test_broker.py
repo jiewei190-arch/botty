@@ -51,6 +51,14 @@ class FakeTradingClient:
             )
         ]
 
+    def submit_order(self, *, order_data):
+        self.calls.append("submit_order")
+        self.last_order = order_data
+        return SimpleNamespace(
+            id="order-1", client_order_id=order_data.client_order_id,
+            symbol=order_data.symbol, status="accepted", qty=order_data.qty,
+        )
+
 
 @pytest.fixture
 def paper_settings() -> Settings:
@@ -152,3 +160,31 @@ def test_live_client_only_built_when_both_locks_pass(monkeypatch):
     broker = AlpacaBroker(live)
     assert captured["paper"] is False
     assert not broker.is_paper
+
+
+def test_paper_bracket_order_carries_broker_hosted_exits(paper_settings):
+    client = FakeTradingClient()
+    broker = AlpacaBroker(paper_settings, client=client)
+    result = broker.submit_bracket_order(
+        symbol="AAPL", qty=3, side="buy", take_profit=210, stop_loss=190,
+        client_order_id="botty-aapl-1",
+    )
+    assert result["id"] == "order-1"
+    assert client.last_order.order_class.value == "bracket"
+    assert float(client.last_order.take_profit.limit_price) == 210
+    assert float(client.last_order.stop_loss.stop_price) == 190
+
+
+def test_automated_order_call_refuses_live_even_after_global_locks():
+    live = Settings(
+        trading_mode=TradingMode.LIVE,
+        enable_live_trading=True,
+        live_trading_confirmation=LIVE_CONFIRMATION_PHRASE,
+        alpaca=Settings().alpaca.model_copy(update={"api_key": "k", "secret_key": "s"}),
+    )
+    broker = AlpacaBroker(live, client=FakeTradingClient())
+    with pytest.raises(BrokerError, match="paper-only"):
+        broker.submit_bracket_order(
+            symbol="AAPL", qty=1, side="buy", take_profit=210, stop_loss=190,
+            client_order_id="blocked-live",
+        )
