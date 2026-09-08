@@ -1276,6 +1276,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         from trading_bot.automation.notifications import build_notifier
         from trading_bot.automation.reconciliation import BrokerReconciler
         from trading_bot.automation.runner import MarketOpenRunner
+        from trading_bot.automation.status_server import build_status_server
         from trading_bot.execution.broker import BrokerError, build_broker
 
         if not args.paper_trade:
@@ -1294,6 +1295,9 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         child_args._automation_broker = broker
         database = Database(settings.data.database_path)
         database.initialize()
+        status_server = build_status_server(settings)
+        if status_server is not None:
+            status_server.start()
         reconciler = BrokerReconciler(broker, database, build_notifier(settings))
 
         def load_last_session() -> date | None:
@@ -1328,6 +1332,8 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             print("\nBotty automation stopped.")
         finally:
+            if status_server is not None:
+                status_server.close()
             database.close()
         return EXIT_OK
 
