@@ -2,15 +2,11 @@ services:
   - type: web
     name: botty-swing-options
     runtime: docker
-    plan: 0.5c-512mb
+    plan: free
     region: virginia
     dockerCommand: python -m trading_bot.deploy
     healthCheckPath: /_stcore/health
     autoDeployTrigger: commit
-    disk:
-      name: botty-data
-      mountPath: /app/storage
-      sizeGB: 1
     envVars:
       - key: TRADING_MODE
         value: paper
