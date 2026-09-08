@@ -82,9 +82,14 @@ class BrokerReconciler:
                     f"order:{order['id']}:{status}", message,
                     symbol=order.get("symbol"),
                 )
+                if client_id.startswith("botty-opt-") and "-exit-" not in client_id:
+                    self.db.option_selections.set_status_by_contract(
+                        str(order.get("symbol") or ""), "failed"
+                    )
 
             if (
-                client_id.startswith("botty-") and status == "filled"
+                client_id.startswith("botty-") and "-exit-" not in client_id
+                and status == "filled"
                 and order.get("filled_avg_price") is not None
                 and self.db.trades.by_broker_entry_order(str(order["id"])) is None
             ):
@@ -99,7 +104,12 @@ class BrokerReconciler:
                     qty=float(order.get("filled_qty") or order.get("qty") or 0),
                     entry_price=float(order["filled_avg_price"]),
                     entry_ts=order.get("filled_at"), stop_loss=stop, take_profit=target,
-                    metadata={"broker_entry_order_id": order["id"], "client_order_id": client_id},
+                    metadata={
+                        "broker_entry_order_id": order["id"],
+                        "client_order_id": client_id,
+                        "instrument": "option" if client_id.startswith("botty-opt-") else "stock",
+                        "contract_multiplier": 100 if client_id.startswith("botty-opt-") else 1,
+                    },
                 )
                 opened += 1
                 if str(order["symbol"]) in broker_symbols:
@@ -120,6 +130,15 @@ class BrokerReconciler:
                         ),
                         None,
                     )
+                    if closing is None and client_id.startswith("botty-opt-"):
+                        closing = self._closing_fill(
+                            orders,
+                            {
+                                "symbol": order["symbol"],
+                                "direction": direction,
+                                "entry_ts": order.get("filled_at") or order.get("created_at"),
+                            },
+                        )
                     if closing:
                         result = self.db.trades.close_trade(
                             trade_id, exit_price=float(closing["filled_avg_price"]),
@@ -131,6 +150,9 @@ class BrokerReconciler:
                         self._notify(
                             f"Botty recovered closed paper trade: {order['symbol']} "
                             f"P&L ${pnl:,.2f}."
+                        )
+                        self.db.option_selections.set_status_by_contract(
+                            str(order["symbol"]), "closed"
                         )
 
         unprotected = 0
@@ -158,7 +180,10 @@ class BrokerReconciler:
                 and str(order.get("status")).lower() == "filled"
                 and order.get("parent_order_id") is None
             ]
-            if trade and botty_entries:
+            if trade and botty_entries and not any(
+                str(order.get("client_order_id") or "").startswith("botty-opt-")
+                for order in botty_entries
+            ):
                 latest = max(
                     botty_entries, key=lambda item: str(item.get("filled_at") or "")
                 )
@@ -194,6 +219,7 @@ class BrokerReconciler:
                     self._notify(
                         f"Botty paper trade closed: {local['symbol']} P&L ${pnl:,.2f}."
                     )
+                    self.db.option_selections.set_status_by_contract(local["symbol"], "closed")
                 else:
                     warnings += 1
                     message = f"{local['symbol']} disappeared without a matching exit fill"

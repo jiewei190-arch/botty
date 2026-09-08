@@ -1010,9 +1010,9 @@ exist.
 ## Roadmap
 
 The project is moving from a decision-support scanner into a guarded automated
-trader. Automation graduates in stages: unattended paper bracket orders first,
-then live execution only after paper results and operational failure handling
-have been reviewed.
+swing-options trader. Automation graduates in stages: unattended long call/put
+paper orders first, then live execution only after paper results and operational
+failure handling have been reviewed.
 
 | Scope | Status |
 |---|---|
@@ -1025,7 +1025,8 @@ have been reviewed.
 | Universe discovery and market-wide hunt | **Complete** |
 | Dashboard (hunt, charts, backtests, settings) | **Complete** |
 | Market-clock runner and webhook alerts | **Complete (paper)** |
-| Broker-hosted bracket entries, stops and targets | **Complete (paper)** |
+| Liquid long call/put selection and limit entries | **Complete (paper)** |
+| Premium, time-held, and expiration exit supervision | **Complete (paper)** |
 | Order, fill, trade, position and equity reconciliation | **Complete (paper)** |
 | Restart-safe market-session state | **Complete (paper)** |
 | Continuous position supervision | **Complete (paper)** |
@@ -1034,12 +1035,12 @@ have been reviewed.
 
 ### Always-on paper automation
 
-Set Alpaca paper credentials and your real paper-test account size in `.env`.
-Optionally add a Discord or Slack incoming webhook so Botty can reach you:
+Set Alpaca paper credentials in `.env`. Add the incoming webhook for `#general`
+in the `bottytrades` Slack workspace so Botty can reach you:
 
 ```bash
-AUTO_WEBHOOK_KIND=discord
-AUTO_WEBHOOK_URL=https://discord.com/api/webhooks/...
+AUTO_WEBHOOK_KIND=slack
+AUTO_WEBHOOK_URL=https://hooks.slack.com/services/...
 ```
 
 Then run:
@@ -1050,10 +1051,11 @@ python main.py hunt --watch-market --paper-trade
 
 Botty uses Alpaca's market clock rather than assuming weekdays or fixed hours,
 so holidays and early closes follow the exchange calendar. It performs one hunt
-per open session, submits at most the account's reported concurrent capacity,
-skips symbols already held, and attaches the strategy's stop and target as a
-bracket at order submission. Keep this process on an always-on host; closing the
-computer or terminal stops it.
+per open session and turns only risk-approved setups into liquid long calls or
+puts. Normal contracts are 60–90 DTE; only scores of 90+ may extend to 120 DTE.
+Each swing risks $500–$1,000 of premium, with at most two swings and four total
+contracts. Same-day exits are blocked. Keep this process on an always-on host;
+closing the computer or terminal stops it.
 
 For an always-on Docker host:
 
@@ -1062,10 +1064,18 @@ docker compose up -d --build
 docker compose logs -f botty
 ```
 
-The named volumes preserve the audit database, cache, and logs across container
-restarts. Secrets stay in the uncommitted `.env` file. See `HANDOFF.md` for the
-living cross-agent development state so Claude or Codex can continue without
-this chat history.
+The dashboard is then available at port `8501`. The named volumes preserve the
+audit database, price tracker, cache, and logs across container restarts. Secrets
+stay in the uncommitted `.env` file.
+
+For Render, create a Blueprint from this repository and select `render.yaml`.
+The Blueprint deliberately uses one paid, always-on web service so the worker and
+dashboard share the same persistent disk. Enter the three private values Render
+prompts for: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `AUTO_WEBHOOK_URL`.
+Do not paste any of them into GitHub or chat.
+
+See `HANDOFF.md` for the living cross-agent development state so Claude or Codex
+can continue without this chat history.
 
 ---
 

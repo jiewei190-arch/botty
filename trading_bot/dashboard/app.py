@@ -59,6 +59,7 @@ from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES
 PAGES = (
     "Hunt",
     "Automation",
+    "Swing Tracker",
     "Overview",
     "Market Scanner",
     "Chart",
@@ -92,6 +93,8 @@ def main() -> None:
         _hunt(settings, controls, palette)
     elif page == "Automation":
         _automation(settings)
+    elif page == "Swing Tracker":
+        _swing_tracker(settings)
     elif page == "Overview":
         _overview(settings, controls, palette)
     elif page == "Market Scanner":
@@ -275,8 +278,17 @@ def _automation(settings) -> None:
     st.caption("Read-only health, broker reconciliation, and paper performance.")
     if healthy:
         st.success(f"Botty is online · heartbeat {age:.1f} minutes ago")
+    elif heartbeat is None:
+        st.error(
+            "The dashboard is online, but the Botty worker is not attached. "
+            "Deploy with render.yaml so both processes share one database."
+        )
     else:
         st.error("Botty is not ready or its heartbeat is stale.")
+    if settings.automation.webhook_url and settings.automation.webhook_kind == "slack":
+        st.success("Slack alerts are configured for the deployment.")
+    else:
+        st.warning("Slack alerts are not configured. Add AUTO_WEBHOOK_URL to the host.")
 
     first, second, third, fourth = st.columns(4)
     first.metric("Market", "Open" if market_open == "true" else "Closed")
@@ -299,6 +311,65 @@ def _automation(settings) -> None:
         st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
     else:
         st.success("No recent automation errors.")
+
+
+def _swing_tracker(settings) -> None:
+    """Track the underlying and exact option contract from selection onward."""
+    from trading_bot.data.database import Database
+
+    database = Database(settings.data.database_path)
+    database.initialize()
+    selections = database.option_selections.recent(limit=100)
+    st.subheader("Swing Tracker")
+    st.caption("Every paper swing Botty selects, with underlying and contract movement.")
+    if not selections:
+        database.close()
+        st.info("No swing option has passed Botty's quality and risk filters yet.")
+        return
+
+    labels = {
+        f"{row['underlying_symbol']} · {row['contract_symbol']} · {row['selected_at'][:10]}": row
+        for row in selections
+    }
+    chosen = labels[st.selectbox("Swing", list(labels))]
+    underlying_history = database.prices.history(chosen["underlying_symbol"])
+    option_history = database.prices.history(chosen["contract_symbol"])
+    database.close()
+
+    one, two, three, four = st.columns(4)
+    one.metric("Underlying", chosen["underlying_symbol"])
+    two.metric(
+        "Contract",
+        f"{str(chosen['contract_type']).upper()} ${float(chosen['strike']):,.2f}",
+    )
+    three.metric("Expiration", str(chosen["expiration"]))
+    four.metric("Status", str(chosen["status"]).replace("_", " ").title())
+    st.markdown(
+        f"Selected **{int(chosen['quantity'])} contract(s)** at an estimated "
+        f"**${float(chosen['estimated_cost']):,.0f} maximum premium risk**."
+    )
+
+    chart_rows = []
+    for label, rows in (("Underlying", underlying_history), ("Option contract", option_history)):
+        if not rows:
+            continue
+        first = float(rows[0]["price"])
+        chart_rows.extend(
+            {
+                "Time": pd.to_datetime(row["ts"], utc=True),
+                "Movement %": (float(row["price"]) / first - 1) * 100,
+                "Series": label,
+            }
+            for row in rows
+            if first > 0
+        )
+    if chart_rows:
+        st.line_chart(pd.DataFrame(chart_rows), x="Time", y="Movement %", color="Series")
+    else:
+        st.warning("Waiting for the worker's first market price snapshot.")
+
+    with st.expander("Contract selection details"):
+        st.dataframe(pd.DataFrame([chosen]), width="stretch", hide_index=True)
 
 
 def _hunt(settings, controls: dict, palette) -> None:

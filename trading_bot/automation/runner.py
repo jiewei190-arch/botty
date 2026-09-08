@@ -41,6 +41,7 @@ class MarketOpenRunner:
         self._last_session = load_last_session() if load_last_session else None
         self._market_is_open = False
         self._scan_failure_notified = False
+        self._clock_failure_notified = False
 
     def _notify(self, message: str) -> None:
         """A broken alert channel must never stop market supervision."""
@@ -51,7 +52,16 @@ class MarketOpenRunner:
 
     def step(self) -> bool:
         """Poll once; return True only when a scan was run."""
-        clock = self.broker.get_clock()
+        try:
+            clock = self.broker.get_clock()
+        except Exception as error:
+            logger.exception("Market clock poll failed; Botty will retry")
+            if not self._clock_failure_notified:
+                self._notify(f"BOTTY NEEDS ATTENTION: market clock unavailable: {error}")
+                self._clock_failure_notified = True
+            self._market_is_open = False
+            return False
+        self._clock_failure_notified = False
         self._market_is_open = bool(clock.is_open)
         if self.heartbeat is not None:
             self.heartbeat(self._market_is_open)

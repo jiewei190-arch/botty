@@ -115,3 +115,15 @@ def test_heartbeat_records_closed_and_open_polls():
     runner.step()
     runner.step()
     assert states == [False, True]
+
+
+def test_temporary_clock_failure_is_retried_instead_of_crashing():
+    notices = Recorder()
+
+    class BrokenClock:
+        def get_clock(self):
+            raise RuntimeError("temporary outage")
+
+    runner = MarketOpenRunner(BrokenClock(), lambda: 0, notices)
+    assert not runner.step()
+    assert any("clock unavailable" in message for message in notices.messages)

@@ -239,6 +239,54 @@ class AutomationSettings(BaseSettings):
         return normalized
 
 
+class OptionsSettings(BaseSettings):
+    """Long-option swing rules. Loss is capped at premium paid."""
+
+    model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="OPTIONS_")
+
+    enabled: bool = True
+    min_dte: int = Field(default=60, ge=30, le=365)
+    max_dte: int = Field(default=90, ge=45, le=365)
+    exceptional_max_dte: int = Field(default=120, ge=60, le=730)
+    exceptional_min_confidence: float = Field(default=90.0, ge=70, le=100)
+    target_dte: int = Field(default=75, ge=30, le=365)
+    target_delta: float = Field(default=0.60, ge=0.35, le=0.80)
+    min_abs_delta: float = Field(default=0.50, ge=0.20, le=0.80)
+    max_abs_delta: float = Field(default=0.70, ge=0.40, le=0.95)
+    max_spread_pct: float = Field(default=12.0, gt=0, le=50)
+    min_daily_volume: int = Field(default=10, ge=0)
+    min_open_interest: int = Field(default=100, ge=0)
+    min_premium_per_trade: float = Field(default=500.0, gt=0)
+    max_premium_per_trade: float = Field(default=1_000.0, gt=0)
+    max_total_premium: float = Field(default=2_000.0, gt=0)
+    max_contracts_per_trade: int = Field(default=4, ge=1, le=4)
+    max_total_contracts: int = Field(default=4, ge=1, le=20)
+    max_open_positions: int = Field(default=2, ge=1, le=5)
+    planned_min_hold_days: int = Field(default=21, ge=1, le=90)
+    planned_max_hold_days: int = Field(default=60, ge=7, le=180)
+    profit_target_pct: float = Field(default=50.0, gt=0, le=500)
+    stop_loss_pct: float = Field(default=35.0, gt=0, lt=100)
+    exit_before_expiry_days: int = Field(default=21, ge=7, le=60)
+
+    @model_validator(mode="after")
+    def _validate_options(self) -> OptionsSettings:
+        if not self.min_dte <= self.target_dte <= self.max_dte:
+            raise ValueError("OPTIONS_TARGET_DTE must be between MIN_DTE and MAX_DTE")
+        if self.min_abs_delta > self.max_abs_delta:
+            raise ValueError("OPTIONS_MIN_ABS_DELTA cannot exceed MAX_ABS_DELTA")
+        if not self.min_abs_delta <= self.target_delta <= self.max_abs_delta:
+            raise ValueError("OPTIONS_TARGET_DELTA must be inside the delta range")
+        if self.planned_min_hold_days > self.planned_max_hold_days:
+            raise ValueError("planned minimum hold cannot exceed maximum hold")
+        if self.max_premium_per_trade > self.max_total_premium:
+            raise ValueError("per-trade premium cannot exceed total premium")
+        if self.min_premium_per_trade > self.max_premium_per_trade:
+            raise ValueError("minimum premium cannot exceed maximum premium")
+        if self.exceptional_max_dte < self.max_dte:
+            raise ValueError("exceptional max DTE cannot be below normal max DTE")
+        return self
+
+
 class Settings(BaseSettings):
     """Root settings object composing every configuration group."""
 
@@ -261,6 +309,7 @@ class Settings(BaseSettings):
     data: DataSettings = Field(default_factory=DataSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     automation: AutomationSettings = Field(default_factory=AutomationSettings)
+    options: OptionsSettings = Field(default_factory=OptionsSettings)
 
     project_root: Path = PROJECT_ROOT
 

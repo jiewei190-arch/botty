@@ -1274,9 +1274,12 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     """
     if args.watch_market:
         from trading_bot.automation.notifications import build_notifier
+        from trading_bot.automation.options_execution import OptionPositionSupervisor
         from trading_bot.automation.reconciliation import BrokerReconciler
         from trading_bot.automation.runner import MarketOpenRunner
+        from trading_bot.automation.tracking import PriceTracker
         from trading_bot.execution.broker import BrokerError, build_broker
+        from trading_bot.options.alpaca import AlpacaOptionChain
 
         if not args.paper_trade:
             print("Error: --watch-market currently requires --paper-trade.", file=sys.stderr)
@@ -1295,6 +1298,19 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         database = Database(settings.data.database_path)
         database.initialize()
         reconciler = BrokerReconciler(broker, database, build_notifier(settings))
+        option_chain = AlpacaOptionChain(settings)
+        stock_data = build_market_data(settings.alpaca, settings.data)
+        option_supervisor = OptionPositionSupervisor(
+            broker, option_chain, database, build_notifier(settings), settings
+        )
+        tracker = PriceTracker(stock_data, option_chain, database)
+
+        def supervise() -> None:
+            reconciler.reconcile()
+            for position in broker.get_positions():
+                database.option_selections.set_status_by_contract(position["symbol"], "open")
+            option_supervisor.supervise()
+            tracker.capture()
 
         def load_last_session() -> date | None:
             value = database.state.get("last_completed_session")
@@ -1316,7 +1332,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             broker,
             lambda: cmd_hunt(settings, child_args),
             build_notifier(settings),
-            supervise_once=reconciler.reconcile,
+            supervise_once=supervise,
             closed_poll_seconds=settings.automation.closed_poll_seconds,
             open_poll_seconds=settings.automation.open_poll_seconds,
             load_last_session=load_last_session,
@@ -1496,7 +1512,6 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         print(f"\nRanked setups written to {path}")
 
     if args.paper_trade:
-        from trading_bot.automation.execution import PaperExecutor
         from trading_bot.automation.notifications import build_notifier
         from trading_bot.execution.broker import build_broker
 
@@ -1505,12 +1520,23 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         try:
             broker = getattr(args, "_automation_broker", None) or build_broker(settings)
             database.initialize()
-            report = PaperExecutor(
-                broker, database, notifier, settings
-            ).execute(sweep.opportunities, sweep.concurrent_capacity)
+            if settings.options.enabled:
+                from trading_bot.automation.options_execution import OptionPaperExecutor
+                from trading_bot.options.alpaca import AlpacaOptionChain
+
+                report = OptionPaperExecutor(
+                    broker, AlpacaOptionChain(settings), database, notifier, settings
+                ).execute(sweep.opportunities, sweep.concurrent_capacity)
+            else:
+                from trading_bot.automation.execution import PaperExecutor
+
+                report = PaperExecutor(
+                    broker, database, notifier, settings
+                ).execute(sweep.opportunities, sweep.concurrent_capacity)
             print(
-                f"\nSubmitted {report.placed} Alpaca paper bracket order(s); "
-                f"{report.failed} failed, {report.stale_blocked} stale blocked."
+                f"\nSubmitted {report.placed} Alpaca paper "
+                f"{'swing-option' if settings.options.enabled else 'bracket'} order(s); "
+                f"{report.failed} failed."
             )
         except Exception as error:  # notification must survive broker failures
             with contextlib.suppress(Exception):

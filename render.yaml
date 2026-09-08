@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: botty-swing-options
+    runtime: docker
+    plan: 0.5c-512mb
+    region: virginia
+    dockerCommand: python -m trading_bot.deploy
+    healthCheckPath: /_stcore/health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    disk:
+      name: botty-data
+      mountPath: /app/storage
+      sizeGB: 1
+    envVars:
+      - key: TRADING_MODE
+        value: paper
+      - key: ENABLE_LIVE_TRADING
+        value: "false"
+      - key: OPTIONS_ENABLED
+        value: "true"
+      - key: OPTIONS_MIN_PREMIUM_PER_TRADE
+        value: "500"
+      - key: OPTIONS_MAX_PREMIUM_PER_TRADE
+        value: "1000"
+      - key: OPTIONS_MAX_DTE
+        value: "90"
+      - key: OPTIONS_EXCEPTIONAL_MAX_DTE
+        value: "120"
+      - key: DATA_DATABASE_PATH
+        value: /app/storage/trading_bot.db
+      - key: DATA_CACHE_DIR
+        value: /app/storage/cache
+      - key: LOG_DIRECTORY
+        value: /app/storage/logs
+      - key: AUTO_WEBHOOK_KIND
+        value: slack
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: AUTO_WEBHOOK_URL
+        sync: false

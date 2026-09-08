@@ -141,3 +141,28 @@ def test_round_trip_completed_while_offline_is_recovered_exactly_once():
     assert second.trades_closed == 0
     assert len(db.trades.history()) == 1
     assert db.trades.history()[0]["pnl"] == 200
+
+
+def test_option_round_trip_completed_while_offline_uses_contract_multiplier():
+    contract = "AAPL261120C00250000"
+    option_entry = entry()
+    option_entry.update({
+        "id": "option-entry", "client_order_id": "botty-opt-20260908-aapl-momentum",
+        "symbol": contract, "qty": 1, "filled_qty": 1, "filled_avg_price": 5.0,
+        "legs": [],
+    })
+    option_exit = {
+        **option_entry,
+        "id": "option-exit", "client_order_id": "botty-opt-exit-20260920-1",
+        "side": "sell", "filled_avg_price": 7.0,
+        "created_at": datetime(2026, 9, 20, 14, 0, tzinfo=timezone.utc),
+        "filled_at": datetime(2026, 9, 20, 14, 1, tzinfo=timezone.utc),
+    }
+    db = Database(":memory:")
+    reconciler = BrokerReconciler(
+        FakeBroker([option_entry, option_exit], []), db, Recorder()
+    )
+    report = reconciler.reconcile()
+    assert report.trades_opened == 1
+    assert report.trades_closed == 1
+    assert db.trades.history()[0]["pnl"] == 200

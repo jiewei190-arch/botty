@@ -17,6 +17,7 @@ def test_initialize_creates_every_table(database):
     assert {
         "runs", "signals", "orders", "trades", "positions", "equity_snapshots",
         "bot_events", "runtime_state",
+        "option_selections", "price_snapshots",
     } <= tables
 
 
@@ -37,6 +38,22 @@ def test_runtime_state_is_upserted(database):
     database.state.set("last_completed_session", "2026-09-09")
     assert database.state.get("last_completed_session") == "2026-09-09"
     assert len(database.state.all()) == 1
+
+
+def test_option_selection_and_price_history_are_persisted(database):
+    selection_id = database.option_selections.record(
+        underlying_symbol="AAPL", contract_symbol="AAPL261120C00250000",
+        contract_type="call", expiration="2026-11-20", strike=250,
+        bid=5.0, ask=5.2, delta=0.6, daily_volume=500, open_interest=1000,
+        quantity=1, estimated_cost=520,
+    )
+    database.option_selections.set_status(selection_id, "submitted")
+    database.prices.record(
+        symbol="AAPL261120C00250000", underlying_symbol="AAPL",
+        asset_kind="option", price=5.1, bid=5.0, ask=5.2,
+    )
+    assert database.option_selections.active()[0]["status"] == "submitted"
+    assert database.prices.history("AAPL261120C00250000")[0]["price"] == 5.1
 
 
 # -- signals ---------------------------------------------------------------------
@@ -83,6 +100,16 @@ def test_short_trade_profits_when_price_falls(database):
     closed = database.trades.close_trade(trade_id, exit_price=180.0)
     assert closed["pnl"] == pytest.approx(100.0)
     assert closed["r_multiple"] == pytest.approx(2.0)    # 20 gained / 10 risked
+
+
+def test_option_trade_pnl_uses_the_100_share_contract_multiplier(database):
+    trade_id = database.trades.open_trade(
+        symbol="AAPL261120C00250000", direction="LONG", qty=1, entry_price=5.0,
+        metadata={"instrument": "option", "contract_multiplier": 100},
+    )
+    closed = database.trades.close_trade(trade_id, exit_price=7.0)
+    assert closed["pnl"] == pytest.approx(200.0)
+    assert closed["pnl_pct"] == pytest.approx(40.0)
 
 
 def test_r_multiple_is_negative_on_a_stop_out(database):

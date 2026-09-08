@@ -23,6 +23,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     GetOrdersRequest,
+    LimitOrderRequest,
     MarketOrderRequest,
     StopLossRequest,
     TakeProfitRequest,
@@ -308,6 +309,33 @@ class AlpacaBroker:
             "status": _enum_value(getattr(order, "status", "accepted")),
             "qty": float(getattr(order, "qty", qty)),
         }
+
+    def submit_option_order(
+        self, *, contract_symbol: str, qty: int, limit_price: float,
+        client_order_id: str, side: str = "buy", allow_live: bool = False,
+    ) -> dict[str, Any]:
+        """Place a paper-only long-option limit order; never chase a wide market."""
+        if qty < 1 or limit_price <= 0:
+            raise BrokerError("Option quantity and limit price must be positive")
+        if not self.is_paper and not allow_live:
+            raise BrokerError("Live option order refused: this call is paper-only")
+        normalized_side = side.strip().lower()
+        if normalized_side not in {"buy", "sell"}:
+            raise BrokerError(f"Order side must be buy or sell, got {side!r}")
+        request = LimitOrderRequest(
+            symbol=contract_symbol.strip().upper(), qty=qty,
+            side=OrderSide.BUY if normalized_side == "buy" else OrderSide.SELL,
+            time_in_force=TimeInForce.DAY, limit_price=round(float(limit_price), 2),
+            client_order_id=client_order_id[:48],
+        )
+        try:
+            order = self._call(
+                lambda: self._client.submit_order(order_data=request),
+                f"submit_option_order({contract_symbol})",
+            )
+        except Exception as error:
+            raise BrokerError(f"Broker rejected {contract_symbol} option order: {error}") from error
+        return _order_dict(order)
 
 
 def build_broker(settings: Settings) -> AlpacaBroker:

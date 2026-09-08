@@ -4,18 +4,18 @@ Last updated: 2026-09-08 UTC
 
 ## User goal
 
-Finish Botty as a fully automated, risk-first US-equity algorithmic trader. It
-must wake for official market sessions, scan, size, paper-execute, supervise,
-persist, recover after restarts, and notify the user only when useful or when
-attention is required. Build and test the complete system with fakes/synthetic
-data before asking for Alpaca or notification credentials.
+Finish Botty as a fully automated, risk-first swing-options trader. It scans
+US equities for directional setups, selects liquid long calls/puts, paper
+executes and supervises them, persists after restarts, and sends useful Slack
+alerts. The intended holding period is roughly three to eight weeks.
 
 ## Non-negotiable safety rules
 
 - Paper trading first. Unattended live orders remain blocked until the complete
   paper workflow is validated with real paper results.
 - Never commit `.env`, API keys, webhook URLs, or account identifiers.
-- Every entry is risk-approved and submitted with broker-hosted stop and target.
+- Every entry is risk-approved. Long options cap loss at premium paid; Botty's
+  market-hours supervisor manages premium stops, targets, time, and expiry exits.
 - Broker state is truth; SQLite is an idempotently reconciled audit mirror.
 - Do not silently fabricate fills, exits, or prices. Alert on unexplained state.
 - Work on a feature branch, run full tests and Ruff, then push the branch.
@@ -48,6 +48,19 @@ data before asking for Alpaca or notification credentials.
 - Simulated execution/reconciliation tests cover guarded bracket submission,
   stale and rejection circuit breakers, fills, exits, restart deduplication, and
   recovery of a complete round trip that occurred while Botty was offline.
+- The primary automated instrument is now a long call for bullish setups or a
+  long put for bearish setups; the equity scanner remains the signal engine.
+- Normal contracts are 60–90 DTE. Only setups scoring at least 90 may use
+  91–120 DTE contracts.
+- Each swing must use $500–$1,000 of premium. At most two swings and four total
+  contracts may be open. Same-day option exits are structurally blocked.
+- Contract selection rejects weak delta, wide spreads, low volume, and low open
+  interest. Limit orders are used instead of market orders.
+- `Swing Tracker` stores and charts both the underlying and exact contract.
+- `render.yaml` runs worker and dashboard in one always-on service with a shared
+  persistent SQLite disk.
+- Slack destination: `#general` in workspace `bottytrades`. The incoming webhook
+  remains a private deployment secret named `AUTO_WEBHOOK_URL`.
 
 ## Verification commands
 
@@ -69,8 +82,9 @@ No credentials are required for the tests.
 
 ## Current scope boundaries
 
-- US equities, not options. Options need separate contract selection, liquidity,
-  Greeks, assignment/expiration, and risk handling.
-- Regular-session market-open automation. Extended/overnight execution is not
-  enabled and must be separately tested against feed/order limitations.
-- Discord and Slack incoming webhooks are implemented; credentials come later.
+- Long calls and long puts only. No naked short options, 0DTE, same-day trading,
+  spreads, exercise, or unattended real-money orders.
+- The process is online continuously, but scans, quotes, entries, and exits occur
+  during regular US option-market sessions.
+- A real paper soak test and private Render/Slack secrets remain required before
+  the deployment can truthfully be called operational.

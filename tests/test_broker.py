@@ -211,3 +211,15 @@ def test_automated_order_call_refuses_live_even_after_global_locks():
             symbol="AAPL", qty=1, side="buy", take_profit=210, stop_loss=190,
             client_order_id="blocked-live",
         )
+
+
+def test_option_entry_is_a_day_limit_order_in_paper(paper_settings):
+    client = FakeTradingClient()
+    broker = AlpacaBroker(paper_settings, client=client)
+    broker.submit_option_order(
+        contract_symbol="AAPL261120C00250000", qty=1, limit_price=5.25,
+        client_order_id="botty-opt-aapl",
+    )
+    assert client.last_order.time_in_force.value == "day"
+    assert client.last_order.side.value == "buy"
+    assert float(client.last_order.limit_price) == 5.25

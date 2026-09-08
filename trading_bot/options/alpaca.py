@@ -1,0 +1,104 @@
+"""Alpaca option-chain adapter with normalized, testable output."""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+from typing import Any
+
+from trading_bot.config.settings import Settings
+from trading_bot.options.selector import OptionQuote
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _value(value: Any) -> str:
+    return str(getattr(value, "value", value)).lower()
+
+
+class AlpacaOptionChain:
+    """Fetch contracts and snapshots only inside the configured swing window."""
+
+    def __init__(self, settings: Settings, *, trading_client=None, data_client=None) -> None:
+        self.settings = settings
+        if trading_client is None or data_client is None:
+            if not settings.alpaca.has_credentials:
+                raise ValueError("Alpaca credentials are required for option chains")
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            from alpaca.trading.client import TradingClient
+
+            trading_client = trading_client or TradingClient(
+                settings.alpaca.api_key, settings.alpaca.secret_key,
+                paper=not settings.is_live,
+            )
+            data_client = data_client or OptionHistoricalDataClient(
+                settings.alpaca.api_key, settings.alpaca.secret_key,
+            )
+        self.trading_client = trading_client
+        self.data_client = data_client
+
+    def quotes(self, underlying: str, direction: str, underlying_price: float) -> list[OptionQuote]:
+        from alpaca.data.requests import OptionSnapshotRequest
+        from alpaca.trading.enums import ContractType
+        from alpaca.trading.requests import GetOptionContractsRequest
+
+        today = date.today()
+        kind = ContractType.CALL if direction.upper() == "LONG" else ContractType.PUT
+        width = 0.20
+        request = GetOptionContractsRequest(
+            underlying_symbols=[underlying.upper()], type=kind,
+            expiration_date_gte=today + timedelta(days=self.settings.options.min_dte),
+            expiration_date_lte=today + timedelta(days=self.settings.options.exceptional_max_dte),
+            strike_price_gte=str(round(underlying_price * (1 - width), 2)),
+            strike_price_lte=str(round(underlying_price * (1 + width), 2)),
+            limit=1000,
+        )
+        response = self.trading_client.get_option_contracts(request)
+        contracts = list(getattr(response, "option_contracts", None) or [])
+        if not contracts:
+            return []
+        symbols = [str(contract.symbol) for contract in contracts]
+        snapshots = self.data_client.get_option_snapshot(
+            OptionSnapshotRequest(symbol_or_symbols=symbols)
+        )
+        output: list[OptionQuote] = []
+        for contract in contracts:
+            symbol = str(contract.symbol)
+            snap = snapshots.get(symbol) if hasattr(snapshots, "get") else None
+            quote = getattr(snap, "latest_quote", None)
+            greeks = getattr(snap, "greeks", None)
+            daily = getattr(snap, "daily_bar", None)
+            if quote is None:
+                continue
+            output.append(OptionQuote(
+                symbol=symbol, underlying=underlying.upper(),
+                contract_type=_value(contract.type),
+                expiration=contract.expiration_date,
+                strike=_number(contract.strike_price), bid=_number(quote.bid_price),
+                ask=_number(quote.ask_price), delta=getattr(greeks, "delta", None),
+                daily_volume=int(_number(getattr(daily, "volume", 0))),
+                open_interest=int(_number(getattr(contract, "open_interest", 0))),
+                implied_volatility=getattr(snap, "implied_volatility", None),
+            ))
+        return output
+
+    def latest_mid(self, symbols: list[str]) -> dict[str, tuple[float, float, float]]:
+        """Return contract -> (mid, bid, ask), omitting invalid quotes."""
+        if not symbols:
+            return {}
+        from alpaca.data.requests import OptionLatestQuoteRequest
+
+        quotes = self.data_client.get_option_latest_quote(
+            OptionLatestQuoteRequest(symbol_or_symbols=symbols)
+        )
+        result = {}
+        for symbol, quote in quotes.items():
+            bid, ask = _number(quote.bid_price), _number(quote.ask_price)
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else ask or bid
+            if mid > 0:
+                result[str(symbol)] = (mid, bid, ask)
+        return result
