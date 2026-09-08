@@ -22,10 +22,9 @@ logger = logging.getLogger(__name__)
 class MarketOpenRunner:
     """Clock-driven, restart-safe swing scanner.
 
-    By default this preserves the original once-per-session behaviour. Set
-    ``open_scan_interval_seconds`` to a positive value to re-run the swing scan
-    periodically while the regular market is open. The first scan of every new
-    session still runs immediately.
+    Botty is a swing bot, so the default is one scan at the regular-session open
+    and then one rescan per hour while the market remains open. Set
+    ``open_scan_interval_seconds=None`` to restore once-per-session behaviour.
     """
 
     def __init__(
@@ -35,7 +34,7 @@ class MarketOpenRunner:
         notifier: Notifier,
         *,
         closed_poll_seconds: int = 300,
-        open_scan_interval_seconds: int | None = None,
+        open_scan_interval_seconds: int | None = 3600,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if closed_poll_seconds < 15:
