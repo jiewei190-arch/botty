@@ -23,3 +23,5 @@ elif new not in text:
     raise RuntimeError("strategy registry assertion not found")
 
 print("Updated stale swing-mode tests")
+
+# Trigger marker: updater workflow was installed after the original script commit.
