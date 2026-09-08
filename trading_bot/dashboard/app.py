@@ -17,6 +17,8 @@ or directly::
 from __future__ import annotations
 
 import contextlib
+import hmac
+import os
 import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -75,6 +77,7 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    _require_dashboard_password()
     settings = dashboard_data.get_settings_cached()
     controls = _sidebar(settings)
     palette = get_palette(controls["mode"])
@@ -107,6 +110,26 @@ def main() -> None:
         _strategy_settings(controls, palette)
 
     _footer(palette)
+
+
+def _require_dashboard_password() -> None:
+    """Protect a public deployment when DASHBOARD_PASSWORD is configured."""
+    expected = os.getenv("DASHBOARD_PASSWORD", "").strip()
+    if not expected or st.session_state.get("dashboard_authenticated"):
+        return
+
+    st.title("Botty Trades")
+    st.caption("Enter the private dashboard password to continue.")
+    with st.form("dashboard_login"):
+        entered = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Open dashboard")
+    if submitted:
+        if hmac.compare_digest(entered, expected):
+            st.session_state["dashboard_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
 
 
 # -- sidebar -----------------------------------------------------------------

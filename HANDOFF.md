@@ -88,3 +88,7 @@ No credentials are required for the tests.
   during regular US option-market sessions.
 - A real paper soak test and private Render/Slack secrets remain required before
   the deployment can truthfully be called operational.
+- Render Free has been validated for initial testing. An Oracle Always Free VM
+  installer, systemd service, persistent data path, and authenticated dashboard
+  are under `deploy/oracle-cloud/` for the continuous paper soak test. Stop the
+  Render worker before starting Oracle to prevent duplicate automation.

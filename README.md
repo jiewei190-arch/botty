@@ -1068,11 +1068,15 @@ The dashboard is then available at port `8501`. The named volumes preserve the
 audit database, price tracker, cache, and logs across container restarts. Secrets
 stay in the uncommitted `.env` file.
 
-For Render, create a Blueprint from this repository and select `render.yaml`.
-The Blueprint deliberately uses one paid, always-on web service so the worker and
-dashboard share the same persistent disk. Enter the three private values Render
-prompts for: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `AUTO_WEBHOOK_URL`.
-Do not paste any of them into GitHub or chat.
+The current Render Blueprint uses its free plan for initial functional testing;
+free Render services can sleep and lose local runtime data, so they are not an
+unattended trading host.
+
+For continuous no-cost paper testing, follow
+[`deploy/oracle-cloud/README.md`](deploy/oracle-cloud/README.md). The Oracle
+deployment adds automatic restart, persistent local state, and password
+protection for the public dashboard. Stop Render before starting Oracle so two
+workers cannot submit duplicate paper orders.
 
 See `HANDOFF.md` for the living cross-agent development state so Claude or Codex
 can continue without this chat history.
