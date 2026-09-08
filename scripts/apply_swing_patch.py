@@ -115,3 +115,5 @@ if __name__ == "__main__":
     patch_engine()
     patch_dashboard()
     print("Applied swing backtest diagnostics/UI patch")
+
+# Trigger marker: workflow installed after the script's initial commit.
