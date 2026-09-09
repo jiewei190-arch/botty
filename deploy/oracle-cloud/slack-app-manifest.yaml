@@ -1,0 +1,25 @@
+display_information:
+  name: Bottytrades
+  description: Paper-trading alerts and on-demand Botty health checks
+  background_color: "#0b5d32"
+features:
+  bot_user:
+    display_name: Bottytrades
+    always_online: true
+  slash_commands:
+    - command: /botty-status
+      description: Check Botty automation health
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - chat:write
+      - commands
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

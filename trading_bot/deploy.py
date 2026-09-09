@@ -25,6 +25,12 @@ def main() -> int:
             ]
         ),
     ]
+    if os.getenv("AUTO_SLACK_BOT_TOKEN") and os.getenv("AUTO_SLACK_APP_TOKEN"):
+        processes.append(
+            subprocess.Popen(  # noqa: S603 - fixed, repository-owned command
+                [sys.executable, "-m", "trading_bot.automation.slack_status"]
+            )
+        )
 
     def stop(_signum=None, _frame=None) -> None:
         for process in processes:

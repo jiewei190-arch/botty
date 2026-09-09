@@ -40,6 +40,20 @@ In the private environment file, fill these four values:
 - `AUTO_WEBHOOK_URL` (Slack `#general` incoming webhook)
 - `DASHBOARD_PASSWORD` (a new strong password for the public dashboard)
 
+## Optional interactive Slack status
+
+Create a Slack app from `slack-app-manifest.yaml`, install it to the workspace,
+and generate an app-level token with `connections:write`. Then save the bot
+(`xoxb-`) and app (`xapp-`) tokens without putting them in shell history:
+
+```bash
+sudo bash /opt/botty/deploy/oracle-cloud/configure-slack-status.sh
+```
+
+After rebuilding/restarting, invite `@Bottytrades` to `#general`. Sending the
+single word `status` in that channel or running `/botty-status` returns the live
+heartbeat, market state, latest scan, positions, orders, equity, and error count.
+
 Do not change `TRADING_MODE=paper` or `ENABLE_LIVE_TRADING=false`.
 
 Open `http://PUBLIC_IP` and enter the dashboard password. Check service health

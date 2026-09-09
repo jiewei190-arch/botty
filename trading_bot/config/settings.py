@@ -229,6 +229,9 @@ class AutomationSettings(BaseSettings):
     webhook_url: str | None = None
     webhook_kind: str = "discord"
     webhook_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    #: Optional Socket Mode credentials for interactive Slack status checks.
+    slack_bot_token: str | None = None
+    slack_app_token: str | None = None
 
     @field_validator("webhook_kind")
     @classmethod
@@ -237,6 +240,14 @@ class AutomationSettings(BaseSettings):
         if normalized not in {"discord", "slack"}:
             raise ValueError("AUTO_WEBHOOK_KIND must be 'discord' or 'slack'")
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_slack_socket_tokens(self) -> AutomationSettings:
+        if bool(self.slack_bot_token) != bool(self.slack_app_token):
+            raise ValueError(
+                "AUTO_SLACK_BOT_TOKEN and AUTO_SLACK_APP_TOKEN must be set together"
+            )
+        return self
 
 
 class OptionsSettings(BaseSettings):
@@ -358,8 +369,9 @@ class Settings(BaseSettings):
         if payload.get("live_trading_confirmation"):
             payload["live_trading_confirmation"] = "***set***"
         automation = payload.get("automation", {})
-        if automation.get("webhook_url"):
-            automation["webhook_url"] = "***set***"
+        for key in ("webhook_url", "slack_bot_token", "slack_app_token"):
+            if automation.get(key):
+                automation[key] = "***set***"
         return payload
 
 
