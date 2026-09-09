@@ -1273,6 +1273,11 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     yours to place, wherever you trade.
     """
     if args.watch_market:
+        from trading_bot.automation.daily_summary import (
+            LAST_SENT_STATE_KEY,
+            format_close_summary,
+            save_scan_report,
+        )
         from trading_bot.automation.notifications import build_notifier
         from trading_bot.automation.options_execution import OptionPositionSupervisor
         from trading_bot.automation.reconciliation import BrokerReconciler
@@ -1324,6 +1329,24 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
                 payload={"session": session.isoformat()},
             )
 
+        def load_last_close_summary() -> date | None:
+            value = database.state.get(LAST_SENT_STATE_KEY)
+            return date.fromisoformat(value) if value else None
+
+        def save_last_close_summary(session: date) -> None:
+            database.state.set(LAST_SENT_STATE_KEY, session.isoformat())
+            database.events.record(
+                category="market_close_summary",
+                message=f"Sent closing summary for {session.isoformat()}",
+                payload={"session": session.isoformat()},
+            )
+
+        child_args._automation_report_sink = (
+            lambda universe, sweep, execution_report: save_scan_report(
+                database, sweep.as_of.date(), universe, sweep, execution_report
+            )
+        )
+
         def heartbeat(market_open: bool) -> None:
             database.state.set("automation_heartbeat", datetime.now(timezone.utc).isoformat())
             database.state.set("market_open", str(market_open).lower())
@@ -1338,6 +1361,9 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             load_last_session=load_last_session,
             save_last_session=save_last_session,
             heartbeat=heartbeat,
+            close_summary=lambda session: format_close_summary(database, session),
+            load_last_close_summary=load_last_close_summary,
+            save_last_close_summary=save_last_close_summary,
         )
         try:
             runner.run_forever()
@@ -1470,6 +1496,16 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         ),
     )
 
+    report_sink = getattr(args, "_automation_report_sink", None)
+
+    def capture_report(execution_report=None) -> None:
+        if report_sink is None:
+            return
+        try:
+            report_sink(universe, sweep, execution_report)
+        except Exception:  # noqa: BLE001 - reporting must not invalidate a scan
+            logger.exception("Could not persist automated daily scan report")
+
     print()
     for line in sweep.summary_lines():
         print(f"  {line}")
@@ -1486,6 +1522,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
                 sweep.blockers.items(), key=lambda item: -item[1]
             )[:6]:
                 print(f"  {count:>6,}x  {name}")
+        capture_report()
         return EXIT_OK
 
     equity = float(portfolio.equity)
@@ -1511,6 +1548,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         sweep.as_frame().to_csv(path, index=False)
         print(f"\nRanked setups written to {path}")
 
+    execution_report = None
     if args.paper_trade:
         from trading_bot.automation.notifications import build_notifier
         from trading_bot.execution.broker import build_broker
@@ -1533,6 +1571,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
                 report = PaperExecutor(
                     broker, database, notifier, settings
                 ).execute(sweep.opportunities, sweep.concurrent_capacity)
+            execution_report = report
             print(
                 f"\nSubmitted {report.placed} Alpaca paper "
                 f"{'swing-option' if settings.options.enabled else 'bracket'} order(s); "
@@ -1545,6 +1584,8 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             return EXIT_FAILURE
         finally:
             database.close()
+
+    capture_report(execution_report)
 
     if args.paper_trade:
         print(

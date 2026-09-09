@@ -27,6 +27,9 @@ class MarketOpenRunner:
         load_last_session: Callable[[], date | None] | None = None,
         save_last_session: Callable[[date], None] | None = None,
         heartbeat: Callable[[bool], None] | None = None,
+        close_summary: Callable[[date], str] | None = None,
+        load_last_close_summary: Callable[[], date | None] | None = None,
+        save_last_close_summary: Callable[[date], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.broker = broker
@@ -38,7 +41,12 @@ class MarketOpenRunner:
         self.sleep = sleep
         self.save_last_session = save_last_session
         self.heartbeat = heartbeat
+        self.close_summary = close_summary
+        self.save_last_close_summary = save_last_close_summary
         self._last_session = load_last_session() if load_last_session else None
+        self._last_close_summary = (
+            load_last_close_summary() if load_last_close_summary else None
+        )
         self._market_is_open = False
         self._scan_failure_notified = False
         self._clock_failure_notified = False
@@ -66,6 +74,20 @@ class MarketOpenRunner:
         if self.heartbeat is not None:
             self.heartbeat(self._market_is_open)
         if not clock.is_open:
+            session = self._last_session
+            if (
+                session is not None
+                and session != self._last_close_summary
+                and self.close_summary is not None
+            ):
+                try:
+                    message = self.close_summary(session)
+                    self._notify(message)
+                    self._last_close_summary = session
+                    if self.save_last_close_summary is not None:
+                        self.save_last_close_summary(session)
+                except Exception:
+                    logger.exception("End-of-day summary failed; Botty will retry")
             return False
         if self.supervise_once is not None:
             try:

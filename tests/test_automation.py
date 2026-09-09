@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 from trading_bot.automation.runner import MarketOpenRunner
@@ -127,3 +127,36 @@ def test_temporary_clock_failure_is_retried_instead_of_crashing():
     runner = MarketOpenRunner(BrokenClock(), lambda: 0, notices)
     assert not runner.step()
     assert any("clock unavailable" in message for message in notices.messages)
+
+
+def test_close_summary_is_sent_once_after_completed_session():
+    notices = Recorder()
+    saved = []
+    runner = MarketOpenRunner(
+        ClockBroker(clock(8, True), clock(8, False), clock(8, False)),
+        lambda: 0,
+        notices,
+        close_summary=lambda session: f"closing report {session}",
+        save_last_close_summary=saved.append,
+    )
+
+    assert runner.step()
+    assert not runner.step()
+    assert not runner.step()
+    assert notices.messages.count("closing report 2026-09-08") == 1
+    assert saved == [date(2026, 9, 8)]
+
+
+def test_close_summary_survives_restart_without_duplicate():
+    notices = Recorder()
+    runner = MarketOpenRunner(
+        ClockBroker(clock(8, False)),
+        lambda: 0,
+        notices,
+        load_last_session=lambda: date(2026, 9, 8),
+        load_last_close_summary=lambda: date(2026, 9, 8),
+        close_summary=lambda session: f"closing report {session}",
+    )
+
+    assert not runner.step()
+    assert not notices.messages

@@ -16,6 +16,16 @@ class OptionExecutionReport:
     placed: int = 0
     skipped: int = 0
     failed: int = 0
+    decisions: tuple[OptionExecutionDecision, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class OptionExecutionDecision:
+    """Final option-level disposition for one underlying candidate."""
+
+    symbol: str
+    approved: bool
+    reason: str
 
 
 class OptionPaperExecutor:
@@ -35,10 +45,19 @@ class OptionPaperExecutor:
             logger.exception("Option notification failed")
 
     def execute(self, opportunities, capacity: int) -> OptionExecutionReport:
+        considered = list(opportunities)
+        decisions: list[OptionExecutionDecision] = []
         active = self.db.option_selections.active()
         active_underlyings = {row["underlying_symbol"] for row in active}
         if len(active_underlyings) >= self.settings.options.max_open_positions:
-            return OptionExecutionReport(skipped=len(opportunities[:capacity]))
+            for opportunity in considered:
+                decisions.append(OptionExecutionDecision(
+                    opportunity.signal.symbol, False,
+                    "not approved: maximum open Botty positions already reached",
+                ))
+            return OptionExecutionReport(
+                skipped=len(considered), decisions=tuple(decisions)
+            )
         held_underlyings = {row["underlying_symbol"] for row in active}
         remaining_premium = max(
             0.0, self.settings.options.max_total_premium
@@ -49,17 +68,31 @@ class OptionPaperExecutor:
             - self.db.option_selections.contracts_committed()
         )
         placed = skipped = failed = 0
-        for opportunity in opportunities[:capacity]:
+        eligible = considered[:capacity]
+        for opportunity in considered[capacity:]:
+            decisions.append(OptionExecutionDecision(
+                opportunity.signal.symbol, False,
+                "not approved: account capacity reserved for higher-ranked setups",
+            ))
+            skipped += 1
+        for opportunity in eligible:
             signal = opportunity.signal
             decision = opportunity.decision
-            if (
-                signal.symbol in held_underlyings
-                or len(held_underlyings) >= self.settings.options.max_open_positions
-                or remaining_contracts < 1
-                or decision is None
-                or not decision.approved
-            ):
+            skip_reason = None
+            if signal.symbol in held_underlyings:
+                skip_reason = "not approved: Botty already tracks this underlying"
+            elif len(held_underlyings) >= self.settings.options.max_open_positions:
+                skip_reason = "not approved: maximum open Botty positions reached"
+            elif remaining_contracts < 1:
+                skip_reason = "not approved: total contract limit reached"
+            elif decision is None:
+                skip_reason = "not approved: no risk decision was available"
+            elif not decision.approved:
+                detail = getattr(decision, "rejection_reason", None) or "risk checks failed"
+                skip_reason = f"not approved: {detail}"
+            if skip_reason:
                 skipped += 1
+                decisions.append(OptionExecutionDecision(signal.symbol, False, skip_reason))
                 continue
             selection_id = None
             try:
@@ -74,6 +107,11 @@ class OptionPaperExecutor:
                 )
                 if selection is None:
                     skipped += 1
+                    reason = (
+                        "not approved: no option contract passed DTE, delta, liquidity, "
+                        "spread, and $500–$1,000 premium rules"
+                    )
+                    decisions.append(OptionExecutionDecision(signal.symbol, False, reason))
                     self.db.events.record(
                         category="option_selection", symbol=signal.symbol,
                         message="No contract passed DTE, delta, liquidity, and premium rules",
@@ -123,6 +161,12 @@ class OptionPaperExecutor:
                 remaining_contracts -= selection.quantity
                 held_underlyings.add(signal.symbol)
                 placed += 1
+                decisions.append(OptionExecutionDecision(
+                    signal.symbol, True,
+                    f"approved: {quote.symbol} x{selection.quantity} at ${quote.ask:.2f}; "
+                    f"premium ${selection.estimated_cost:,.0f}, "
+                    f"{selection.days_to_expiry} DTE",
+                ))
                 self._notify(
                     f"BOTTY SWING FOUND: {signal.symbol} {signal.direction.value} "
                     f"({opportunity.confidence:.0f}/100) | {quote.symbol} "
@@ -132,6 +176,9 @@ class OptionPaperExecutor:
                 )
             except Exception as error:  # noqa: BLE001 - isolate one candidate
                 failed += 1
+                decisions.append(OptionExecutionDecision(
+                    signal.symbol, False, f"not approved: option execution failed ({error})"
+                ))
                 if selection_id is not None:
                     self.db.option_selections.set_status(selection_id, "failed")
                 logger.exception("Option execution failed for %s", signal.symbol)
@@ -142,7 +189,7 @@ class OptionPaperExecutor:
                 self._notify(f"BOTTY NEEDS ATTENTION: {signal.symbol} option entry failed: {error}")
                 if failed >= self.settings.automation.max_order_failures_per_scan:
                     break
-        return OptionExecutionReport(placed, skipped, failed)
+        return OptionExecutionReport(placed, skipped, failed, tuple(decisions))
 
 
 class OptionPositionSupervisor:
