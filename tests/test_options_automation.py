@@ -66,13 +66,16 @@ def opportunity(*, approved=True, confidence=95):
 
 def test_option_executor_only_places_risk_approved_paper_swing(database, settings):
     broker = Broker()
+    notifier = Notifier()
     report = OptionPaperExecutor(
-        broker, Chain(), database, Notifier(), settings
+        broker, Chain(), database, notifier, settings
     ).execute([opportunity()], capacity=1)
     assert report.placed == 1
     assert broker.submissions[0]["side"] == "buy"
     selected = database.option_selections.active()[0]
     assert 500 <= selected["estimated_cost"] <= 1000
+    assert "CALL $250.00" in notifier.messages[0]
+    assert str(date.today() + timedelta(days=75)) in notifier.messages[0]
 
 
 def test_option_executor_rejects_unapproved_setup(database, settings):

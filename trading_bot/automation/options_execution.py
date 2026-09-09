@@ -163,13 +163,16 @@ class OptionPaperExecutor:
                 placed += 1
                 decisions.append(OptionExecutionDecision(
                     signal.symbol, True,
-                    f"approved: {quote.symbol} x{selection.quantity} at ${quote.ask:.2f}; "
-                    f"premium ${selection.estimated_cost:,.0f}, "
-                    f"{selection.days_to_expiry} DTE",
+                    f"approved: {quote.contract_type.upper()} ${quote.strike:,.2f} "
+                    f"exp {quote.expiration.isoformat()}, x{selection.quantity} "
+                    f"at ${quote.ask:.2f}; premium ${selection.estimated_cost:,.0f}, "
+                    f"{selection.days_to_expiry} DTE ({quote.symbol})",
                 ))
                 self._notify(
                     f"BOTTY SWING FOUND: {signal.symbol} {signal.direction.value} "
-                    f"({opportunity.confidence:.0f}/100) | {quote.symbol} "
+                    f"({opportunity.confidence:.0f}/100) | "
+                    f"{quote.contract_type.upper()} ${quote.strike:,.2f} "
+                    f"exp {quote.expiration.isoformat()} | {quote.symbol} "
                     f"x{selection.quantity} @ limit ${quote.ask:.2f} | "
                     f"estimated premium risk ${selection.estimated_cost:,.0f} | "
                     f"{selection.days_to_expiry} DTE | PAPER ORDER SUBMITTED."

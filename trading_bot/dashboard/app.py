@@ -501,6 +501,7 @@ def _hunt(settings, controls: dict, palette) -> None:
                 return
         st.session_state["hunt_sweep"] = sweep
         st.session_state["hunt_equity"] = float(equity)
+        st.session_state.pop("hunt_option_previews", None)
 
     sweep = st.session_state.get("hunt_sweep")
     if sweep is None:
@@ -510,10 +511,12 @@ def _hunt(settings, controls: dict, palette) -> None:
         )
         return
 
-    _hunt_results(sweep, st.session_state.get("hunt_equity", 0.0), palette)
+    _hunt_results(
+        sweep, st.session_state.get("hunt_equity", 0.0), palette, settings
+    )
 
 
-def _hunt_results(sweep, equity: float, palette) -> None:
+def _hunt_results(sweep, equity: float, palette, settings) -> None:
     """Render a completed sweep."""
     columns = st.columns(4)
     columns[0].markdown(
@@ -570,6 +573,36 @@ def _hunt_results(sweep, equity: float, palette) -> None:
 
     for opportunity in sweep.opportunities:
         _entry_plan_card(opportunity, palette)
+
+    st.markdown("### Exact option contracts")
+    st.caption(
+        "Uses the same DTE, delta, spread, liquidity, premium and position-limit "
+        "rules as the automated paper bot. This preview cannot place an order."
+    )
+    if st.button("Find option strikes and expiration dates", type="primary"):
+        with st.spinner("Checking the live options chains…"):
+            st.session_state["hunt_option_previews"] = (
+                dashboard_data.preview_option_trades(
+                    settings,
+                    sweep.opportunities,
+                    capacity=sweep.concurrent_capacity,
+                )
+            )
+    option_previews = st.session_state.get("hunt_option_previews")
+    if option_previews:
+        st.dataframe(
+            pd.DataFrame(option_previews),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score", min_value=0, max_value=100, format="%.0f"
+                ),
+                "Strike": st.column_config.NumberColumn(format="$%.2f"),
+                "Limit": st.column_config.NumberColumn(format="$%.2f"),
+                "Estimated premium": st.column_config.NumberColumn(format="$%.0f"),
+            },
+        )
 
     st.divider()
     frame = sweep.as_frame()
