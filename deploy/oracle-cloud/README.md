@@ -29,7 +29,7 @@ git clone --branch codex/order-reconciliation \
   https://github.com/jiewei190-arch/botty.git
 cd botty
 sudo bash deploy/oracle-cloud/install.sh
-sudo nano /etc/botty/botty.env
+sudo bash deploy/oracle-cloud/configure.sh
 sudo /opt/botty/deploy/oracle-cloud/start.sh
 ```
 
