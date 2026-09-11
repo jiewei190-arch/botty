@@ -223,8 +223,63 @@ CREATE TABLE IF NOT EXISTS system_health (
 CREATE INDEX IF NOT EXISTS idx_health_component_ts ON system_health(component, ts);
 """
 
+#: v3 — restart-safe key/value state for the always-on runner.
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+#: v4 — option contract selections and the price snapshots behind them.
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS option_selections (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id          INTEGER REFERENCES signals(id) ON DELETE SET NULL,
+    selected_at        TEXT NOT NULL,
+    underlying_symbol  TEXT NOT NULL,
+    contract_symbol    TEXT NOT NULL,
+    contract_type      TEXT NOT NULL,
+    expiration         TEXT NOT NULL,
+    strike             REAL NOT NULL,
+    bid                REAL,
+    ask                REAL NOT NULL,
+    delta              REAL,
+    implied_volatility REAL,
+    daily_volume       INTEGER DEFAULT 0,
+    open_interest      INTEGER DEFAULT 0,
+    quantity           INTEGER NOT NULL,
+    estimated_cost     REAL NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'selected',
+    metadata           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_option_selections_underlying
+    ON option_selections(underlying_symbol, selected_at);
+CREATE INDEX IF NOT EXISTS idx_option_selections_contract
+    ON option_selections(contract_symbol, selected_at);
+
+CREATE TABLE IF NOT EXISTS price_snapshots (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                TEXT NOT NULL,
+    symbol            TEXT NOT NULL,
+    underlying_symbol TEXT,
+    asset_kind        TEXT NOT NULL,
+    price             REAL NOT NULL,
+    bid               REAL,
+    ask               REAL,
+    source            TEXT NOT NULL DEFAULT 'alpaca'
+);
+CREATE INDEX IF NOT EXISTS idx_price_snapshots_symbol_ts
+    ON price_snapshots(symbol, ts);
+"""
+
 #: Ordered migrations. Index 0 upgrades user_version 0 -> 1, and so on.
-MIGRATIONS: tuple[str, ...] = (SCHEMA_V1, SCHEMA_V2)
+#:
+#: Never renumber a released migration. A database already at v2 carries
+#: the scanner tables; moving another script into that slot would leave it
+#: permanently missing whatever the new v2 creates.
+MIGRATIONS: tuple[str, ...] = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4)
 
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -285,6 +340,9 @@ class Database:
         self.opportunities = OpportunityRepository(self)
         self.alerts = AlertRepository(self)
         self.health = HealthRepository(self)
+        self.state = StateRepository(self)
+        self.option_selections = OptionSelectionRepository(self)
+        self.prices = PriceSnapshotRepository(self)
 
     # -- connection management ---------------------------------------------------
 
@@ -535,6 +593,38 @@ class OrderRepository(_Repository):
             (status, filled_qty, filled_avg_price, utc_now_iso(), broker_order_id),
         )
 
+    def upsert_broker_order(self, order: dict[str, Any]) -> int:
+        """Insert or refresh a broker snapshot, keyed by immutable broker id."""
+        broker_id = str(order["id"])
+        existing = self.db.query_one(
+            "SELECT id FROM orders WHERE broker_order_id = ?", (broker_id,)
+        )
+        values = {
+            "client_order_id": order.get("client_order_id"),
+            "status": str(order.get("status", "unknown")).lower(),
+            "filled_qty": float(order.get("filled_qty") or 0),
+            "filled_avg_price": order.get("filled_avg_price"),
+            "updated_at": to_iso(order.get("updated_at")) or utc_now_iso(),
+            "raw": _dumps(order),
+        }
+        if existing:
+            self.db.update("orders", int(existing["id"]), values)
+            return int(existing["id"])
+        return self.record(
+            broker_order_id=broker_id,
+            client_order_id=order.get("client_order_id"),
+            ts=order.get("created_at"),
+            symbol=str(order["symbol"]),
+            side=str(order["side"]),
+            qty=float(order.get("qty") or 0),
+            order_type=str(order.get("type") or "unknown"),
+            time_in_force=order.get("time_in_force"),
+            limit_price=order.get("limit_price"),
+            stop_price=order.get("stop_price"),
+            status=str(order.get("status") or "unknown").lower(),
+            raw=order,
+        )
+
     def open_orders(self) -> list[dict[str, Any]]:
         return self.db.query(
             "SELECT * FROM orders WHERE status NOT IN "
@@ -602,12 +692,18 @@ class TradeRepository(_Repository):
         direction = str(trade["direction"]).upper()
         qty = float(trade["qty"])
         entry = float(trade["entry_price"])
+        metadata = _loads(trade.get("metadata"))
+        multiplier = (
+            float(metadata.get("contract_multiplier", 1))
+            if isinstance(metadata, dict)
+            else 1
+        )
         sign = 1.0 if direction in ("LONG", "BUY") else -1.0
-        gross = (float(exit_price) - entry) * qty * sign
+        gross = (float(exit_price) - entry) * qty * sign * multiplier
         total_fees = float(trade["fees"] or 0.0) + fees
         total_slippage = float(trade["slippage"] or 0.0) + slippage
         net = gross - total_fees
-        cost_basis = entry * qty
+        cost_basis = entry * qty * multiplier
         pnl_pct = (net / cost_basis * 100) if cost_basis else 0.0
 
         r_multiple = None
@@ -638,6 +734,29 @@ class TradeRepository(_Repository):
 
     def open_trades(self) -> list[dict[str, Any]]:
         return self.db.query("SELECT * FROM trades WHERE status = 'open' ORDER BY entry_ts")
+
+    def open_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        return self.db.query_one(
+            "SELECT * FROM trades WHERE status = 'open' AND symbol = ? "
+            "ORDER BY entry_ts DESC LIMIT 1",
+            (symbol.upper(),),
+        )
+
+    def by_broker_entry_order(self, broker_order_id: str) -> dict[str, Any] | None:
+        """Find a trade reconstructed from a specific immutable broker entry."""
+        rows = self.db.query(
+            "SELECT * FROM trades WHERE metadata LIKE ? ORDER BY id DESC",
+            (f"%{broker_order_id}%",),
+        )
+        for row in rows:
+            metadata = _loads(row.get("metadata"))
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("broker_entry_order_id") == broker_order_id
+            ):
+                row["metadata"] = metadata
+                return row
+        return None
 
     def history(self, limit: int = 100, *, symbol: str | None = None) -> list[dict[str, Any]]:
         if symbol:
@@ -1065,3 +1184,114 @@ class HealthRepository(_Repository):
         if row:
             row["detail"] = _loads(row.get("detail"))
         return row
+class OptionSelectionRepository(_Repository):
+    """Chosen swing contracts and their selection-time market state."""
+
+    def record(self, **values: Any) -> int:
+        payload = {
+            "signal_id": values.get("signal_id"),
+            "selected_at": to_iso(values.get("selected_at")) or utc_now_iso(),
+            "underlying_symbol": str(values["underlying_symbol"]).upper(),
+            "contract_symbol": str(values["contract_symbol"]).upper(),
+            "contract_type": str(values["contract_type"]).lower(),
+            "expiration": str(values["expiration"]),
+            "strike": float(values["strike"]),
+            "bid": values.get("bid"),
+            "ask": float(values["ask"]),
+            "delta": values.get("delta"),
+            "implied_volatility": values.get("implied_volatility"),
+            "daily_volume": int(values.get("daily_volume") or 0),
+            "open_interest": int(values.get("open_interest") or 0),
+            "quantity": int(values["quantity"]),
+            "estimated_cost": float(values["estimated_cost"]),
+            "status": values.get("status", "selected"),
+            "metadata": _dumps(values.get("metadata")),
+        }
+        return self.db.insert("option_selections", payload)
+
+    def recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM option_selections ORDER BY selected_at DESC LIMIT ?", (limit,)
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.get("metadata"))
+        return rows
+
+    def active(self) -> list[dict[str, Any]]:
+        return self.db.query(
+            "SELECT * FROM option_selections WHERE status IN "
+            "('selected', 'submitted', 'open', 'exit_submitted') "
+            "ORDER BY selected_at DESC"
+        )
+
+    def set_status(self, selection_id: int, status: str) -> None:
+        self.db.update("option_selections", selection_id, {"status": status})
+
+    def set_status_by_contract(self, contract_symbol: str, status: str) -> None:
+        self.db.execute(
+            "UPDATE option_selections SET status = ? WHERE contract_symbol = ? "
+            "AND status NOT IN ('closed', 'failed')",
+            (status, contract_symbol.upper()),
+        )
+
+    def premium_committed(self) -> float:
+        row = self.db.query_one(
+            "SELECT COALESCE(SUM(estimated_cost), 0) cost FROM option_selections "
+            "WHERE status IN ('submitted', 'open')"
+        )
+        return float(row["cost"]) if row else 0.0
+
+    def contracts_committed(self) -> int:
+        row = self.db.query_one(
+            "SELECT COALESCE(SUM(quantity), 0) qty FROM option_selections "
+            "WHERE status IN ('submitted', 'open')"
+        )
+        return int(row["qty"]) if row else 0
+
+
+class PriceSnapshotRepository(_Repository):
+    """Observed prices for an underlying or exact option contract."""
+
+    def record(
+        self, *, symbol: str, price: float, asset_kind: str,
+        underlying_symbol: str | None = None, bid: float | None = None,
+        ask: float | None = None, ts: datetime | str | None = None,
+        source: str = "alpaca",
+    ) -> int:
+        if price <= 0:
+            raise ValueError("snapshot price must be positive")
+        return self.db.insert("price_snapshots", {
+            "ts": to_iso(ts) or utc_now_iso(), "symbol": symbol.upper(),
+            "underlying_symbol": underlying_symbol.upper() if underlying_symbol else None,
+            "asset_kind": asset_kind, "price": float(price), "bid": bid, "ask": ask,
+            "source": source,
+        })
+
+    def history(self, symbol: str, limit: int = 5000) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM price_snapshots WHERE symbol = ? ORDER BY ts DESC LIMIT ?",
+            (symbol.upper(), limit),
+        )
+        return list(reversed(rows))
+
+
+class StateRepository(_Repository):
+    """Small durable key/value store for restart-safe automation state."""
+
+    def set(self, key: str, value: str) -> None:
+        self.db.execute(
+            """
+            INSERT INTO runtime_state (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, utc_now_iso()),
+        )
+
+    def get(self, key: str) -> str | None:
+        row = self.db.query_one("SELECT value FROM runtime_state WHERE key = ?", (key,))
+        return str(row["value"]) if row else None
+
+    def all(self) -> list[dict[str, Any]]:
+        return self.db.query("SELECT * FROM runtime_state ORDER BY key")

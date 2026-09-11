@@ -1,0 +1,17 @@
+[Unit]
+Description=Botty swing-options paper automation
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=15
+TimeoutStopSec=45
+ExecStartPre=-/usr/bin/docker rm -f botty
+ExecStart=/usr/bin/docker run --name botty --env-file /etc/botty/botty.env --env PORT=8501 --env LOG_DIRECTORY=/app/storage/logs --publish 80:8501 --volume /var/lib/botty:/app/storage botty-oracle:latest python -m trading_bot.deploy
+ExecStop=/usr/bin/docker stop --time 30 botty
+
+[Install]
+WantedBy=multi-user.target

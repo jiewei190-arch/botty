@@ -51,6 +51,21 @@ class FakeTradingClient:
             )
         ]
 
+    def get_orders(self, *, filter):
+        self.calls.append("get_orders")
+        self.last_order_filter = filter
+        return [
+            SimpleNamespace(
+                id="order-1", client_order_id="botty-aapl", symbol="AAPL",
+                side=SimpleNamespace(value="buy"), type=SimpleNamespace(value="market"),
+                time_in_force=SimpleNamespace(value="gtc"),
+                status=SimpleNamespace(value="filled"), qty="3", filled_qty="3",
+                filled_avg_price="200", limit_price=None, stop_price=None,
+                created_at="2026-09-08T13:30:00Z", updated_at="2026-09-08T13:31:00Z",
+                filled_at="2026-09-08T13:31:00Z", legs=[],
+            )
+        ]
+
     def submit_order(self, *, order_data):
         self.calls.append("submit_order")
         self.last_order = order_data
@@ -105,6 +120,14 @@ def test_positions_are_returned_as_plain_dicts(paper_settings):
     positions = AlpacaBroker(paper_settings, client=FakeTradingClient()).get_positions()
     assert positions[0]["symbol"] == "AAPL"
     assert positions[0]["unrealized_plpc"] == pytest.approx(10.0)
+
+
+def test_orders_are_normalized_for_reconciliation(paper_settings):
+    client = FakeTradingClient()
+    orders = AlpacaBroker(paper_settings, client=client).get_orders()
+    assert orders[0]["status"] == "filled"
+    assert orders[0]["filled_avg_price"] == 200
+    assert client.last_order_filter.nested is True
 
 
 def test_ping_reports_failure_without_raising(paper_settings):
@@ -188,3 +211,15 @@ def test_automated_order_call_refuses_live_even_after_global_locks():
             symbol="AAPL", qty=1, side="buy", take_profit=210, stop_loss=190,
             client_order_id="blocked-live",
         )
+
+
+def test_option_entry_is_a_day_limit_order_in_paper(paper_settings):
+    client = FakeTradingClient()
+    broker = AlpacaBroker(paper_settings, client=client)
+    broker.submit_option_order(
+        contract_symbol="AAPL261120C00250000", qty=1, limit_price=5.25,
+        client_order_id="botty-opt-aapl",
+    )
+    assert client.last_order.time_in_force.value == "day"
+    assert client.last_order.side.value == "buy"
+    assert float(client.last_order.limit_price) == 5.25

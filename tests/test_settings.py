@@ -9,6 +9,7 @@ from trading_bot.config.settings import (
     LIVE_CONFIRMATION_PHRASE,
     AlpacaSettings,
     DataSettings,
+    OptionsSettings,
     RiskSettings,
     Settings,
     TradingMode,
@@ -18,6 +19,30 @@ from trading_bot.config.settings import (
 
 def test_defaults_to_paper_mode():
     assert load_settings().trading_mode is TradingMode.PAPER
+
+
+def test_options_default_to_alert_only_over_the_swing_holding_window():
+    options = OptionsSettings()
+    assert options.alert_only is True
+    # The hold matches the equity swing strategy: 7-30 calendar days.
+    assert options.planned_min_hold_days == 7
+    assert options.planned_max_hold_days == 30
+    assert options.min_dte <= options.target_dte <= options.max_dte
+
+
+def test_the_shortest_contract_outlives_the_planned_hold():
+    """The floor is derived from the window, not picked.
+
+    A 7-DTE contract held for three weeks expires worthless whatever the stock
+    does, and the old default allowed exactly that.
+    """
+    options = OptionsSettings()
+    assert options.min_dte >= options.planned_max_hold_days + options.exit_before_expiry_days
+
+
+def test_a_contract_that_expires_inside_the_hold_is_refused():
+    with pytest.raises(ValidationError, match="OPTIONS_MIN_DTE"):
+        OptionsSettings(min_dte=7, planned_max_hold_days=30, exit_before_expiry_days=14)
 
 
 def test_live_mode_rejected_without_any_lock(monkeypatch):

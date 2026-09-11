@@ -222,6 +222,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | Command | What it does |
 |---|---|
 | `python main.py check` | Full health check: config, database, credentials, broker, data |
+| `python main.py status` | Automation heartbeat, scan, order, position, trade and error health |
 | `python main.py config` | Print resolved configuration (secrets masked) |
 | `python main.py clock` | Market session state (local calendar + broker) |
 | `python main.py universe` | List symbol categories and the resolved watchlist |
@@ -694,6 +695,80 @@ tape, that is a paid subscription and a one-line change to `ALPACA_DATA_FEED`.
 - **Score calibration covers strategy confidence, not detector scores.** The
   machinery in `backtesting/calibration.py` applies to `scan`/`hunt` confidence;
   pointing it at detector scores is unfinished work.
+
+---
+
+## What you actually buy, and what the market did
+
+### Every scanned play names its contract
+
+A chart setup is a thesis about a stock. `hunt` and `scan` now finish the
+sentence — the ticker, the strike, whether it is a call or a put, and how long
+it has to work:
+
+```
+  Buy              12 shares near $182.40   ($2,189)
+  Stop                             $174.12   (4.54% away)
+  Target                           $199.05   (9.13% away)
+  Option            1 x  NVDA $185 CALL 2026-11-20 (70DTE)
+                         limit $8.35/contract   (premium $835)
+```
+
+The same line appears in the Slack/Discord alerts and on the dashboard, from one
+selector — two implementations would drift, and the contract on screen would
+stop matching the one the bot would buy. `--no-options` prints the stock plan
+alone.
+
+Contracts are chosen by **liquidity and by the holding window**, never by a
+prediction: spread, open interest, delta (or moneyness when the feed has no
+greeks), days to expiration, and what the premium budget allows.
+
+### The DTE window is derived, not chosen
+
+| | Value | Why |
+|---|---|---|
+| `planned_max_hold_days` | 30 | matches the equity swing window |
+| `exit_before_expiry_days` | 14 | theta and gamma both accelerate inside three weeks |
+| `min_dte` | 45 | **hold + exit buffer** — anything shorter expires inside the trade |
+| `target_dte` / `max_dte` | 60 / 90 | room for the thesis without paying for a year |
+
+A validator refuses any configuration that breaks the first relationship. The
+old defaults allowed a 7-day contract while planning to hold for up to 60 days
+and exit with 21 days left — a contract bought at the floor was already past the
+exit rule on the day it opened.
+
+### The market recap
+
+`python main.py recap` says what the tape did, and the same block leads the
+end-of-day report:
+
+```
+MARKET RECAP — 2026-09-10
+
+  S&P 500           757.83   -0.60%   (5d -0.96%, below its 50-day)
+
+  Leading:  Technology +1.21%, Communications +0.88%, Financials +0.402%
+  Lagging:  Energy -1.44%, Utilities -0.91%, Real Estate -0.62%
+
+  7/11 sectors higher — positive but uneven.
+  Volatility calm — the S&P's average daily range is 0.71% of price.
+```
+
+Market first, then the bot's own numbers: a list of setups means something
+different after a day the whole tape rallied than after one where only those
+names moved.
+
+It is built from **daily bars the scanner already fetches** — index and sector
+ETFs through the same provider as everything else. No second subscription, and
+it works on a data-only key.
+
+**It does not comment on the economy.** CPI prints, Fed decisions and payroll
+numbers are not in a price feed, and inferring them from index moves would be
+narration dressed as analysis — "stocks fell on rate fears", written by
+something that cannot see rates. The volatility regime says what the *price
+behaviour* implies and stops there. A news or macro provider would slot in
+behind `MarketRecap.headlines`; until one exists the field stays empty rather
+than invented.
 
 ---
 
@@ -1189,8 +1264,9 @@ produce a fake signal.
 
 ## Data storage
 
-**`storage/trading_bot.db`** (SQLite, WAL mode) holds seven tables: `runs`,
+**`storage/trading_bot.db`** (SQLite, WAL mode) holds eight tables: `runs`,
 `signals`, `orders`, `trades`, `positions`, `equity_snapshots` and `bot_events`.
+`runtime_state` keeps restart-safe heartbeat and completed-session markers.
 
 Rejected signals are recorded alongside accepted ones with the reason for
 rejection — when the bot is not trading, that table tells you why. Schema changes
@@ -1299,9 +1375,9 @@ exist.
 ## Roadmap
 
 The project is moving from a decision-support scanner into a guarded automated
-trader. Automation graduates in stages: unattended paper bracket orders first,
-then live execution only after paper results and operational failure handling
-have been reviewed.
+swing-options trader. Automation graduates in stages: unattended long call/put
+paper orders first, then live execution only after paper results and operational
+failure handling have been reviewed.
 
 | Scope | Status |
 |---|---|
@@ -1321,16 +1397,22 @@ have been reviewed.
 | Tracking setups you took, to measure the scanner against reality | Planned |
 | Reconciliation of fills/orders/trades into SQLite | Planned |
 | Continuous intraday rescans and position supervision | Planned |
+| Liquid long call/put selection and limit entries | **Complete (paper)** |
+| Premium, time-held, and expiration exit supervision | **Complete (paper)** |
+| Order, fill, trade, position and equity reconciliation | **Complete (paper)** |
+| Restart-safe market-session state | **Complete (paper)** |
+| Continuous position supervision | **Complete (paper)** |
+| Dashboard automation health and paper performance | **Complete (paper)** |
 | Live unattended order placement | **Locked pending paper validation** |
 
 ### Always-on paper automation
 
-Set Alpaca paper credentials and your real paper-test account size in `.env`.
-Optionally add a Discord or Slack incoming webhook so Botty can reach you:
+Set Alpaca paper credentials in `.env`. Add the incoming webhook for `#general`
+in the `bottytrades` Slack workspace so Botty can reach you:
 
 ```bash
-AUTO_WEBHOOK_KIND=discord
-AUTO_WEBHOOK_URL=https://discord.com/api/webhooks/...
+AUTO_WEBHOOK_KIND=slack
+AUTO_WEBHOOK_URL=https://hooks.slack.com/services/...
 ```
 
 Then run:
@@ -1341,10 +1423,39 @@ python main.py hunt --watch-market --paper-trade
 
 Botty uses Alpaca's market clock rather than assuming weekdays or fixed hours,
 so holidays and early closes follow the exchange calendar. It performs one hunt
-per open session, submits at most the account's reported concurrent capacity,
-skips symbols already held, and attaches the strategy's stop and target as a
-bracket at order submission. Keep this process on an always-on host; closing the
-computer or terminal stops it.
+per open session and turns only risk-approved setups into liquid long calls or
+puts. By default, `OPTIONS_ALERT_ONLY=true` sends the exact contract idea to
+Slack without submitting an order. Set it to `false` only when intentionally
+testing paper orders. Contracts must have 7–60 DTE, with selection targeting
+roughly 30 DTE. Each idea uses $500–$1,000 of premium, with at most two swings
+and four total contracts. The planned swing window is 7–60 days; protective
+profit, loss, and expiration rules can still recommend or trigger an earlier
+exit. Same-day automated exits are blocked. Keep this process on an always-on
+host; closing the computer or terminal stops it.
+
+For an always-on Docker host:
+
+```bash
+docker compose up -d --build
+docker compose logs -f botty
+```
+
+The dashboard is then available at port `8501`. The named volumes preserve the
+audit database, price tracker, cache, and logs across container restarts. Secrets
+stay in the uncommitted `.env` file.
+
+The current Render Blueprint uses its free plan for initial functional testing;
+free Render services can sleep and lose local runtime data, so they are not an
+unattended trading host.
+
+For continuous no-cost paper testing, follow
+[`deploy/oracle-cloud/README.md`](deploy/oracle-cloud/README.md). The Oracle
+deployment adds automatic restart, persistent local state, and password
+protection for the public dashboard. Stop Render before starting Oracle so two
+workers cannot submit duplicate paper orders.
+
+See `HANDOFF.md` for the living cross-agent development state so Claude or Codex
+can continue without this chat history.
 
 ---
 

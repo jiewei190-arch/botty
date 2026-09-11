@@ -16,6 +16,9 @@ or directly::
 
 from __future__ import annotations
 
+import contextlib
+import hmac
+import os
 import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -57,6 +60,8 @@ from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES
 
 PAGES = (
     "Hunt",
+    "Automation",
+    "Swing Tracker",
     "Overview",
     "Market Scanner",
     "Chart",
@@ -72,6 +77,7 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    _require_dashboard_password()
     settings = dashboard_data.get_settings_cached()
     controls = _sidebar(settings)
     palette = get_palette(controls["mode"])
@@ -88,6 +94,10 @@ def main() -> None:
     page = controls["page"]
     if page == "Hunt":
         _hunt(settings, controls, palette)
+    elif page == "Automation":
+        _automation(settings)
+    elif page == "Swing Tracker":
+        _swing_tracker(settings)
     elif page == "Overview":
         _overview(settings, controls, palette)
     elif page == "Market Scanner":
@@ -100,6 +110,26 @@ def main() -> None:
         _strategy_settings(controls, palette)
 
     _footer(palette)
+
+
+def _require_dashboard_password() -> None:
+    """Protect a public deployment when DASHBOARD_PASSWORD is configured."""
+    expected = os.getenv("DASHBOARD_PASSWORD", "").strip()
+    if not expected or st.session_state.get("dashboard_authenticated"):
+        return
+
+    st.title("Botty Trades")
+    st.caption("Enter the private dashboard password to continue.")
+    with st.form("dashboard_login"):
+        entered = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Open dashboard")
+    if submitted:
+        if hmac.compare_digest(entered, expected):
+            st.session_state["dashboard_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
 
 
 # -- sidebar -----------------------------------------------------------------
@@ -246,6 +276,127 @@ def _metric(label: str, value: str, note: str = "") -> str:
 # -- pages -------------------------------------------------------------------
 
 
+def _automation(settings) -> None:
+    """Read-only operating view of the unattended paper trader."""
+    from trading_bot.data.database import Database
+
+    database = Database(settings.data.database_path)
+    database.initialize()
+    heartbeat = database.state.get("automation_heartbeat")
+    market_open = database.state.get("market_open") or "unknown"
+    last_session = database.state.get("last_completed_session") or "never"
+    equity = database.equity.latest()
+    positions = database.positions.all()
+    orders = database.orders.open_orders()
+    trades = database.trades.open_trades()
+    errors = database.events.recent(limit=20, level="ERROR")
+    closed_stats = database.trades.statistics()
+    database.close()
+
+    age = None
+    if heartbeat:
+        with contextlib.suppress(ValueError):
+            elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(heartbeat)
+            age = elapsed.total_seconds() / 60
+    healthy = age is not None and age <= 15
+    st.subheader("Automation")
+    st.caption("Read-only health, broker reconciliation, and paper performance.")
+    if healthy:
+        st.success(f"Botty is online · heartbeat {age:.1f} minutes ago")
+    elif heartbeat is None:
+        st.error(
+            "The dashboard is online, but the Botty worker is not attached. "
+            "Deploy with render.yaml so both processes share one database."
+        )
+    else:
+        st.error("Botty is not ready or its heartbeat is stale.")
+    if settings.automation.webhook_url and settings.automation.webhook_kind == "slack":
+        st.success("Slack alerts are configured for the deployment.")
+    else:
+        st.warning("Slack alerts are not configured. Add AUTO_WEBHOOK_URL to the host.")
+
+    first, second, third, fourth = st.columns(4)
+    first.metric("Market", "Open" if market_open == "true" else "Closed")
+    second.metric("Last scan", last_session)
+    third.metric("Open positions", len(positions))
+    fourth.metric("Open orders", len(orders))
+    fifth, sixth, seventh, eighth = st.columns(4)
+    fifth.metric("Paper equity", f"${float(equity['equity']):,.2f}" if equity else "—")
+    sixth.metric("Open Botty trades", len(trades))
+    seventh.metric("Closed trades", closed_stats["total_trades"])
+    eighth.metric("Realized P&L", f"${closed_stats['total_pnl']:,.2f}")
+
+    st.markdown("### Current positions")
+    if positions:
+        st.dataframe(pd.DataFrame(positions), width="stretch", hide_index=True)
+    else:
+        st.info("No positions are currently tracked.")
+    st.markdown("### Recent attention events")
+    if errors:
+        st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
+    else:
+        st.success("No recent automation errors.")
+
+
+def _swing_tracker(settings) -> None:
+    """Track the underlying and exact option contract from selection onward."""
+    from trading_bot.data.database import Database
+
+    database = Database(settings.data.database_path)
+    database.initialize()
+    selections = database.option_selections.recent(limit=100)
+    st.subheader("Swing Tracker")
+    st.caption("Every paper swing Botty selects, with underlying and contract movement.")
+    if not selections:
+        database.close()
+        st.info("No swing option has passed Botty's quality and risk filters yet.")
+        return
+
+    labels = {
+        f"{row['underlying_symbol']} · {row['contract_symbol']} · {row['selected_at'][:10]}": row
+        for row in selections
+    }
+    chosen = labels[st.selectbox("Swing", list(labels))]
+    underlying_history = database.prices.history(chosen["underlying_symbol"])
+    option_history = database.prices.history(chosen["contract_symbol"])
+    database.close()
+
+    one, two, three, four = st.columns(4)
+    one.metric("Underlying", chosen["underlying_symbol"])
+    two.metric(
+        "Contract",
+        f"{str(chosen['contract_type']).upper()} ${float(chosen['strike']):,.2f}",
+    )
+    three.metric("Expiration", str(chosen["expiration"]))
+    four.metric("Status", str(chosen["status"]).replace("_", " ").title())
+    st.markdown(
+        f"Selected **{int(chosen['quantity'])} contract(s)** at an estimated "
+        f"**${float(chosen['estimated_cost']):,.0f} maximum premium risk**."
+    )
+
+    chart_rows = []
+    for label, rows in (("Underlying", underlying_history), ("Option contract", option_history)):
+        if not rows:
+            continue
+        first = float(rows[0]["price"])
+        chart_rows.extend(
+            {
+                "Time": pd.to_datetime(row["ts"], utc=True),
+                "Movement %": (float(row["price"]) / first - 1) * 100,
+                "Series": label,
+            }
+            for row in rows
+            if first > 0
+        )
+    if chart_rows:
+        st.line_chart(pd.DataFrame(chart_rows), x="Time", y="Movement %", color="Series")
+    else:
+        st.warning("Waiting for the worker's first market price snapshot.")
+
+    with st.expander("Contract selection details"):
+        st.dataframe(pd.DataFrame([chosen]), width="stretch", hide_index=True)
+
+
 def _hunt(settings, controls: dict, palette) -> None:
     """Scan the whole market and show the setups worth acting on.
 
@@ -352,6 +503,7 @@ def _hunt(settings, controls: dict, palette) -> None:
                 return
         st.session_state["hunt_sweep"] = sweep
         st.session_state["hunt_equity"] = float(equity)
+        st.session_state.pop("hunt_option_previews", None)
 
     sweep = st.session_state.get("hunt_sweep")
     if sweep is None:
@@ -361,10 +513,12 @@ def _hunt(settings, controls: dict, palette) -> None:
         )
         return
 
-    _hunt_results(sweep, st.session_state.get("hunt_equity", 0.0), palette)
+    _hunt_results(
+        sweep, st.session_state.get("hunt_equity", 0.0), palette, settings
+    )
 
 
-def _hunt_results(sweep, equity: float, palette) -> None:
+def _hunt_results(sweep, equity: float, palette, settings) -> None:
     """Render a completed sweep."""
     columns = st.columns(4)
     columns[0].markdown(
@@ -421,6 +575,36 @@ def _hunt_results(sweep, equity: float, palette) -> None:
 
     for opportunity in sweep.opportunities:
         _entry_plan_card(opportunity, palette)
+
+    st.markdown("### Exact option contracts")
+    st.caption(
+        "Uses the same DTE, delta, spread, liquidity, premium and position-limit "
+        "rules as the automated paper bot. This preview cannot place an order."
+    )
+    if st.button("Find option strikes and expiration dates", type="primary"):
+        with st.spinner("Checking the live options chains…"):
+            st.session_state["hunt_option_previews"] = (
+                dashboard_data.preview_option_trades(
+                    settings,
+                    sweep.opportunities,
+                    capacity=sweep.concurrent_capacity,
+                )
+            )
+    option_previews = st.session_state.get("hunt_option_previews")
+    if option_previews:
+        st.dataframe(
+            pd.DataFrame(option_previews),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score", min_value=0, max_value=100, format="%.0f"
+                ),
+                "Strike": st.column_config.NumberColumn(format="$%.2f"),
+                "Limit": st.column_config.NumberColumn(format="$%.2f"),
+                "Estimated premium": st.column_config.NumberColumn(format="$%.0f"),
+            },
+        )
 
     st.divider()
     frame = sweep.as_frame()

@@ -314,6 +314,22 @@ def test_the_app_starts_without_error(app_path):
     assert not app.exception
 
 
+def test_dashboard_password_blocks_public_pages(app_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "correct-horse-battery-staple")
+    app = AppTest.from_file(app_path, default_timeout=300).run()
+
+    assert not app.exception
+    assert not app.radio
+    assert app.text_input[0].label == "Password"
+    app.text_input[0].set_value("correct-horse-battery-staple")
+    app.button[0].click().run()
+
+    assert not app.exception
+    assert app.radio
+
+
 def test_every_page_renders(app_path):
     from trading_bot.dashboard.app import PAGES
 

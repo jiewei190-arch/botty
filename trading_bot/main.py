@@ -37,8 +37,9 @@ import sys
 import textwrap
 from collections import Counter
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 # Allow `python main.py` from the repository root without installing the package.
@@ -142,6 +143,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check", help="Run connectivity and configuration health checks.")
     subparsers.add_parser("clock", help="Show current market session state.")
     subparsers.add_parser("db-init", help="Create or migrate the SQLite database.")
+    status = subparsers.add_parser("status", help="Show automation health and paper state.")
+    status.add_argument(
+        "--max-heartbeat-age", type=float, default=15.0,
+        help="Fail if the automation heartbeat is older than this many minutes.",
+    )
+
+    recap = subparsers.add_parser(
+        "recap", help="Summarise what the market did today: indices, sectors, breadth."
+    )
+    recap.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
 
     universe_cmd = subparsers.add_parser(
         "universe", help="List symbol categories and the resolved watchlist."
@@ -274,6 +285,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo", action="store_true", help="Use generated sample data — no API keys needed."
     )
     scan.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+    scan.add_argument(
+        "--no-options", action="store_true",
+        help="Print the stock plan only; skip looking up an option contract for each setup.",
+    )
 
     calibrate_cmd = subparsers.add_parser(
         "calibrate",
@@ -378,6 +393,10 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument(
         "--watch-market", action="store_true",
         help="Stay online and run once whenever Alpaca reports a new market session open.",
+    )
+    hunt.add_argument(
+        "--no-options", action="store_true",
+        help="Print the stock plan only; skip looking up an option contract for each setup.",
     )
 
     backtest = subparsers.add_parser(
@@ -498,6 +517,48 @@ def cmd_config(settings: Settings) -> int:
 
     print(json.dumps(settings.redacted_dict(), indent=2, default=str))
     return EXIT_OK
+
+
+def cmd_status(settings: Settings, args: argparse.Namespace) -> int:
+    """Operator-facing readiness check; safe for Docker health checks."""
+    database = Database(settings.data.database_path)
+    database.initialize()
+    heartbeat = database.state.get("automation_heartbeat")
+    market_open = database.state.get("market_open")
+    last_session = database.state.get("last_completed_session")
+    latest_equity = database.equity.latest()
+    positions = database.positions.all()
+    open_orders = database.orders.open_orders()
+    open_trades = database.trades.open_trades()
+    recent_errors = database.events.recent(limit=5, level="ERROR")
+    database.close()
+
+    healthy = False
+    age_minutes = None
+    if heartbeat:
+        try:
+            stamp = datetime.fromisoformat(heartbeat)
+            age_minutes = (datetime.now(timezone.utc) - stamp).total_seconds() / 60
+            healthy = age_minutes <= args.max_heartbeat_age
+        except ValueError:
+            pass
+    print("BOTTY AUTOMATION STATUS")
+    print("-" * 64)
+    print(f"Health             : {'HEALTHY' if healthy else 'NOT READY'}")
+    print(f"Heartbeat          : {heartbeat or 'never'}")
+    if age_minutes is not None:
+        print(f"Heartbeat age      : {age_minutes:.1f} minutes")
+    print(f"Market open        : {market_open or 'unknown'}")
+    print(f"Last scanned       : {last_session or 'never'}")
+    print(f"Open broker orders : {len(open_orders)}")
+    print(f"Tracked positions  : {len(positions)}")
+    print(f"Open Botty trades  : {len(open_trades)}")
+    print(
+        f"Latest equity      : ${float(latest_equity['equity']):,.2f}"
+        if latest_equity else "Latest equity      : unavailable"
+    )
+    print(f"Recent errors      : {len(recent_errors)}")
+    return EXIT_OK if healthy else EXIT_FAILURE
 
 
 def cmd_check(settings: Settings) -> int:
@@ -1251,8 +1312,16 @@ def cmd_scan(settings: Settings, args: argparse.Namespace) -> int:
                 result.blockers.items(), key=lambda item: -item[1]
             )[:8]:
                 print(f"  {count:>3}x  {name}")
+    tradable = [o for o in result.opportunities if o.decision and o.decision.approved]
+    contracts = _option_contracts(
+        settings,
+        SimpleNamespace(opportunities=tradable, concurrent_capacity=len(tradable)),
+        skip=args.no_options,
+    )
     for opportunity in result.opportunities:
-        _render_opportunity(opportunity, width)
+        _render_opportunity(
+            opportunity, width, contracts.get(opportunity.signal.symbol)
+        )
 
     if result.opportunities:
         print("\n" + "=" * width)
@@ -1287,7 +1356,7 @@ def cmd_scan(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _render_opportunity(opportunity, width: int) -> None:
+def _render_opportunity(opportunity, width: int, contract: dict | None = None) -> None:
     """Print one ranked opportunity."""
     signal = opportunity.signal
     print()
@@ -1312,6 +1381,15 @@ def _render_opportunity(opportunity, width: int) -> None:
           f"  ({signal.stop_distance_pct:.2f}% away)")
     print(f"Take Profit     : ${signal.take_profit:,.2f}")
     print(f"Risk/Reward     : 1:{signal.risk_reward_ratio:.2f}")
+    if contract:
+        if "Strike" in contract:
+            print(
+                f"Option          : {contract['Underlying']} ${contract['Strike']:g} "
+                f"{contract['Type']} {contract['Expiration']} ({contract['DTE']}DTE)"
+                f"  x{contract['Contracts']} @ ${contract['Limit']:.2f}"
+            )
+        else:
+            print(f"Option          : {contract.get('Status', 'no contract')}")
 
     decision = opportunity.decision
     if decision is None:
@@ -1426,9 +1504,17 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     yours to place, wherever you trade.
     """
     if args.watch_market:
+        from trading_bot.automation.daily_summary import (
+            LAST_SENT_STATE_KEY,
+            save_scan_report,
+        )
         from trading_bot.automation.notifications import build_notifier
+        from trading_bot.automation.options_execution import OptionPositionSupervisor
+        from trading_bot.automation.reconciliation import BrokerReconciler
         from trading_bot.automation.runner import MarketOpenRunner
+        from trading_bot.automation.tracking import PriceTracker
         from trading_bot.execution.broker import BrokerError, build_broker
+        from trading_bot.options.alpaca import AlpacaOptionChain
 
         if not args.paper_trade:
             print("Error: --watch-market currently requires --paper-trade.", file=sys.stderr)
@@ -1443,16 +1529,78 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             return EXIT_FAILURE
         child_args = argparse.Namespace(**vars(args))
         child_args.watch_market = False
+        child_args._automation_broker = broker
+        database = Database(settings.data.database_path)
+        database.initialize()
+        reconciler = BrokerReconciler(broker, database, build_notifier(settings))
+        option_chain = AlpacaOptionChain(settings)
+        stock_data = build_market_data(settings.alpaca, settings.data)
+        option_supervisor = OptionPositionSupervisor(
+            broker, option_chain, database, build_notifier(settings), settings
+        )
+        tracker = PriceTracker(stock_data, option_chain, database)
+
+        def supervise() -> None:
+            reconciler.reconcile()
+            for position in broker.get_positions():
+                database.option_selections.set_status_by_contract(position["symbol"], "open")
+            option_supervisor.supervise()
+            tracker.capture()
+
+        def load_last_session() -> date | None:
+            value = database.state.get("last_completed_session")
+            return date.fromisoformat(value) if value else None
+
+        def save_last_session(session: date) -> None:
+            database.state.set("last_completed_session", session.isoformat())
+            database.events.record(
+                category="market_scan_completed",
+                message=f"Completed automated scan for {session.isoformat()}",
+                payload={"session": session.isoformat()},
+            )
+
+        def load_last_close_summary() -> date | None:
+            value = database.state.get(LAST_SENT_STATE_KEY)
+            return date.fromisoformat(value) if value else None
+
+        def save_last_close_summary(session: date) -> None:
+            database.state.set(LAST_SENT_STATE_KEY, session.isoformat())
+            database.events.record(
+                category="market_close_summary",
+                message=f"Sent closing summary for {session.isoformat()}",
+                payload={"session": session.isoformat()},
+            )
+
+        child_args._automation_report_sink = (
+            lambda universe, sweep, execution_report: save_scan_report(
+                database, sweep.as_of.date(), universe, sweep, execution_report
+            )
+        )
+
+        def heartbeat(market_open: bool) -> None:
+            database.state.set("automation_heartbeat", datetime.now(timezone.utc).isoformat())
+            database.state.set("market_open", str(market_open).lower())
+
         runner = MarketOpenRunner(
             broker,
             lambda: cmd_hunt(settings, child_args),
             build_notifier(settings),
+            supervise_once=supervise,
             closed_poll_seconds=settings.automation.closed_poll_seconds,
+            open_poll_seconds=settings.automation.open_poll_seconds,
+            load_last_session=load_last_session,
+            save_last_session=save_last_session,
+            heartbeat=heartbeat,
+            close_summary=lambda session: _close_report(settings, database, session),
+            load_last_close_summary=load_last_close_summary,
+            save_last_close_summary=save_last_close_summary,
         )
         try:
             runner.run_forever()
         except KeyboardInterrupt:
             print("\nBotty automation stopped.")
+        finally:
+            database.close()
         return EXIT_OK
 
     names = (
@@ -1484,8 +1632,23 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         settings.alpaca, settings.data, use_cache=not args.no_cache
     )
     try:
-        portfolio = _stated_portfolio(settings, args)
-    except ValueError as error:
+        if args.paper_trade:
+            from trading_bot.execution.broker import build_broker
+
+            sizing_broker = getattr(args, "_automation_broker", None) or build_broker(settings)
+            sizing_database = Database(settings.data.database_path)
+            sizing_database.initialize()
+            try:
+                portfolio = build_portfolio_state(
+                    account=sizing_broker.get_account(),
+                    broker_positions=sizing_broker.get_positions(),
+                    database=sizing_database,
+                )
+            finally:
+                sizing_database.close()
+        else:
+            portfolio = _stated_portfolio(settings, args)
+    except Exception as error:  # noqa: BLE001 - every broker/config error is actionable here
         print(f"Error: {error}", file=sys.stderr)
         return EXIT_FAILURE
 
@@ -1563,6 +1726,16 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         ),
     )
 
+    report_sink = getattr(args, "_automation_report_sink", None)
+
+    def capture_report(execution_report=None) -> None:
+        if report_sink is None:
+            return
+        try:
+            report_sink(universe, sweep, execution_report)
+        except Exception:  # noqa: BLE001 - reporting must not invalidate a scan
+            logger.exception("Could not persist automated daily scan report")
+
     print()
     for line in sweep.summary_lines():
         print(f"  {line}")
@@ -1579,6 +1752,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
                 sweep.blockers.items(), key=lambda item: -item[1]
             )[:6]:
                 print(f"  {count:>6,}x  {name}")
+        capture_report()
         return EXIT_OK
 
     equity = float(portfolio.equity)
@@ -1586,8 +1760,9 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     print("=" * width)
     print(f"{len(sweep.opportunities)} SETUP(S) — sized for a ${equity:,.0f} account")
     print("=" * width)
+    contracts = _option_contracts(settings, sweep, skip=args.no_options)
     for opportunity in sweep.opportunities:
-        _render_entry_plan(opportunity, width)
+        _render_entry_plan(opportunity, width, contracts.get(opportunity.signal.symbol))
 
     print()
     print("-" * width)
@@ -1604,43 +1779,44 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
         sweep.as_frame().to_csv(path, index=False)
         print(f"\nRanked setups written to {path}")
 
+    execution_report = None
     if args.paper_trade:
         from trading_bot.automation.notifications import build_notifier
-        from trading_bot.execution.broker import BrokerError, build_broker
+        from trading_bot.execution.broker import build_broker
 
         notifier = build_notifier(settings)
+        database = Database(settings.data.database_path)
         try:
-            broker = build_broker(settings)
-            if not broker.is_paper:
-                raise BrokerError("automated execution is paper-only in this release")
-            held = {item["symbol"] for item in broker.get_positions()}
-            placed = 0
-            for opportunity in sweep.opportunities[: sweep.concurrent_capacity]:
-                signal = opportunity.signal
-                if signal.symbol in held or opportunity.decision is None:
-                    continue
-                stamp = signal.timestamp.strftime("%Y%m%d")
-                client_id = f"botty-{stamp}-{signal.symbol}-{signal.strategy}".lower()
-                broker.submit_bracket_order(
-                    symbol=signal.symbol,
-                    qty=int(opportunity.decision.shares),
-                    side="buy" if signal.direction.value == "LONG" else "sell",
-                    take_profit=signal.take_profit,
-                    stop_loss=signal.stop_loss,
-                    client_order_id=client_id,
-                )
-                placed += 1
-                notifier.send(
-                    f"Botty paper order submitted: {signal.symbol} "
-                    f"{signal.direction.value} x{int(opportunity.decision.shares)}; "
-                    f"stop ${signal.stop_loss:,.2f}, target ${signal.take_profit:,.2f}."
-                )
-            print(f"\nSubmitted {placed} Alpaca paper bracket order(s).")
+            broker = getattr(args, "_automation_broker", None) or build_broker(settings)
+            database.initialize()
+            if settings.options.enabled:
+                from trading_bot.automation.options_execution import OptionPaperExecutor
+                from trading_bot.options.alpaca import AlpacaOptionChain
+
+                report = OptionPaperExecutor(
+                    broker, AlpacaOptionChain(settings), database, notifier, settings
+                ).execute(sweep.opportunities, sweep.concurrent_capacity)
+            else:
+                from trading_bot.automation.execution import PaperExecutor
+
+                report = PaperExecutor(
+                    broker, database, notifier, settings
+                ).execute(sweep.opportunities, sweep.concurrent_capacity)
+            execution_report = report
+            print(
+                f"\nSubmitted {report.placed} Alpaca paper "
+                f"{'swing-option' if settings.options.enabled else 'bracket'} order(s); "
+                f"{report.failed} failed."
+            )
         except Exception as error:  # notification must survive broker failures
             with contextlib.suppress(Exception):
                 notifier.send(f"BOTTY NEEDS ATTENTION: paper execution failed: {error}")
             print(f"\nPaper execution failed: {error}", file=sys.stderr)
             return EXIT_FAILURE
+        finally:
+            database.close()
+
+    capture_report(execution_report)
 
     if args.paper_trade:
         print(
@@ -1655,7 +1831,91 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _render_entry_plan(opportunity, width: int) -> None:
+def _close_report(settings: Settings, database, session) -> str:
+    """The end-of-day message: what the market did, then what the bot did.
+
+    Market first on purpose. A list of setups means something different after a
+    day the whole tape rallied than after one where only those names moved, and
+    a reader who sees the bot's output first has already formed an impression by
+    the time the context arrives.
+    """
+    from trading_bot.automation.daily_summary import format_close_summary
+
+    parts = []
+    try:
+        parts.append(_market_recap_text(settings))
+    except Exception:  # noqa: BLE001 - the bot's own report still has to go out
+        logger.exception("Market recap failed; sending the scan summary alone")
+    parts.append(format_close_summary(database, session))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _market_recap_text(settings: Settings) -> str:
+    """Build the market recap, or an empty string when data is unavailable."""
+    from trading_bot.automation.market_recap import build_recap, render_recap
+
+    if not settings.alpaca.has_credentials:
+        return ""
+    provider = build_market_data(settings.alpaca, settings.data, use_cache=True)
+    recap = build_recap(provider, timeframe=settings.data.timeframe)
+    return render_recap(recap) if recap.usable else ""
+
+
+def cmd_recap(settings: Settings, args: argparse.Namespace) -> int:
+    """Print what the market did today."""
+    from trading_bot.automation.market_recap import build_recap, render_recap
+
+    provider = build_market_data(settings.alpaca, settings.data, use_cache=not args.no_cache)
+    recap = build_recap(provider, timeframe="1Day")
+    print()
+    print(render_recap(recap))
+    return EXIT_OK if recap.usable else EXIT_FAILURE
+
+
+def _option_contracts(settings: Settings, sweep, *, skip: bool) -> dict[str, dict]:
+    """Pick the contract behind each setup, keyed by underlying.
+
+    Best-effort by design: option chains are a second API and a second
+    subscription, and a scan that dies because the chain endpoint is unavailable
+    would be worse than one that prints the stock plan without a contract. Any
+    failure explains itself once and leaves the equity plan intact.
+    """
+    if skip or not settings.options.enabled or not sweep.opportunities:
+        return {}
+    if not settings.alpaca.has_credentials:
+        return {}
+    try:
+        from trading_bot.options.preview import preview_option_trades
+
+        rows = preview_option_trades(
+            settings, sweep.opportunities, capacity=sweep.concurrent_capacity
+        )
+    except Exception as error:  # noqa: BLE001 - a missing chain is not a failed scan
+        logger.warning("Option contracts unavailable: %s", error)
+        print(f"\n  (option contracts unavailable: {error})")
+        return {}
+    return {row["Underlying"]: row for row in rows}
+
+
+def _render_contract(contract: dict | None) -> None:
+    """Print the contract a setup would be traded through, if there is one."""
+    if not contract:
+        return
+    if "Strike" not in contract:
+        print(f"  {'Option':<12} {'':>6}        {contract.get('Status', 'no contract')}")
+        return
+    print(
+        f"  {'Option':<12} {contract['Contracts']:>6} x  "
+        f"{contract['Underlying']} ${contract['Strike']:g} {contract['Type']} "
+        f"{contract['Expiration']} ({contract['DTE']}DTE)"
+    )
+    print(
+        f"  {'':<12} {'':>6}        limit ${contract['Limit']:.2f}/contract"
+        f"   (premium ${contract['Estimated premium']:,.0f})"
+    )
+
+
+def _render_entry_plan(opportunity, width: int, contract: dict | None = None) -> None:
     """Print one setup as a plan you could work from."""
     signal = opportunity.signal
     decision = opportunity.decision
@@ -1685,6 +1945,7 @@ def _render_entry_plan(opportunity, width: int) -> None:
           f"   ({stop_pct:.2f}% away)")
     print(f"  {'Target':<12} {'':>6}        ${signal.take_profit:,.2f}"
           f"   ({target_pct:.2f}% away)")
+    _render_contract(contract)
 
     if decision is not None and decision.approved:
         print(
@@ -2191,12 +2452,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_clock(settings)
         if args.command == "db-init":
             return cmd_db_init(settings)
+        if args.command == "recap":
+            return cmd_recap(settings, args)
         if args.command == "universe":
             return cmd_universe(settings, args)
         if args.command == "detect":
             return cmd_detect(settings, args)
         if args.command == "watch":
             return cmd_watch(settings, args)
+        if args.command == "status":
+            return cmd_status(settings, args)
         if args.command == "fetch":
             return cmd_fetch(settings, args)
         if args.command == "analyze":

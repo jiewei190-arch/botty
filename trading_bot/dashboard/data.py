@@ -28,6 +28,7 @@ from trading_bot.config.settings import Settings, TradingMode, load_settings
 from trading_bot.data.database import Database
 from trading_bot.data.market_data import build_market_data, drop_incomplete_bars
 from trading_bot.indicators import IndicatorConfig, calculate_all_indicators
+from trading_bot.options.preview import preview_option_trades as _preview_option_trades
 from trading_bot.risk import PortfolioState, RiskManager, build_portfolio_state
 from trading_bot.scanner import MarketScanner, ScannerConfig
 from trading_bot.strategies import build_strategy, explain_blockers
@@ -407,3 +408,8 @@ def run_hunt(
             max_signal_age_bars=max_age,
         ),
     )
+
+
+#: Re-exported: contract selection moved to :mod:`trading_bot.options.preview`
+#: so the CLI, the dashboard and the runner all read the same answer.
+preview_option_trades = _preview_option_trades

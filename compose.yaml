@@ -1,0 +1,34 @@
+services:
+  botty:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - botty-storage:/app/storage
+      - botty-logs:/app/logs
+    init: true
+    stop_grace_period: 30s
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    command:
+      - streamlit
+      - run
+      - trading_bot/dashboard/app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    ports:
+      - "8501:8501"
+    volumes:
+      - botty-storage:/app/storage
+      - botty-logs:/app/logs
+    depends_on:
+      - botty
+
+volumes:
+  botty-storage:
+  botty-logs:
