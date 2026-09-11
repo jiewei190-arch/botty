@@ -698,6 +698,80 @@ tape, that is a paid subscription and a one-line change to `ALPACA_DATA_FEED`.
 
 ---
 
+## What you actually buy, and what the market did
+
+### Every scanned play names its contract
+
+A chart setup is a thesis about a stock. `hunt` and `scan` now finish the
+sentence — the ticker, the strike, whether it is a call or a put, and how long
+it has to work:
+
+```
+  Buy              12 shares near $182.40   ($2,189)
+  Stop                             $174.12   (4.54% away)
+  Target                           $199.05   (9.13% away)
+  Option            1 x  NVDA $185 CALL 2026-11-20 (70DTE)
+                         limit $8.35/contract   (premium $835)
+```
+
+The same line appears in the Slack/Discord alerts and on the dashboard, from one
+selector — two implementations would drift, and the contract on screen would
+stop matching the one the bot would buy. `--no-options` prints the stock plan
+alone.
+
+Contracts are chosen by **liquidity and by the holding window**, never by a
+prediction: spread, open interest, delta (or moneyness when the feed has no
+greeks), days to expiration, and what the premium budget allows.
+
+### The DTE window is derived, not chosen
+
+| | Value | Why |
+|---|---|---|
+| `planned_max_hold_days` | 30 | matches the equity swing window |
+| `exit_before_expiry_days` | 14 | theta and gamma both accelerate inside three weeks |
+| `min_dte` | 45 | **hold + exit buffer** — anything shorter expires inside the trade |
+| `target_dte` / `max_dte` | 60 / 90 | room for the thesis without paying for a year |
+
+A validator refuses any configuration that breaks the first relationship. The
+old defaults allowed a 7-day contract while planning to hold for up to 60 days
+and exit with 21 days left — a contract bought at the floor was already past the
+exit rule on the day it opened.
+
+### The market recap
+
+`python main.py recap` says what the tape did, and the same block leads the
+end-of-day report:
+
+```
+MARKET RECAP — 2026-09-10
+
+  S&P 500           757.83   -0.60%   (5d -0.96%, below its 50-day)
+
+  Leading:  Technology +1.21%, Communications +0.88%, Financials +0.402%
+  Lagging:  Energy -1.44%, Utilities -0.91%, Real Estate -0.62%
+
+  7/11 sectors higher — positive but uneven.
+  Volatility calm — the S&P's average daily range is 0.71% of price.
+```
+
+Market first, then the bot's own numbers: a list of setups means something
+different after a day the whole tape rallied than after one where only those
+names moved.
+
+It is built from **daily bars the scanner already fetches** — index and sector
+ETFs through the same provider as everything else. No second subscription, and
+it works on a data-only key.
+
+**It does not comment on the economy.** CPI prints, Fed decisions and payroll
+numbers are not in a price feed, and inferring them from index moves would be
+narration dressed as analysis — "stocks fell on rate fears", written by
+something that cannot see rates. The volatility regime says what the *price
+behaviour* implies and stops there. A news or macro provider would slot in
+behind `MarketRecap.headlines`; until one exists the field stays empty rather
+than invented.
+
+---
+
 ## Risk management
 
 **The gate every trade passes through.** `RiskManager` is the only thing in the

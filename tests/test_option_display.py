@@ -15,7 +15,6 @@ import pytest
 from trading_bot.config.settings import OptionsSettings, load_settings
 from trading_bot.main import _option_contracts, _render_contract
 
-
 QUALIFYING = {
     "Underlying": "NVDA",
     "Direction": "LONG",

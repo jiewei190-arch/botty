@@ -149,6 +149,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail if the automation heartbeat is older than this many minutes.",
     )
 
+    recap = subparsers.add_parser(
+        "recap", help="Summarise what the market did today: indices, sectors, breadth."
+    )
+    recap.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+
     universe_cmd = subparsers.add_parser(
         "universe", help="List symbol categories and the resolved watchlist."
     )
@@ -1501,7 +1506,6 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     if args.watch_market:
         from trading_bot.automation.daily_summary import (
             LAST_SENT_STATE_KEY,
-            format_close_summary,
             save_scan_report,
         )
         from trading_bot.automation.notifications import build_notifier
@@ -1587,7 +1591,7 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             load_last_session=load_last_session,
             save_last_session=save_last_session,
             heartbeat=heartbeat,
-            close_summary=lambda session: format_close_summary(database, session),
+            close_summary=lambda session: _close_report(settings, database, session),
             load_last_close_summary=load_last_close_summary,
             save_last_close_summary=save_last_close_summary,
         )
@@ -1825,6 +1829,47 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             "probability\nof profit, and nothing here has been placed as an order."
         )
     return EXIT_OK
+
+
+def _close_report(settings: Settings, database, session) -> str:
+    """The end-of-day message: what the market did, then what the bot did.
+
+    Market first on purpose. A list of setups means something different after a
+    day the whole tape rallied than after one where only those names moved, and
+    a reader who sees the bot's output first has already formed an impression by
+    the time the context arrives.
+    """
+    from trading_bot.automation.daily_summary import format_close_summary
+
+    parts = []
+    try:
+        parts.append(_market_recap_text(settings))
+    except Exception:  # noqa: BLE001 - the bot's own report still has to go out
+        logger.exception("Market recap failed; sending the scan summary alone")
+    parts.append(format_close_summary(database, session))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _market_recap_text(settings: Settings) -> str:
+    """Build the market recap, or an empty string when data is unavailable."""
+    from trading_bot.automation.market_recap import build_recap, render_recap
+
+    if not settings.alpaca.has_credentials:
+        return ""
+    provider = build_market_data(settings.alpaca, settings.data, use_cache=True)
+    recap = build_recap(provider, timeframe=settings.data.timeframe)
+    return render_recap(recap) if recap.usable else ""
+
+
+def cmd_recap(settings: Settings, args: argparse.Namespace) -> int:
+    """Print what the market did today."""
+    from trading_bot.automation.market_recap import build_recap, render_recap
+
+    provider = build_market_data(settings.alpaca, settings.data, use_cache=not args.no_cache)
+    recap = build_recap(provider, timeframe="1Day")
+    print()
+    print(render_recap(recap))
+    return EXIT_OK if recap.usable else EXIT_FAILURE
 
 
 def _option_contracts(settings: Settings, sweep, *, skip: bool) -> dict[str, dict]:
@@ -2407,6 +2452,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_clock(settings)
         if args.command == "db-init":
             return cmd_db_init(settings)
+        if args.command == "recap":
+            return cmd_recap(settings, args)
         if args.command == "universe":
             return cmd_universe(settings, args)
         if args.command == "detect":
