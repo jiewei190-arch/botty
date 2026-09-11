@@ -10,12 +10,13 @@ python main.py hunt     # scan the whole market, on demand
 python main.py watch    # stay connected and alert when something starts
 ```
 
-> **It places no orders and connects to no broker for trading.** Market data is
-> read from a data provider; execution is yours. That separation is deliberate,
-> not a missing feature — see [Where you trade](#where-you-trade-is-not-where-you-get-data).
+> **Automated execution is paper-only while it is being proven.** A normal hunt
+> remains read-only. `hunt --paper-trade` submits broker-hosted bracket orders
+> to Alpaca paper trading; live unattended orders are rejected even when the
+> account's global live locks are armed.
 
 > **Status: the scanner, the analysis behind it, the backtester and the
-> continuous market scanner are complete and tested** — 1,093 tests, no
+> continuous market scanner are complete and tested** — 1,099 tests, no
 > credentials needed to run them. See the [roadmap](#roadmap).
 
 ---
@@ -77,7 +78,10 @@ botty/
 │   │   ├── cache.py              Parquet bar cache
 │   │   ├── database.py           SQLite schema + repositories
 │   │   └── models.py             Quote, MarketClock, AccountSnapshot, AssetInfo
-│   ├── execution/broker.py       Read-only broker access (orders: Phase 7)
+│   ├── execution/broker.py       Broker access; paper bracket orders
+│   ├── automation/
+│   │   ├── runner.py             Market-clock loop: one hunt per session
+│   │   └── notifications.py      Discord / Slack incoming webhooks
 │   ├── utils/
 │   │   ├── logging_setup.py      Console + rotating file + JSON-lines sinks
 │   │   ├── market_hours.py       Sessions, holidays and early closes, offline
@@ -123,7 +127,7 @@ botty/
 │   │   ├── theme.py                 Validated palette, light and dark
 │   │   └── data.py                  Cached data access for the UI
 │   └── main.py                   CLI
-├── tests/                        1,093 tests, no credentials required
+├── tests/                        1,099 tests, no credentials required
 ├── logs/                         Runtime logs (gitignored)
 ├── storage/                      SQLite database + parquet cache (gitignored)
 ├── main.py                       Launcher
@@ -229,6 +233,8 @@ The command exits non-zero if any check fails, so it works in CI too.
 | `python main.py analyze` | Full technical analysis of a symbol (Phase 2) |
 | `python main.py signals` | Run strategies and report trade setups (Phase 3) |
 | `python main.py hunt` | **Scan the whole market and rank the best entries** |
+| `python main.py hunt --paper-trade` | Scan once and paper-trade approved setups |
+| `python main.py hunt --watch-market --paper-trade` | Stay online and run once per market-open session |
 | `python main.py scan` | Rank a watchlist by trade confidence |
 | `python main.py backtest` | Simulate a strategy over historical bars (Phase 6) |
 | `python main.py dashboard` | Launch the Streamlit dashboard |
@@ -519,9 +525,10 @@ python main.py watch --once
 python main.py watch --no-stream --min-score 4
 ```
 
-**`watch` cannot place an order.** Nothing in the detector, scoring or alert
-layers imports the execution module, and the CLI passes it no broker. That is
-structural, not a policy setting.
+**`watch` cannot place an order**, unlike `hunt --paper-trade`. Nothing in the
+detector, scoring or alert layers imports the execution module, and the CLI
+passes it no broker. That is structural, not a policy setting: this scanner
+tells you something is happening, and what you do about it is yours.
 
 ### Five detectors, one signal shape
 
@@ -1191,7 +1198,7 @@ pytest                    # full suite
 pytest -v tests/test_settings.py
 ```
 
-**1,093 tests, `ruff check` clean.** The suite runs against synthetic bars and
+**1,099 tests, `ruff check` clean.** The suite runs against synthetic bars and
 an in-memory database — **no API credentials or network access required**, so it
 is safe to run in CI. Tests cover the universe filters, the scan funnel,
 per-trade sizing, bar normalization, the lookahead guards, cache coverage rules,
@@ -1244,10 +1251,10 @@ exist.
 
 ## Roadmap
 
-The project began as a paper-trading bot and was redirected into a
-decision-support scanner: it finds and ranks entries, and a person executes
-them. Order placement and automated exits were dropped from the plan rather
-than deferred — they are not features this tool is missing.
+The project is moving from a decision-support scanner into a guarded automated
+trader. Automation graduates in stages: unattended paper bracket orders first,
+then live execution only after paper results and operational failure handling
+have been reviewed.
 
 | Scope | Status |
 |---|---|
@@ -1259,11 +1266,38 @@ than deferred — they are not features this tool is missing.
 | Backtesting engine | **Complete** |
 | Universe discovery and market-wide hunt | **Complete** |
 | Dashboard (hunt, charts, backtests, settings) | **Complete** |
+| Market-clock runner and webhook alerts | **Complete (paper)** |
+| Broker-hosted bracket entries, stops and targets | **Complete (paper)** |
 | Continuous scanner: streaming, five detectors, alerts | **Complete** |
 | Alerts to Discord / Telegram / SMS / email | One `CallbackChannel` away |
 | News and catalyst analysis behind a volume spike | Planned |
 | Tracking setups you took, to measure the scanner against reality | Planned |
-| Broker order placement | **Not planned** — you execute |
+| Reconciliation of fills/orders/trades into SQLite | Planned |
+| Continuous intraday rescans and position supervision | Planned |
+| Live unattended order placement | **Locked pending paper validation** |
+
+### Always-on paper automation
+
+Set Alpaca paper credentials and your real paper-test account size in `.env`.
+Optionally add a Discord or Slack incoming webhook so Botty can reach you:
+
+```bash
+AUTO_WEBHOOK_KIND=discord
+AUTO_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+Then run:
+
+```bash
+python main.py hunt --watch-market --paper-trade
+```
+
+Botty uses Alpaca's market clock rather than assuming weekdays or fixed hours,
+so holidays and early closes follow the exchange calendar. It performs one hunt
+per open session, submits at most the account's reported concurrent capacity,
+skips symbols already held, and attaches the strategy's stop and target as a
+bracket at order submission. Keep this process on an always-on host; closing the
+computer or terminal stops it.
 
 ---
 

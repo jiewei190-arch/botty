@@ -331,6 +331,26 @@ class AlertSettings(BaseSettings):
     log_enabled: bool = True
     database_enabled: bool = True
 
+class AutomationSettings(BaseSettings):
+    """Always-on runner and outbound notification settings."""
+
+    model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="AUTO_")
+
+    #: How often the service rechecks Alpaca's calendar while the market is closed.
+    closed_poll_seconds: int = Field(default=300, ge=15, le=3600)
+    #: Optional Discord or Slack incoming-webhook URL. Kept out of logs/config dumps.
+    webhook_url: str | None = None
+    webhook_kind: str = "discord"
+    webhook_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+
+    @field_validator("webhook_kind")
+    @classmethod
+    def _validate_webhook_kind(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"discord", "slack"}:
+            raise ValueError("AUTO_WEBHOOK_KIND must be 'discord' or 'slack'")
+        return normalized
+
 
 class Settings(BaseSettings):
     """Root settings object composing every configuration group."""
@@ -356,6 +376,7 @@ class Settings(BaseSettings):
     scanner: ScannerSettings = Field(default_factory=ScannerSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
     alerts: AlertSettings = Field(default_factory=AlertSettings)
+    automation: AutomationSettings = Field(default_factory=AutomationSettings)
 
     project_root: Path = PROJECT_ROOT
 
@@ -403,6 +424,9 @@ class Settings(BaseSettings):
                 alpaca[key] = _mask(str(alpaca[key]))
         if payload.get("live_trading_confirmation"):
             payload["live_trading_confirmation"] = "***set***"
+        automation = payload.get("automation", {})
+        if automation.get("webhook_url"):
+            automation["webhook_url"] = "***set***"
         return payload
 
 
