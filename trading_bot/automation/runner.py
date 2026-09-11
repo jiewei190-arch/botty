@@ -39,6 +39,8 @@ class MarketOpenRunner:
         open_scan_interval_seconds: int | None = 3600,
         load_last_session: Callable[[], date | None] | None = None,
         save_last_session: Callable[[date], None] | None = None,
+        load_last_scan_at: Callable[[], datetime | None] | None = None,
+        save_last_scan_at: Callable[[datetime], None] | None = None,
         heartbeat: Callable[[bool], None] | None = None,
         close_summary: Callable[[date], str] | None = None,
         load_last_close_summary: Callable[[], date | None] | None = None,
@@ -68,7 +70,17 @@ class MarketOpenRunner:
         self._market_is_open = False
         self._scan_failure_notified = False
         self._clock_failure_notified = False
-        self._last_scan_at: datetime | None = None
+        self.save_last_scan_at = save_last_scan_at
+        # Restored, not reset. The interval means "an hour since the last scan",
+        # which is a fact about the market rather than about this process: a
+        # restart that zeroed it left the runner unable to rescan for the rest
+        # of the session, because _scan_due treats a missing timestamp as "not
+        # due" and the session had already been marked complete. Restoring it
+        # also keeps a crash loop from rescanning on every boot, since the
+        # timestamp it reads back is genuinely recent.
+        self._last_scan_at: datetime | None = (
+            load_last_scan_at() if load_last_scan_at else None
+        )
 
     def _notify(self, message: str) -> None:
         """A broken alert channel must never stop market supervision."""
@@ -120,6 +132,8 @@ class MarketOpenRunner:
             return False
 
         self._last_scan_at = clock.timestamp
+        if self.save_last_scan_at is not None:
+            self.save_last_scan_at(clock.timestamp)
         label = "market-open" if new_session else "scheduled swing"
         self._notify(f"Botty {label} scan started ({clock.timestamp.isoformat()}).")
         try:

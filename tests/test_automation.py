@@ -178,3 +178,92 @@ def test_close_summary_survives_restart_without_duplicate():
 
     assert not runner.step()
     assert not notices.messages
+
+
+# ---------------------------------------------------------------------------
+# A restart must not cost the rest of the trading session
+#
+# `_last_scan_at` lived only in memory. After a mid-session restart it was None
+# while the session was already recorded complete, so `_scan_due` took neither
+# branch that can return True: not a new session, and no timestamp to measure
+# the interval from. The runner announced "scans run every 60 minute(s) while
+# open" and then scanned zero more times that day.
+# ---------------------------------------------------------------------------
+
+
+def test_a_restart_mid_session_resumes_scanning_on_the_interval():
+    """The regression: an hour had passed, so the next poll is due."""
+    scans = []
+    scanned_at = datetime(2026, 9, 11, 13, 33, tzinfo=timezone.utc)
+    runner = MarketOpenRunner(
+        ClockBroker(clock(11, hour=15, minute=41)),
+        lambda: scans.append("scan") or 0,
+        Recorder(),
+        open_scan_interval_seconds=3600,
+        load_last_session=lambda: date(2026, 9, 11),
+        load_last_scan_at=lambda: scanned_at,
+    )
+
+    assert runner.step()
+    assert scans == ["scan"]
+
+
+def test_a_restart_soon_after_a_scan_does_not_rescan():
+    """A crash loop must not turn into a scan loop."""
+    scans = []
+    scanned_at = datetime(2026, 9, 11, 15, 39, tzinfo=timezone.utc)
+    runner = MarketOpenRunner(
+        ClockBroker(clock(11, hour=15, minute=41)),
+        lambda: scans.append("scan") or 0,
+        Recorder(),
+        open_scan_interval_seconds=3600,
+        load_last_session=lambda: date(2026, 9, 11),
+        load_last_scan_at=lambda: scanned_at,
+    )
+
+    assert not runner.step()
+    assert scans == []
+
+
+def test_the_scan_time_is_persisted_when_a_scan_runs():
+    saved = []
+    runner = MarketOpenRunner(
+        ClockBroker(clock(11, hour=14, minute=30)),
+        lambda: 0,
+        Recorder(),
+        open_scan_interval_seconds=3600,
+        save_last_scan_at=saved.append,
+    )
+
+    assert runner.step()
+    assert saved == [datetime(2026, 9, 11, 14, 30, tzinfo=timezone.utc)]
+
+
+def test_a_first_ever_start_still_scans_the_open():
+    """Nothing persisted yet: a new session is always scanned."""
+    scans = []
+    runner = MarketOpenRunner(
+        ClockBroker(clock(11)),
+        lambda: scans.append("scan") or 0,
+        Recorder(),
+        open_scan_interval_seconds=3600,
+        load_last_scan_at=lambda: None,
+    )
+
+    assert runner.step()
+    assert scans == ["scan"]
+
+
+def test_a_failed_scan_is_still_recorded_as_attempted():
+    """A crashing scan must not retry every poll for the rest of the day."""
+    saved = []
+    runner = MarketOpenRunner(
+        ClockBroker(clock(11, hour=14, minute=30)),
+        lambda: 1,  # non-zero exit: the scan failed
+        Recorder(),
+        open_scan_interval_seconds=3600,
+        save_last_scan_at=saved.append,
+    )
+
+    assert runner.step()
+    assert saved == [datetime(2026, 9, 11, 14, 30, tzinfo=timezone.utc)]
