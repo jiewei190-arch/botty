@@ -20,6 +20,20 @@ def _value(value: Any) -> str:
     return str(getattr(value, "value", value)).lower()
 
 
+#: Alpaca rejects a market-data request naming more than this many symbols with
+#: ``{"message":"symbol limit is 100"}``. A single underlying easily exceeds it:
+#: a liquid name inside a +/-20% strike band across 45-120 DTE carries several
+#: hundred contracts once weekly expirations are included. Requesting the whole
+#: chain at once therefore failed for exactly the busiest, most tradeable names
+#: and left the thin ones working, which is the worst possible failure shape.
+SYMBOL_REQUEST_LIMIT = 100
+
+
+def _batched(symbols: list[str], size: int = SYMBOL_REQUEST_LIMIT) -> list[list[str]]:
+    """Split ``symbols`` into request-sized chunks, preserving order."""
+    return [symbols[i : i + size] for i in range(0, len(symbols), size)]
+
+
 class AlpacaOptionChain:
     """Fetch contracts and snapshots only inside the configured swing window."""
 
@@ -66,15 +80,18 @@ class AlpacaOptionChain:
         # plans and an indicative feed to the free one; leaving it unset asks for
         # whatever the account happens to have, which makes a failure here depend
         # on the subscription instead of on the code.
-        snapshots = self.data_client.get_option_snapshot(
-            OptionSnapshotRequest(
-                symbol_or_symbols=symbols, feed=self.settings.alpaca.options_feed
+        snapshots: dict[str, Any] = {}
+        for batch in _batched(symbols):
+            page = self.data_client.get_option_snapshot(
+                OptionSnapshotRequest(
+                    symbol_or_symbols=batch, feed=self.settings.alpaca.options_feed
+                )
             )
-        )
+            snapshots.update(page if isinstance(page, dict) else dict(page))
         output: list[OptionQuote] = []
         for contract in contracts:
             symbol = str(contract.symbol)
-            snap = snapshots.get(symbol) if hasattr(snapshots, "get") else None
+            snap = snapshots.get(symbol)
             quote = getattr(snap, "latest_quote", None)
             greeks = getattr(snap, "greeks", None)
             if quote is None:
@@ -103,9 +120,12 @@ class AlpacaOptionChain:
             return {}
         from alpaca.data.requests import OptionLatestQuoteRequest
 
-        quotes = self.data_client.get_option_latest_quote(
-            OptionLatestQuoteRequest(symbol_or_symbols=symbols)
-        )
+        quotes: dict[str, Any] = {}
+        for batch in _batched(symbols):
+            page = self.data_client.get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=batch)
+            )
+            quotes.update(page if isinstance(page, dict) else dict(page))
         result = {}
         for symbol, quote in quotes.items():
             bid, ask = _number(quote.bid_price), _number(quote.ask_price)
