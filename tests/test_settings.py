@@ -9,6 +9,7 @@ from trading_bot.config.settings import (
     LIVE_CONFIRMATION_PHRASE,
     AlpacaSettings,
     DataSettings,
+    OptionsSettings,
     RiskSettings,
     Settings,
     TradingMode,
@@ -18,6 +19,13 @@ from trading_bot.config.settings import (
 
 def test_defaults_to_paper_mode():
     assert load_settings().trading_mode is TradingMode.PAPER
+
+
+def test_options_default_to_alert_only_with_seven_to_sixty_day_plan():
+    options = OptionsSettings()
+    assert options.alert_only is True
+    assert options.planned_min_hold_days == 7
+    assert options.planned_max_hold_days == 60
 
 
 def test_live_mode_rejected_without_any_lock(monkeypatch):

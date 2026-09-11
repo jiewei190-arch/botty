@@ -256,6 +256,7 @@ class OptionsSettings(BaseSettings):
     model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="OPTIONS_")
 
     enabled: bool = True
+    alert_only: bool = True
     min_dte: int = Field(default=60, ge=30, le=365)
     max_dte: int = Field(default=90, ge=45, le=365)
     exceptional_max_dte: int = Field(default=120, ge=60, le=730)
@@ -273,7 +274,7 @@ class OptionsSettings(BaseSettings):
     max_contracts_per_trade: int = Field(default=4, ge=1, le=4)
     max_total_contracts: int = Field(default=4, ge=1, le=20)
     max_open_positions: int = Field(default=2, ge=1, le=5)
-    planned_min_hold_days: int = Field(default=21, ge=1, le=90)
+    planned_min_hold_days: int = Field(default=7, ge=1, le=90)
     planned_max_hold_days: int = Field(default=60, ge=7, le=180)
     profit_target_pct: float = Field(default=50.0, gt=0, le=500)
     stop_loss_pct: float = Field(default=35.0, gt=0, lt=100)

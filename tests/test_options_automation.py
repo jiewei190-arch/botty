@@ -67,6 +67,9 @@ def opportunity(*, approved=True, confidence=95):
 def test_option_executor_only_places_risk_approved_paper_swing(database, settings):
     broker = Broker()
     notifier = Notifier()
+    settings = settings.model_copy(update={
+        "options": settings.options.model_copy(update={"alert_only": False})
+    })
     report = OptionPaperExecutor(
         broker, Chain(), database, notifier, settings
     ).execute([opportunity()], capacity=1)
@@ -76,6 +79,22 @@ def test_option_executor_only_places_risk_approved_paper_swing(database, setting
     assert 500 <= selected["estimated_cost"] <= 1000
     assert "CALL $250.00" in notifier.messages[0]
     assert str(date.today() + timedelta(days=75)) in notifier.messages[0]
+
+
+def test_option_executor_alert_only_sends_contract_without_order(database, settings):
+    broker = Broker()
+    notifier = Notifier()
+    report = OptionPaperExecutor(
+        broker, Chain(), database, notifier, settings
+    ).execute([opportunity()], capacity=1)
+
+    assert report.alerted == 1
+    assert report.placed == 0
+    assert broker.submissions == []
+    assert "BOTTY SWING ALERT: AAPL LONG" in notifier.messages[0]
+    assert "CALL $250.00" in notifier.messages[0]
+    assert "ALERT ONLY — NO ORDER SUBMITTED" in notifier.messages[0]
+    assert database.option_selections.recent()[0]["status"] == "alerted"
 
 
 def test_option_executor_rejects_unapproved_setup(database, settings):

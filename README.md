@@ -1052,10 +1052,14 @@ python main.py hunt --watch-market --paper-trade
 Botty uses Alpaca's market clock rather than assuming weekdays or fixed hours,
 so holidays and early closes follow the exchange calendar. It performs one hunt
 per open session and turns only risk-approved setups into liquid long calls or
-puts. Normal contracts are 60–90 DTE; only scores of 90+ may extend to 120 DTE.
-Each swing risks $500–$1,000 of premium, with at most two swings and four total
-contracts. Same-day exits are blocked. Keep this process on an always-on host;
-closing the computer or terminal stops it.
+puts. By default, `OPTIONS_ALERT_ONLY=true` sends the exact contract idea to
+Slack without submitting an order. Set it to `false` only when intentionally
+testing paper orders. Normal contracts are 60–90 DTE; only scores of 90+ may
+extend to 120 DTE. Each idea uses $500–$1,000 of premium, with at most two swings
+and four total contracts. The planned swing window is 7–60 days; protective
+profit, loss, and expiration rules can still recommend or trigger an earlier
+exit. Same-day automated exits are blocked. Keep this process on an always-on
+host; closing the computer or terminal stops it.
 
 For an always-on Docker host:
 

@@ -39,6 +39,7 @@ def save_scan_report(database, session: date, universe, sweep, execution_report=
         "opportunities": opportunities,
         "decisions": decisions,
         "placed": int(getattr(execution_report, "placed", 0)),
+        "alerted": int(getattr(execution_report, "alerted", 0)),
         "skipped": int(getattr(execution_report, "skipped", 0)),
         "failed": int(getattr(execution_report, "failed", 0)),
         "blockers": dict(sweep.blockers),
@@ -83,7 +84,8 @@ def format_close_summary(database, session: date) -> str:
         ),
         (
             f"• Final chart setups: {len(payload['opportunities'])} | "
-            f"Paper orders submitted: {payload['placed']} | "
+            f"Option alerts: {payload.get('alerted', 0)} | "
+            f"Paper orders: {payload['placed']} | "
             f"Skipped: {payload['skipped']} | Errors: {payload['failed']}"
         ),
     ]

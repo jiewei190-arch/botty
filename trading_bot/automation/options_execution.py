@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class OptionExecutionReport:
     placed: int = 0
+    alerted: int = 0
     skipped: int = 0
     failed: int = 0
     decisions: tuple[OptionExecutionDecision, ...] = ()
@@ -29,7 +30,7 @@ class OptionExecutionDecision:
 
 
 class OptionPaperExecutor:
-    """Turn approved underlying setups into capped-loss long option positions."""
+    """Select contracts and either alert or place capped-loss paper positions."""
 
     def __init__(self, broker, chain, database, notifier, settings) -> None:
         if not broker.is_paper:
@@ -67,7 +68,7 @@ class OptionPaperExecutor:
             0, self.settings.options.max_total_contracts
             - self.db.option_selections.contracts_committed()
         )
-        placed = skipped = failed = 0
+        placed = alerted = skipped = failed = 0
         eligible = considered[:capacity]
         for opportunity in considered[capacity:]:
             decisions.append(OptionExecutionDecision(
@@ -140,6 +141,32 @@ class OptionPaperExecutor:
                         "dte_at_entry": selection.days_to_expiry,
                     },
                 )
+                contract_summary = (
+                    f"{quote.contract_type.upper()} ${quote.strike:,.2f} "
+                    f"exp {quote.expiration.isoformat()}, x{selection.quantity} "
+                    f"at ${quote.ask:.2f}; premium ${selection.estimated_cost:,.0f}, "
+                    f"{selection.days_to_expiry} DTE ({quote.symbol})"
+                )
+                alert_message = (
+                    f"BOTTY SWING ALERT: {signal.symbol} {signal.direction.value} "
+                    f"({opportunity.confidence:.0f}/100) | "
+                    f"{quote.contract_type.upper()} ${quote.strike:,.2f} "
+                    f"exp {quote.expiration.isoformat()} | {quote.symbol} "
+                    f"x{selection.quantity} @ suggested limit ${quote.ask:.2f} | "
+                    f"estimated premium ${selection.estimated_cost:,.0f} | "
+                    f"{selection.days_to_expiry} DTE"
+                )
+                if self.settings.options.alert_only:
+                    self.db.option_selections.set_status(selection_id, "alerted")
+                    remaining_premium -= selection.estimated_cost
+                    remaining_contracts -= selection.quantity
+                    held_underlyings.add(signal.symbol)
+                    alerted += 1
+                    decisions.append(OptionExecutionDecision(
+                        signal.symbol, True, f"approved alert: {contract_summary}",
+                    ))
+                    self._notify(f"{alert_message} | ALERT ONLY — NO ORDER SUBMITTED.")
+                    continue
                 client_id = (
                     f"botty-opt-{date.today():%Y%m%d}-{signal.symbol}-"
                     f"{signal.strategy}"
@@ -162,20 +189,10 @@ class OptionPaperExecutor:
                 held_underlyings.add(signal.symbol)
                 placed += 1
                 decisions.append(OptionExecutionDecision(
-                    signal.symbol, True,
-                    f"approved: {quote.contract_type.upper()} ${quote.strike:,.2f} "
-                    f"exp {quote.expiration.isoformat()}, x{selection.quantity} "
-                    f"at ${quote.ask:.2f}; premium ${selection.estimated_cost:,.0f}, "
-                    f"{selection.days_to_expiry} DTE ({quote.symbol})",
+                    signal.symbol, True, f"approved: {contract_summary}",
                 ))
                 self._notify(
-                    f"BOTTY SWING FOUND: {signal.symbol} {signal.direction.value} "
-                    f"({opportunity.confidence:.0f}/100) | "
-                    f"{quote.contract_type.upper()} ${quote.strike:,.2f} "
-                    f"exp {quote.expiration.isoformat()} | {quote.symbol} "
-                    f"x{selection.quantity} @ limit ${quote.ask:.2f} | "
-                    f"estimated premium risk ${selection.estimated_cost:,.0f} | "
-                    f"{selection.days_to_expiry} DTE | PAPER ORDER SUBMITTED."
+                    f"{alert_message} | PAPER ORDER SUBMITTED."
                 )
             except Exception as error:  # noqa: BLE001 - isolate one candidate
                 failed += 1
@@ -192,7 +209,10 @@ class OptionPaperExecutor:
                 self._notify(f"BOTTY NEEDS ATTENTION: {signal.symbol} option entry failed: {error}")
                 if failed >= self.settings.automation.max_order_failures_per_scan:
                     break
-        return OptionExecutionReport(placed, skipped, failed, tuple(decisions))
+        return OptionExecutionReport(
+            placed=placed, alerted=alerted, skipped=skipped, failed=failed,
+            decisions=tuple(decisions),
+        )
 
 
 class OptionPositionSupervisor:
