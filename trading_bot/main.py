@@ -1559,6 +1559,13 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
                 payload={"session": session.isoformat()},
             )
 
+        def load_last_scan_at() -> datetime | None:
+            value = database.state.get("last_scan_at")
+            return datetime.fromisoformat(value) if value else None
+
+        def save_last_scan_at(moment: datetime) -> None:
+            database.state.set("last_scan_at", moment.isoformat())
+
         def load_last_close_summary() -> date | None:
             value = database.state.get(LAST_SENT_STATE_KEY)
             return date.fromisoformat(value) if value else None
@@ -1590,6 +1597,8 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
             open_poll_seconds=settings.automation.open_poll_seconds,
             load_last_session=load_last_session,
             save_last_session=save_last_session,
+            load_last_scan_at=load_last_scan_at,
+            save_last_scan_at=save_last_scan_at,
             heartbeat=heartbeat,
             close_summary=lambda session: _close_report(settings, database, session),
             load_last_close_summary=load_last_close_summary,
