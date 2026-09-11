@@ -80,8 +80,12 @@ def test_option_executor_only_places_risk_approved_paper_swing(database, setting
     assert broker.submissions[0]["side"] == "buy"
     selected = database.option_selections.active()[0]
     assert 500 <= selected["estimated_cost"] <= 1000
-    assert "CALL $250.00" in notifier.messages[0]
-    assert str(date.today() + timedelta(days=60)) in notifier.messages[0]
+    # Pin the contract's content, not the sentence it sits in: ticker,
+    # strike, right, expiry and DTE are what the reader acts on.
+    message = notifier.messages[0]
+    assert "AAPL $250 CALL" in message
+    assert "60 DTE" in message
+    assert str(date.today() + timedelta(days=60)) in message
 
 
 def test_option_executor_alert_only_sends_contract_without_order(database, settings):
@@ -94,9 +98,13 @@ def test_option_executor_alert_only_sends_contract_without_order(database, setti
     assert report.alerted == 1
     assert report.placed == 0
     assert broker.submissions == []
-    assert "BOTTY SWING ALERT: AAPL LONG" in notifier.messages[0]
-    assert "CALL $250.00" in notifier.messages[0]
-    assert "ALERT ONLY — NO ORDER SUBMITTED" in notifier.messages[0]
+    message = notifier.messages[0]
+    assert "BOTTY SWING ALERT" in message
+    assert "AAPL LONG" in message
+    assert "AAPL $250 CALL" in message
+    assert "60 DTE" in message
+    assert str(date.today() + timedelta(days=60)) in message
+    assert "ALERT ONLY — NO ORDER SUBMITTED" in message
     assert database.option_selections.recent()[0]["status"] == "alerted"
 
 
@@ -110,7 +118,11 @@ def test_option_executor_keeps_searching_until_capacity_is_filled(database, sett
     assert report.alerted == 1
     assert report.skipped == 1
     assert broker.submissions == []
-    assert "BOTTY SWING ALERT: AAPL LONG" in notifier.messages[0]
+    message = notifier.messages[0]
+    assert "BOTTY SWING ALERT" in message
+    assert "AAPL LONG" in message
+    assert "AAPL $250 CALL" in message
+    assert "60 DTE" in message
     assert database.option_selections.recent()[0]["underlying_symbol"] == "AAPL"
 
 
@@ -178,3 +190,161 @@ def test_tracker_records_underlying_and_contract(database):
     assert PriceTracker(Stocks(), Chain(), database).capture() == 2
     assert database.prices.history("AAPL")[-1]["price"] == 251.0
     assert database.prices.history(symbol)[-1]["asset_kind"] == "option"
+
+
+# ---------------------------------------------------------------------------
+# Every ranked setup gets named
+#
+# The caps below exist to protect capital, so they gate orders. They used to
+# gate alerts too, which meant a manually-traded account saw the first couple
+# of names in a scan and never learned the rest existed. These pin the split.
+# ---------------------------------------------------------------------------
+
+
+def _chain_for(*symbols):
+    """A chain that answers for every symbol, not just AAPL."""
+    class MultiChain(Chain):
+        def quotes(self, underlying, direction, underlying_price):
+            kind = "call" if direction == "LONG" else "put"
+            return [OptionQuote(
+                symbol=f"{underlying}261120C00250000", underlying=underlying,
+                contract_type=kind, expiration=date.today() + timedelta(days=60),
+                strike=underlying_price, bid=5.0, ask=5.2, delta=0.60,
+                daily_volume=100, open_interest=500,
+            )]
+    return MultiChain()
+
+
+def test_setups_beyond_order_capacity_are_still_alerted(database, settings):
+    """Capacity of one used to mean one alert and silence for the rest."""
+    notifier = Notifier()
+    report = OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute(
+        [opportunity("AAPL"), opportunity("NVDA"), opportunity("NET")],
+        capacity=1,
+    )
+
+    assert report.alerted == 3
+    assert len(notifier.messages) == 3
+    named = " ".join(notifier.messages)
+    for symbol in ("AAPL", "NVDA", "NET"):
+        assert f"{symbol} $250 CALL" in named
+
+
+def test_a_risk_declined_setup_is_alerted_with_the_reason(database, settings):
+    """Botty declining to buy it is not a reason to keep it from the reader."""
+    notifier = Notifier()
+    report = OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute([opportunity("NET", approved=False)], capacity=1)
+
+    assert report.alerted == 1
+    message = notifier.messages[0]
+    assert "NET $250 CALL" in message
+    assert "60 DTE" in message
+    assert "NO ORDER" in message
+    assert report.placed == 0
+
+
+def test_a_full_account_still_alerts_every_candidate(database, settings):
+    """The early return sent zero alerts for the whole scan."""
+    database.option_selections.record(
+        signal_id=None, underlying_symbol="TSLA", contract_symbol="TSLA1",
+        contract_type="call", expiration=date.today() + timedelta(days=60),
+        strike=250.0, bid=5.0, ask=5.2, delta=0.6, implied_volatility=0.3,
+        daily_volume=10, open_interest=500, quantity=1, estimated_cost=520.0,
+    )
+    database.option_selections.record(
+        signal_id=None, underlying_symbol="MSFT", contract_symbol="MSFT1",
+        contract_type="call", expiration=date.today() + timedelta(days=60),
+        strike=250.0, bid=5.0, ask=5.2, delta=0.6, implied_volatility=0.3,
+        daily_volume=10, open_interest=500, quantity=1, estimated_cost=520.0,
+    )
+    notifier = Notifier()
+
+    report = OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute([opportunity("AAPL"), opportunity("NVDA")], capacity=2)
+
+    assert report.alerted == 2
+    assert report.placed == 0
+    assert all("NO ORDER" in m for m in notifier.messages)
+
+
+def test_an_underlying_already_held_is_not_alerted_twice(database, settings):
+    """The one silence kept on purpose: a duplicate is not news."""
+    database.option_selections.record(
+        signal_id=None, underlying_symbol="AAPL", contract_symbol="AAPL1",
+        contract_type="call", expiration=date.today() + timedelta(days=60),
+        strike=250.0, bid=5.0, ask=5.2, delta=0.6, implied_volatility=0.3,
+        daily_volume=10, open_interest=500, quantity=1, estimated_cost=520.0,
+    )
+    notifier = Notifier()
+
+    report = OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute([opportunity("AAPL")], capacity=2)
+
+    assert notifier.messages == []
+    assert report.alerted == 0
+    assert report.skipped == 1
+
+
+def test_the_per_scan_alert_budget_bounds_api_lookups(database, settings):
+    """Alerts are bounded by a budget, not by the money caps."""
+    settings = settings.model_copy(update={
+        "options": settings.options.model_copy(update={"max_alerts_per_scan": 2})
+    })
+    notifier = Notifier()
+
+    report = OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute(
+        [opportunity("AAPL"), opportunity("NVDA"), opportunity("NET")],
+        capacity=5,
+    )
+
+    assert len(notifier.messages) == 2
+    assert report.alerted == 2
+
+
+def test_an_alert_names_strike_dte_and_right(database, settings):
+    """Exactly what was asked for: ticker, strike price, DTE, call or put."""
+    notifier = Notifier()
+    OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute([opportunity("NET")], capacity=1)
+
+    message = notifier.messages[0]
+    assert "NET" in message                                   # ticker
+    assert "$250" in message                                  # strike
+    assert "CALL" in message                                  # right
+    assert "60 DTE" in message                                # DTE
+    assert str(date.today() + timedelta(days=60)) in message  # expiry
+
+
+def test_a_put_setup_says_put(database, settings):
+    notifier = Notifier()
+    bearish = opportunity("NET")
+    bearish.signal.direction = SimpleNamespace(value="SHORT")
+    OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute([bearish], capacity=1)
+
+    assert "NET $250 PUT" in notifier.messages[0]
+
+
+def test_an_alert_only_selection_does_not_consume_account_capacity(database, settings):
+    """An alert spends no money, so it must not shrink the next one's budget."""
+    notifier = Notifier()
+    OptionPaperExecutor(
+        Broker(), _chain_for(), database, notifier, settings
+    ).execute(
+        [opportunity("AAPL"), opportunity("NVDA"), opportunity("NET")],
+        capacity=1,
+    )
+
+    costs = [row["estimated_cost"] for row in database.option_selections.recent()]
+    assert len(costs) == 3
+    assert all(500 <= cost <= 1000 for cost in costs)
