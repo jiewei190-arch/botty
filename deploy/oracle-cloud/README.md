@@ -25,8 +25,7 @@ and AMD64.
 SSH into the VM and run:
 
 ```bash
-git clone --branch codex/order-reconciliation \
-  https://github.com/jiewei190-arch/botty.git
+git clone https://github.com/jiewei190-arch/botty.git
 cd botty
 sudo bash deploy/oracle-cloud/install.sh
 sudo bash deploy/oracle-cloud/configure.sh
@@ -72,9 +71,22 @@ against the same Alpaca paper account can produce duplicate scans or orders.
 From the original checkout:
 
 ```bash
+git checkout main          # earlier installs were cloned from a feature branch
 git pull --ff-only
 sudo bash deploy/oracle-cloud/install.sh
 sudo systemctl restart botty
 ```
 
-The installer never overwrites `/etc/botty/botty.env` or `/var/lib/botty`.
+The installer never overwrites `/etc/botty/botty.env` or `/var/lib/botty`, so
+credentials and history survive. Nothing else has to be changed by hand:
+
+- **The database migrates itself.** The worker applies any new schema versions
+  forward on start, so an older `/var/lib/botty/botty.db` gains new tables in
+  place. Migrations are append-only and never destructive.
+- **New settings take their defaults.** `install.sh` deliberately leaves an
+  existing environment file alone, which also means it gains no new keys. Every
+  setting has a working default, so an upgrade needs no edit — but new options
+  appear only in `.env.example`. Diff it against `/etc/botty/botty.env` after an
+  upgrade if you want to see what became configurable.
+- **The end-of-day market recap needs no wiring.** It leads the close summary
+  the worker already sends, and reads the same daily bars the scanner fetches.
