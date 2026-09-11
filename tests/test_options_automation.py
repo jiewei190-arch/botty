@@ -15,10 +15,13 @@ class Notifier:
 
 
 class Chain:
-    def __init__(self, *, mid=5.2, bid=5.1, ask=5.3):
+    def __init__(self, *, mid=5.2, bid=5.1, ask=5.3, empty_for=()):
         self.mid, self.bid, self.ask = mid, bid, ask
+        self.empty_for = set(empty_for)
 
     def quotes(self, underlying, direction, underlying_price):
+        if underlying in self.empty_for:
+            return []
         kind = "call" if direction == "LONG" else "put"
         return [OptionQuote(
             symbol=f"{underlying}261120C00250000", underlying=underlying,
@@ -51,9 +54,9 @@ class Broker:
         return []
 
 
-def opportunity(*, approved=True, confidence=95):
+def opportunity(symbol="AAPL", *, approved=True, confidence=95):
     signal = SimpleNamespace(
-        symbol="AAPL", strategy="momentum", direction=SimpleNamespace(value="LONG"),
+        symbol=symbol, strategy="momentum", direction=SimpleNamespace(value="LONG"),
         entry_price=250.0, stop_loss=240.0, take_profit=270.0,
         risk_reward_ratio=2.0, reasons=("strong trend",),
         timestamp=datetime.now(timezone.utc),
@@ -95,6 +98,20 @@ def test_option_executor_alert_only_sends_contract_without_order(database, setti
     assert "CALL $250.00" in notifier.messages[0]
     assert "ALERT ONLY — NO ORDER SUBMITTED" in notifier.messages[0]
     assert database.option_selections.recent()[0]["status"] == "alerted"
+
+
+def test_option_executor_keeps_searching_until_capacity_is_filled(database, settings):
+    broker = Broker()
+    notifier = Notifier()
+    report = OptionPaperExecutor(
+        broker, Chain(empty_for={"VG"}), database, notifier, settings
+    ).execute([opportunity("VG"), opportunity("AAPL")], capacity=1)
+
+    assert report.alerted == 1
+    assert report.skipped == 1
+    assert broker.submissions == []
+    assert "BOTTY SWING ALERT: AAPL LONG" in notifier.messages[0]
+    assert database.option_selections.recent()[0]["underlying_symbol"] == "AAPL"
 
 
 def test_option_executor_rejects_unapproved_setup(database, settings):

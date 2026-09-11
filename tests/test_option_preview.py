@@ -21,11 +21,22 @@ class Chain:
         )]
 
 
-def test_option_preview_returns_human_readable_contract(database, settings):
+class FirstSymbolHasNoContract(Chain):
+    def quotes(self, underlying, direction, underlying_price):
+        if underlying == "VG":
+            return []
+        return super().quotes(underlying, direction, underlying_price)
+
+
+def option_opportunity(symbol, confidence):
     signal = SimpleNamespace(
-        symbol="META", direction=SimpleNamespace(value="LONG"), entry_price=250.0,
+        symbol=symbol, direction=SimpleNamespace(value="LONG"), entry_price=250.0,
     )
-    opportunity = SimpleNamespace(signal=signal, confidence=95)
+    return SimpleNamespace(signal=signal, confidence=confidence)
+
+
+def test_option_preview_returns_human_readable_contract(database, settings):
+    opportunity = option_opportunity("META", 95)
 
     rows = preview_option_trades(
         settings,
@@ -40,3 +51,20 @@ def test_option_preview_returns_human_readable_contract(database, settings):
     assert rows[0]["Expiration"] == "2026-11-20"
     assert rows[0]["DTE"] == (date(2026, 11, 20) - date(2026, 9, 9)).days
     assert rows[0]["Status"] == "QUALIFIES — preview only"
+
+
+def test_option_preview_keeps_searching_after_higher_ranked_symbol_has_no_contract(
+    database, settings,
+):
+    rows = preview_option_trades(
+        settings,
+        [option_opportunity("VG", 95), option_opportunity("AAPL", 90)],
+        capacity=1,
+        chain=FirstSymbolHasNoContract(),
+        as_of=date(2026, 9, 9),
+    )
+
+    assert rows[0]["Underlying"] == "VG"
+    assert rows[0]["Status"].startswith("No contract passed")
+    assert rows[1]["Underlying"] == "AAPL"
+    assert rows[1]["Status"] == "QUALIFIES — preview only"

@@ -69,19 +69,15 @@ class OptionPaperExecutor:
             - self.db.option_selections.contracts_committed()
         )
         placed = alerted = skipped = failed = 0
-        eligible = considered[:capacity]
-        for opportunity in considered[capacity:]:
-            decisions.append(OptionExecutionDecision(
-                opportunity.signal.symbol, False,
-                "not approved: account capacity reserved for higher-ranked setups",
-            ))
-            skipped += 1
-        for opportunity in eligible:
+        selection_limit = max(0, capacity)
+        for opportunity in considered:
             signal = opportunity.signal
             decision = opportunity.decision
             skip_reason = None
             if signal.symbol in held_underlyings:
                 skip_reason = "not approved: Botty already tracks this underlying"
+            elif placed + alerted >= selection_limit:
+                skip_reason = "not approved: account capacity filled by higher-ranked contracts"
             elif len(held_underlyings) >= self.settings.options.max_open_positions:
                 skip_reason = "not approved: maximum open Botty positions reached"
             elif remaining_contracts < 1:

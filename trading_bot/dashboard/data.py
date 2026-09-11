@@ -445,8 +445,9 @@ def preview_option_trades(
     rows: list[dict[str, Any]] = []
     available_slots = max(0, settings.options.max_open_positions - len(held))
     preview_limit = min(max(0, capacity), available_slots)
+    qualifying_contracts = 0
 
-    for index, opportunity in enumerate(opportunities):
+    for opportunity in opportunities:
         signal = opportunity.signal
         base = {
             "Underlying": signal.symbol,
@@ -456,7 +457,7 @@ def preview_option_trades(
         if signal.symbol in held:
             rows.append({**base, "Status": "Already tracked; no duplicate entry"})
             continue
-        if index >= preview_limit:
+        if qualifying_contracts >= preview_limit:
             rows.append({**base, "Status": "Outside current account/position capacity"})
             continue
         try:
@@ -496,5 +497,6 @@ def preview_option_trades(
         })
         remaining_premium -= selection.estimated_cost
         remaining_contracts -= selection.quantity
+        qualifying_contracts += 1
 
     return rows
