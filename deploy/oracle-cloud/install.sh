@@ -38,8 +38,10 @@ rsync -a --delete \
   --exclude storage \
   "${SOURCE_ROOT}/" "${INSTALL_ROOT}/"
 
+FRESH_ENV=0
 if [[ ! -f ${ENV_FILE} ]]; then
   install -m 0600 "${INSTALL_ROOT}/.env.example" "${ENV_FILE}"
+  FRESH_ENV=1
 fi
 
 docker build --tag botty-oracle:latest "${INSTALL_ROOT}"
@@ -48,7 +50,21 @@ install -m 0644 "${INSTALL_ROOT}/deploy/oracle-cloud/botty.service" \
 systemctl daemon-reload
 
 echo
-echo "Botty is installed but has not been started."
-echo "1. Edit ${ENV_FILE} and fill ALPACA_API_KEY, ALPACA_SECRET_KEY,"
-echo "   AUTO_WEBHOOK_URL, and DASHBOARD_PASSWORD."
-echo "2. Run: sudo /opt/botty/deploy/oracle-cloud/start.sh"
+if [[ ${FRESH_ENV} -eq 1 ]]; then
+  echo "Botty is installed but has not been started."
+  echo "1. Edit ${ENV_FILE} and fill ALPACA_API_KEY, ALPACA_SECRET_KEY,"
+  echo "   AUTO_WEBHOOK_URL, and DASHBOARD_PASSWORD."
+  echo "2. Run: sudo /opt/botty/deploy/oracle-cloud/start.sh"
+else
+  # An upgrade keeps the existing environment file, so telling the operator to
+  # fill in credentials they set months ago invites them to re-enter secrets
+  # that are already correct. Say what actually remains to be done.
+  echo "Botty is rebuilt. ${ENV_FILE} was left as it is, so credentials are intact."
+  echo "Restart to pick up the new image:"
+  echo "  sudo systemctl restart botty"
+  echo
+  echo "New settings are never written into an existing environment file. To see"
+  echo "what became configurable since it was written:"
+  echo "  diff <(grep -o '^[A-Z_]*' ${ENV_FILE} | sort -u) \\"
+  echo "       <(grep -o '^[A-Z_]*' ${INSTALL_ROOT}/.env.example | sort -u)"
+fi
