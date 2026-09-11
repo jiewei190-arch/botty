@@ -222,6 +222,7 @@ The command exits non-zero if any check fails, so it works in CI too.
 | Command | What it does |
 |---|---|
 | `python main.py check` | Full health check: config, database, credentials, broker, data |
+| `python main.py status` | Automation heartbeat, scan, order, position, trade and error health |
 | `python main.py config` | Print resolved configuration (secrets masked) |
 | `python main.py clock` | Market session state (local calendar + broker) |
 | `python main.py universe` | List symbol categories and the resolved watchlist |
@@ -1189,8 +1190,9 @@ produce a fake signal.
 
 ## Data storage
 
-**`storage/trading_bot.db`** (SQLite, WAL mode) holds seven tables: `runs`,
+**`storage/trading_bot.db`** (SQLite, WAL mode) holds eight tables: `runs`,
 `signals`, `orders`, `trades`, `positions`, `equity_snapshots` and `bot_events`.
+`runtime_state` keeps restart-safe heartbeat and completed-session markers.
 
 Rejected signals are recorded alongside accepted ones with the reason for
 rejection — when the bot is not trading, that table tells you why. Schema changes
@@ -1299,9 +1301,9 @@ exist.
 ## Roadmap
 
 The project is moving from a decision-support scanner into a guarded automated
-trader. Automation graduates in stages: unattended paper bracket orders first,
-then live execution only after paper results and operational failure handling
-have been reviewed.
+swing-options trader. Automation graduates in stages: unattended long call/put
+paper orders first, then live execution only after paper results and operational
+failure handling have been reviewed.
 
 | Scope | Status |
 |---|---|
@@ -1321,16 +1323,22 @@ have been reviewed.
 | Tracking setups you took, to measure the scanner against reality | Planned |
 | Reconciliation of fills/orders/trades into SQLite | Planned |
 | Continuous intraday rescans and position supervision | Planned |
+| Liquid long call/put selection and limit entries | **Complete (paper)** |
+| Premium, time-held, and expiration exit supervision | **Complete (paper)** |
+| Order, fill, trade, position and equity reconciliation | **Complete (paper)** |
+| Restart-safe market-session state | **Complete (paper)** |
+| Continuous position supervision | **Complete (paper)** |
+| Dashboard automation health and paper performance | **Complete (paper)** |
 | Live unattended order placement | **Locked pending paper validation** |
 
 ### Always-on paper automation
 
-Set Alpaca paper credentials and your real paper-test account size in `.env`.
-Optionally add a Discord or Slack incoming webhook so Botty can reach you:
+Set Alpaca paper credentials in `.env`. Add the incoming webhook for `#general`
+in the `bottytrades` Slack workspace so Botty can reach you:
 
 ```bash
-AUTO_WEBHOOK_KIND=discord
-AUTO_WEBHOOK_URL=https://discord.com/api/webhooks/...
+AUTO_WEBHOOK_KIND=slack
+AUTO_WEBHOOK_URL=https://hooks.slack.com/services/...
 ```
 
 Then run:
@@ -1341,10 +1349,39 @@ python main.py hunt --watch-market --paper-trade
 
 Botty uses Alpaca's market clock rather than assuming weekdays or fixed hours,
 so holidays and early closes follow the exchange calendar. It performs one hunt
-per open session, submits at most the account's reported concurrent capacity,
-skips symbols already held, and attaches the strategy's stop and target as a
-bracket at order submission. Keep this process on an always-on host; closing the
-computer or terminal stops it.
+per open session and turns only risk-approved setups into liquid long calls or
+puts. By default, `OPTIONS_ALERT_ONLY=true` sends the exact contract idea to
+Slack without submitting an order. Set it to `false` only when intentionally
+testing paper orders. Contracts must have 7–60 DTE, with selection targeting
+roughly 30 DTE. Each idea uses $500–$1,000 of premium, with at most two swings
+and four total contracts. The planned swing window is 7–60 days; protective
+profit, loss, and expiration rules can still recommend or trigger an earlier
+exit. Same-day automated exits are blocked. Keep this process on an always-on
+host; closing the computer or terminal stops it.
+
+For an always-on Docker host:
+
+```bash
+docker compose up -d --build
+docker compose logs -f botty
+```
+
+The dashboard is then available at port `8501`. The named volumes preserve the
+audit database, price tracker, cache, and logs across container restarts. Secrets
+stay in the uncommitted `.env` file.
+
+The current Render Blueprint uses its free plan for initial functional testing;
+free Render services can sleep and lose local runtime data, so they are not an
+unattended trading host.
+
+For continuous no-cost paper testing, follow
+[`deploy/oracle-cloud/README.md`](deploy/oracle-cloud/README.md). The Oracle
+deployment adds automatic restart, persistent local state, and password
+protection for the public dashboard. Stop Render before starting Oracle so two
+workers cannot submit duplicate paper orders.
+
+See `HANDOFF.md` for the living cross-agent development state so Claude or Codex
+can continue without this chat history.
 
 ---
 

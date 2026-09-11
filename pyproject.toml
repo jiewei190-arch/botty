@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.3,<3.0",
     "streamlit>=1.35",
     "plotly>=5.20",
+    "slack-bolt>=1.23,<2.0",
 ]
 
 [project.optional-dependencies]

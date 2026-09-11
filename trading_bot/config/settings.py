@@ -311,9 +311,16 @@ class AutomationSettings(BaseSettings):
     model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="AUTO_")
 
     closed_poll_seconds: int = Field(default=300, ge=15, le=3600)
+    open_poll_seconds: int = Field(default=60, ge=15, le=900)
+    max_signal_age_hours: float = Field(default=120.0, gt=0, le=720)
+    max_order_failures_per_scan: int = Field(default=2, ge=1, le=20)
+    #: Optional Discord or Slack incoming-webhook URL. Kept out of logs/config dumps.
     webhook_url: str | None = None
     webhook_kind: str = "discord"
     webhook_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    #: Optional Socket Mode credentials for interactive Slack status checks.
+    slack_bot_token: str | None = None
+    slack_app_token: str | None = None
 
     @field_validator("webhook_kind")
     @classmethod
@@ -322,6 +329,63 @@ class AutomationSettings(BaseSettings):
         if normalized not in {"discord", "slack"}:
             raise ValueError("AUTO_WEBHOOK_KIND must be 'discord' or 'slack'")
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_slack_socket_tokens(self) -> AutomationSettings:
+        if bool(self.slack_bot_token) != bool(self.slack_app_token):
+            raise ValueError(
+                "AUTO_SLACK_BOT_TOKEN and AUTO_SLACK_APP_TOKEN must be set together"
+            )
+        return self
+
+
+class OptionsSettings(BaseSettings):
+    """Long-option swing rules. Loss is capped at premium paid."""
+
+    model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="OPTIONS_")
+
+    enabled: bool = True
+    alert_only: bool = True
+    min_dte: int = Field(default=7, ge=1, le=365)
+    max_dte: int = Field(default=60, ge=7, le=365)
+    exceptional_max_dte: int = Field(default=60, ge=7, le=730)
+    exceptional_min_confidence: float = Field(default=90.0, ge=70, le=100)
+    target_dte: int = Field(default=30, ge=7, le=365)
+    target_delta: float = Field(default=0.60, ge=0.35, le=0.80)
+    min_abs_delta: float = Field(default=0.50, ge=0.20, le=0.80)
+    max_abs_delta: float = Field(default=0.70, ge=0.40, le=0.95)
+    max_spread_pct: float = Field(default=12.0, gt=0, le=50)
+    min_daily_volume: int = Field(default=10, ge=0)
+    min_open_interest: int = Field(default=100, ge=0)
+    min_premium_per_trade: float = Field(default=500.0, gt=0)
+    max_premium_per_trade: float = Field(default=1_000.0, gt=0)
+    max_total_premium: float = Field(default=2_000.0, gt=0)
+    max_contracts_per_trade: int = Field(default=4, ge=1, le=4)
+    max_total_contracts: int = Field(default=4, ge=1, le=20)
+    max_open_positions: int = Field(default=2, ge=1, le=5)
+    planned_min_hold_days: int = Field(default=7, ge=1, le=90)
+    planned_max_hold_days: int = Field(default=60, ge=7, le=180)
+    profit_target_pct: float = Field(default=50.0, gt=0, le=500)
+    stop_loss_pct: float = Field(default=35.0, gt=0, lt=100)
+    exit_before_expiry_days: int = Field(default=21, ge=7, le=60)
+
+    @model_validator(mode="after")
+    def _validate_options(self) -> OptionsSettings:
+        if not self.min_dte <= self.target_dte <= self.max_dte:
+            raise ValueError("OPTIONS_TARGET_DTE must be between MIN_DTE and MAX_DTE")
+        if self.min_abs_delta > self.max_abs_delta:
+            raise ValueError("OPTIONS_MIN_ABS_DELTA cannot exceed MAX_ABS_DELTA")
+        if not self.min_abs_delta <= self.target_delta <= self.max_abs_delta:
+            raise ValueError("OPTIONS_TARGET_DELTA must be inside the delta range")
+        if self.planned_min_hold_days > self.planned_max_hold_days:
+            raise ValueError("planned minimum hold cannot exceed maximum hold")
+        if self.max_premium_per_trade > self.max_total_premium:
+            raise ValueError("per-trade premium cannot exceed total premium")
+        if self.min_premium_per_trade > self.max_premium_per_trade:
+            raise ValueError("minimum premium cannot exceed maximum premium")
+        if self.exceptional_max_dte < self.max_dte:
+            raise ValueError("exceptional max DTE cannot be below normal max DTE")
+        return self
 
 
 class Settings(BaseSettings):
@@ -347,6 +411,7 @@ class Settings(BaseSettings):
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
     alerts: AlertSettings = Field(default_factory=AlertSettings)
     automation: AutomationSettings = Field(default_factory=AutomationSettings)
+    options: OptionsSettings = Field(default_factory=OptionsSettings)
     project_root: Path = PROJECT_ROOT
 
     @model_validator(mode="after")
@@ -390,8 +455,9 @@ class Settings(BaseSettings):
         if payload.get("live_trading_confirmation"):
             payload["live_trading_confirmation"] = "***set***"
         automation = payload.get("automation", {})
-        if automation.get("webhook_url"):
-            automation["webhook_url"] = "***set***"
+        for key in ("webhook_url", "slack_bot_token", "slack_app_token"):
+            if automation.get(key):
+                automation[key] = "***set***"
         return payload
 
 

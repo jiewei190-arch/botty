@@ -1,10 +1,15 @@
 """Always-on market supervision for swing scanning.
 
-The runner is intentionally conservative about execution: it can stay online
-24/7, but paper/live order-producing scans are only invoked while Alpaca reports
-the regular market open. That avoids accidental extended-hours bracket/order
-behaviour while still giving Botty a persistent process that wakes, checks the
-clock, and resumes automatically after restarts.
+One scan at the regular-session open, then a rescan every
+``open_scan_interval_seconds`` while the market stays open — a swing setup that
+forms at 11:00 should not wait until tomorrow to be seen. Set the interval to
+``None`` for strict once-per-session behaviour.
+
+The runner stays online around the clock but only scans while Alpaca reports the
+regular session open, so nothing can place an extended-hours order by accident.
+State is restart-safe: the session already scanned and the session already
+summarised are both persisted, so a redeploy mid-afternoon does not re-scan or
+re-send the closing report.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 
 from trading_bot.automation.notifications import Notifier
 
@@ -20,12 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class MarketOpenRunner:
-    """Clock-driven, restart-safe swing scanner.
-
-    Botty is a swing bot, so the default is one scan at the regular-session open
-    and then one rescan per hour while the market remains open. Set
-    ``open_scan_interval_seconds=None`` to restore once-per-session behaviour.
-    """
+    """Clock-driven loop with restart-safe, once-per-session scan semantics."""
 
     def __init__(
         self,
@@ -33,22 +33,41 @@ class MarketOpenRunner:
         scan_once: Callable[[], int],
         notifier: Notifier,
         *,
+        supervise_once: Callable[[], object] | None = None,
         closed_poll_seconds: int = 300,
+        open_poll_seconds: int = 60,
         open_scan_interval_seconds: int | None = 3600,
+        load_last_session: Callable[[], date | None] | None = None,
+        save_last_session: Callable[[date], None] | None = None,
+        heartbeat: Callable[[bool], None] | None = None,
+        close_summary: Callable[[date], str] | None = None,
+        load_last_close_summary: Callable[[], date | None] | None = None,
+        save_last_close_summary: Callable[[date], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        self.broker = broker
+        self.scan_once = scan_once
+        self.notifier = notifier
+        self.supervise_once = supervise_once
         if closed_poll_seconds < 15:
             raise ValueError("closed_poll_seconds must be at least 15")
         if open_scan_interval_seconds is not None and open_scan_interval_seconds < 60:
             raise ValueError("open_scan_interval_seconds must be at least 60 seconds")
-
-        self.broker = broker
-        self.scan_once = scan_once
-        self.notifier = notifier
         self.closed_poll_seconds = closed_poll_seconds
+        self.open_poll_seconds = open_poll_seconds
         self.open_scan_interval_seconds = open_scan_interval_seconds
         self.sleep = sleep
-        self._last_session = None
+        self.save_last_session = save_last_session
+        self.heartbeat = heartbeat
+        self.close_summary = close_summary
+        self.save_last_close_summary = save_last_close_summary
+        self._last_session = load_last_session() if load_last_session else None
+        self._last_close_summary = (
+            load_last_close_summary() if load_last_close_summary else None
+        )
+        self._market_is_open = False
+        self._scan_failure_notified = False
+        self._clock_failure_notified = False
         self._last_scan_at: datetime | None = None
 
     def _notify(self, message: str) -> None:
@@ -58,43 +77,83 @@ class MarketOpenRunner:
         except Exception:
             logger.exception("Notification delivery failed")
 
-    def _scan_due(self, timestamp: datetime, session) -> bool:
-        """Whether a new open-session scan should run now."""
-        if session != self._last_session:
+    def step(self) -> bool:
+        """Poll once; return True only when a scan was run."""
+        try:
+            clock = self.broker.get_clock()
+        except Exception as error:
+            logger.exception("Market clock poll failed; Botty will retry")
+            if not self._clock_failure_notified:
+                self._notify(f"BOTTY NEEDS ATTENTION: market clock unavailable: {error}")
+                self._clock_failure_notified = True
+            self._market_is_open = False
+            return False
+        self._clock_failure_notified = False
+        self._market_is_open = bool(clock.is_open)
+        if self.heartbeat is not None:
+            self.heartbeat(self._market_is_open)
+        if not clock.is_open:
+            session = self._last_session
+            if (
+                session is not None
+                and session != self._last_close_summary
+                and self.close_summary is not None
+            ):
+                try:
+                    message = self.close_summary(session)
+                    self._notify(message)
+                    self._last_close_summary = session
+                    if self.save_last_close_summary is not None:
+                        self.save_last_close_summary(session)
+                except Exception:
+                    logger.exception("End-of-day summary failed; Botty will retry")
+            return False
+        if self.supervise_once is not None:
+            try:
+                self.supervise_once()
+            except Exception as error:
+                logger.exception("Position supervision failed")
+                self._notify(f"BOTTY NEEDS ATTENTION: position supervision failed: {error}")
+        session = clock.timestamp.date()
+        new_session = session != self._last_session
+        if not self._scan_due(clock.timestamp, new_session):
+            return False
+
+        self._last_scan_at = clock.timestamp
+        label = "market-open" if new_session else "scheduled swing"
+        self._notify(f"Botty {label} scan started ({clock.timestamp.isoformat()}).")
+        try:
+            code = self.scan_once()
+        except Exception as error:
+            logger.exception("Automated market-open scan crashed")
+            if not self._scan_failure_notified:
+                self._notify(f"BOTTY NEEDS ATTENTION: scan crashed: {error}")
+                self._scan_failure_notified = True
+            return True
+        if code:
+            if not self._scan_failure_notified:
+                self._notify(f"BOTTY NEEDS ATTENTION: scan exited with code {code}.")
+                self._scan_failure_notified = True
+        else:
+            self._scan_failure_notified = False
+            self._last_session = session
+            if self.save_last_session is not None:
+                self.save_last_session(session)
+            self._notify(f"Botty {label} scan completed.")
+        return True
+
+    def _scan_due(self, timestamp, new_session: bool) -> bool:
+        """Whether a scan should run now.
+
+        The open is always scanned. After that the interval decides, so a setup
+        that forms at 11:00 is seen the same day rather than at tomorrow's bell.
+        """
+        if new_session:
             return True
         if self.open_scan_interval_seconds is None or self._last_scan_at is None:
             return False
         elapsed = (timestamp - self._last_scan_at).total_seconds()
         return elapsed >= self.open_scan_interval_seconds
-
-    def step(self) -> bool:
-        """Poll once; return True only when a scan was run."""
-        clock = self.broker.get_clock()
-        if not clock.is_open:
-            return False
-
-        timestamp = clock.timestamp
-        session = timestamp.date()
-        if not self._scan_due(timestamp, session):
-            return False
-
-        new_session = session != self._last_session
-        self._last_session = session
-        self._last_scan_at = timestamp
-        label = "market-open" if new_session else "scheduled swing"
-        self._notify(f"Botty {label} scan started ({timestamp.isoformat()}).")
-        try:
-            code = self.scan_once()
-        except Exception as error:
-            logger.exception("Automated swing scan crashed")
-            self._notify(f"BOTTY NEEDS ATTENTION: scan crashed: {error}")
-            return True
-
-        if code:
-            self._notify(f"BOTTY NEEDS ATTENTION: scan exited with code {code}.")
-        else:
-            self._notify(f"Botty {label} scan completed.")
-        return True
 
     def run_forever(self) -> None:
         cadence = (
@@ -102,15 +161,10 @@ class MarketOpenRunner:
             if self.open_scan_interval_seconds is None
             else f"every {self.open_scan_interval_seconds // 60} minute(s) while open"
         )
-        self._notify(
-            "Botty automation is online 24/7; execution scans run " + cadence + "."
-        )
+        self._notify(f"Botty automation is online; scans run {cadence}.")
         while True:
-            ran = self.step()
-            if ran and self.open_scan_interval_seconds is not None:
-                pause = min(60, self.open_scan_interval_seconds)
-            elif ran:
-                pause = 60
-            else:
-                pause = self.closed_poll_seconds
-            self.sleep(pause)
+            self.step()
+            self.sleep(
+                self.open_poll_seconds if self._market_is_open
+                else self.closed_poll_seconds
+            )

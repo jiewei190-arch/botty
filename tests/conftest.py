@@ -21,7 +21,10 @@ from trading_bot.data.database import Database
 def _isolate_env(monkeypatch):
     """Strip bot-related environment variables so a developer's real .env or
     exported keys cannot influence test outcomes."""
-    for prefix in ("ALPACA_", "RISK_", "DATA_", "LOG_", "SCANNER_", "DETECTOR_", "ALERT_"):
+    for prefix in (
+        "ALPACA_", "RISK_", "DATA_", "LOG_",
+        "SCANNER_", "DETECTOR_", "ALERT_", "AUTO_", "OPTIONS_",
+    ):
         for key in list(dict(**__import__("os").environ)):
             if key.startswith(prefix):
                 monkeypatch.delenv(key, raising=False)

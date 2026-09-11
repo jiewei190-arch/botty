@@ -1,57 +1,35 @@
 services:
   - type: web
-    name: botty-dashboard
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py dashboard --headless --host 0.0.0.0 --port $PORT
-    autoDeploy: true
+    name: botty-swing-options
+    runtime: docker
+    plan: free
+    region: virginia
+    dockerCommand: python -m trading_bot.deploy
+    healthCheckPath: /_stcore/health
+    autoDeployTrigger: commit
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.16
       - key: TRADING_MODE
         value: paper
-      - key: DATA_TIMEFRAME
-        value: 1Day
-      - key: DATA_LOOKBACK_BARS
+      - key: ENABLE_LIVE_TRADING
+        value: "false"
+      - key: OPTIONS_ENABLED
+        value: "true"
+      - key: OPTIONS_MIN_PREMIUM_PER_TRADE
         value: "500"
-      - key: RISK_MIN_CONFIDENCE
-        value: "70"
-      - key: ALPACA_API_KEY
-        sync: false
-      - key: ALPACA_SECRET_KEY
-        sync: false
-
-  - type: worker
-    name: botty-swing-worker
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: >-
-      python main.py hunt
-      --strategy swing_quality
-      --timeframe 1Day
-      --top 5
-      --min-score 70
-      --min-risk-reward 2.0
-      --paper-trade
-      --watch-market
-    autoDeploy: true
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.16
-      - key: TRADING_MODE
-        value: paper
-      - key: DATA_TIMEFRAME
-        value: 1Day
-      - key: DATA_LOOKBACK_BARS
-        value: "500"
-      - key: RISK_MIN_CONFIDENCE
-        value: "70"
-      - key: RISK_MAX_RISK_PER_TRADE_PCT
-        value: "1.0"
-      - key: RISK_MAX_OPEN_POSITIONS
-        value: "5"
-      - key: RISK_MIN_RISK_REWARD
-        value: "2.0"
+      - key: OPTIONS_MAX_PREMIUM_PER_TRADE
+        value: "1000"
+      - key: OPTIONS_MAX_DTE
+        value: "90"
+      - key: OPTIONS_EXCEPTIONAL_MAX_DTE
+        value: "120"
+      - key: DATA_DATABASE_PATH
+        value: /app/storage/trading_bot.db
+      - key: DATA_CACHE_DIR
+        value: /app/storage/cache
+      - key: LOG_DIRECTORY
+        value: /app/storage/logs
+      - key: AUTO_WEBHOOK_KIND
+        value: slack
       - key: ALPACA_API_KEY
         sync: false
       - key: ALPACA_SECRET_KEY
