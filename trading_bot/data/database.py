@@ -155,8 +155,76 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON bot_events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_category ON bot_events(category);
 """
 
+SCHEMA_V2 = """
+-- Phase 1 scanner tables. Detector output, the scores built from it, the alerts
+-- that survived the gates, and the health of the pieces producing all three.
+
+CREATE TABLE IF NOT EXISTS detector_signals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+    ts          TEXT    NOT NULL,
+    symbol      TEXT    NOT NULL,
+    detector    TEXT    NOT NULL,
+    signal_type TEXT    NOT NULL,
+    direction   TEXT    NOT NULL,
+    strength    REAL    NOT NULL,
+    session     TEXT,
+    reason      TEXT,
+    metrics     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_detector_signals_symbol_ts
+    ON detector_signals(symbol, ts);
+CREATE INDEX IF NOT EXISTS idx_detector_signals_type
+    ON detector_signals(signal_type, ts);
+
+CREATE TABLE IF NOT EXISTS opportunity_scores (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+    ts           TEXT    NOT NULL,
+    symbol       TEXT    NOT NULL,
+    overall      REAL    NOT NULL,
+    direction    TEXT    NOT NULL,
+    agreement    REAL,
+    session      TEXT,
+    signal_count INTEGER NOT NULL DEFAULT 0,
+    components   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_ts ON opportunity_scores(ts);
+CREATE INDEX IF NOT EXISTS idx_opportunity_symbol ON opportunity_scores(symbol, ts);
+
+-- ``dedupe_key`` is the alert manager's cooldown identity. Reloading the most
+-- recent row per key is what stops a restart from re-alerting a whole session.
+CREATE TABLE IF NOT EXISTS alerts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+    ts             TEXT    NOT NULL,
+    symbol         TEXT    NOT NULL,
+    direction      TEXT    NOT NULL,
+    score          REAL    NOT NULL,
+    priority       TEXT    NOT NULL,
+    session        TEXT,
+    price          REAL,
+    dedupe_key     TEXT    NOT NULL,
+    trigger_reason TEXT,
+    signal_types   TEXT,
+    payload        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
+CREATE INDEX IF NOT EXISTS idx_alerts_key_ts ON alerts(dedupe_key, ts);
+
+CREATE TABLE IF NOT EXISTS system_health (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT NOT NULL,
+    component TEXT NOT NULL,
+    status    TEXT NOT NULL,
+    message   TEXT,
+    detail    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_health_component_ts ON system_health(component, ts);
+"""
+
 #: Ordered migrations. Index 0 upgrades user_version 0 -> 1, and so on.
-MIGRATIONS: tuple[str, ...] = (SCHEMA_V1,)
+MIGRATIONS: tuple[str, ...] = (SCHEMA_V1, SCHEMA_V2)
 
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -196,7 +264,9 @@ class Database:
     """Connection owner and migration runner.
 
     Repositories are exposed as attributes: ``db.signals``, ``db.trades``,
-    ``db.positions``, ``db.equity``, ``db.events``, ``db.runs``.
+    ``db.positions``, ``db.equity``, ``db.events``, ``db.runs``, and the Phase 1
+    scanner set — ``db.detector_signals``, ``db.opportunities``, ``db.alerts``
+    and ``db.health``.
     """
 
     def __init__(self, path: Path | str) -> None:
@@ -211,6 +281,10 @@ class Database:
         self.positions = PositionRepository(self)
         self.equity = EquityRepository(self)
         self.events = EventRepository(self)
+        self.detector_signals = DetectorSignalRepository(self)
+        self.opportunities = OpportunityRepository(self)
+        self.alerts = AlertRepository(self)
+        self.health = HealthRepository(self)
 
     # -- connection management ---------------------------------------------------
 
@@ -782,3 +856,212 @@ class EventRepository(_Repository):
         for row in rows:
             row["payload"] = _loads(row.get("payload"))
         return rows
+
+
+class DetectorSignalRepository(_Repository):
+    """Raw detector output.
+
+    Kept separately from ``signals`` (which holds strategy signals with entry,
+    stop and target) because these are observations rather than trade ideas.
+    Mixing them would make "how often does a volume spike precede a winning
+    trade?" unanswerable, and that question is the whole point of storing them.
+    """
+
+    def record(self, signal: Any, *, run_id: int | None = None) -> int:
+        return self.db.insert(
+            "detector_signals",
+            {
+                "run_id": run_id,
+                "ts": to_iso(signal.timestamp) or utc_now_iso(),
+                "symbol": signal.symbol,
+                "detector": signal.detector,
+                "signal_type": signal.signal_type.value,
+                "direction": signal.direction.value,
+                "strength": float(signal.strength),
+                "session": signal.session.value,
+                "reason": signal.reason,
+                "metrics": _dumps(dict(signal.metrics)),
+            },
+        )
+
+    def record_many(self, signals: Sequence[Any], *, run_id: int | None = None) -> int:
+        """Store a batch, returning how many rows were written."""
+        return sum(1 for signal in signals if self.record(signal, run_id=run_id))
+
+    def recent(
+        self,
+        limit: int = 100,
+        *,
+        symbol: str | None = None,
+        signal_type: str | None = None,
+        since: datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        if signal_type:
+            clauses.append("signal_type = ?")
+            params.append(signal_type.upper())
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(to_iso(since))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.db.query(
+            f"SELECT * FROM detector_signals {where} ORDER BY ts DESC LIMIT ?", params
+        )
+        for row in rows:
+            row["metrics"] = _loads(row.get("metrics"))
+        return rows
+
+
+class OpportunityRepository(_Repository):
+    """Ranked scores, so a later session can ask what the scanner thought."""
+
+    def record(self, score: Any, *, run_id: int | None = None) -> int:
+        return self.db.insert(
+            "opportunity_scores",
+            {
+                "run_id": run_id,
+                "ts": to_iso(score.timestamp) or utc_now_iso(),
+                "symbol": score.symbol,
+                "overall": float(score.overall),
+                "direction": score.direction.value,
+                "agreement": float(score.agreement),
+                "session": score.session.value,
+                "signal_count": len(score.signals),
+                "components": _dumps(
+                    {key.value: round(float(value), 3) for key, value in score.components.items()}
+                ),
+            },
+        )
+
+    def top(
+        self, limit: int = 20, *, since: datetime | str | None = None
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if since is not None:
+            where = "WHERE ts >= ?"
+            params.append(to_iso(since))
+        params.append(limit)
+        rows = self.db.query(
+            f"SELECT * FROM opportunity_scores {where} ORDER BY overall DESC, ts DESC LIMIT ?",
+            params,
+        )
+        for row in rows:
+            row["components"] = _loads(row.get("components"))
+        return rows
+
+
+class AlertRepository(_Repository):
+    """Alerts that were actually sent."""
+
+    def record(self, alert: Any, *, run_id: int | None = None) -> int:
+        return self.db.insert(
+            "alerts",
+            {
+                "run_id": run_id,
+                "ts": to_iso(alert.timestamp) or utc_now_iso(),
+                "symbol": alert.symbol,
+                "direction": alert.direction.value,
+                "score": float(alert.score),
+                "priority": alert.priority.value,
+                "session": alert.session.value,
+                "price": alert.price,
+                "dedupe_key": alert.key,
+                "trigger_reason": alert.trigger,
+                "signal_types": ",".join(alert.signal_types),
+                "payload": _dumps(alert.as_dict()),
+            },
+        )
+
+    def recent(self, limit: int = 50, *, symbol: str | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if symbol:
+            where = "WHERE symbol = ?"
+            params.append(symbol.upper())
+        params.append(limit)
+        rows = self.db.query(f"SELECT * FROM alerts {where} ORDER BY ts DESC LIMIT ?", params)
+        for row in rows:
+            row["payload"] = _loads(row.get("payload"))
+        return rows
+
+    def latest_per_key(self, *, since: datetime | str | None = None) -> list[dict[str, Any]]:
+        """The most recent alert for each dedupe key.
+
+        Feeds :meth:`trading_bot.alerts.AlertManager.prime` at startup so a
+        restarted scanner honours the cooldowns it was already observing.
+        """
+        params: list[Any] = []
+        where = ""
+        if since is not None:
+            where = "WHERE ts >= ?"
+            params.append(to_iso(since))
+        return self.db.query(
+            f"""
+            SELECT dedupe_key,
+                   MAX(ts)      AS ts,
+                   COUNT(*)     AS count,
+                   MAX(score)   AS score
+            FROM alerts {where}
+            GROUP BY dedupe_key
+            """,
+            params,
+        )
+
+
+class HealthRepository(_Repository):
+    """Component status over time: connections, streams, scan cycles.
+
+    Distinct from ``bot_events``, which records *what the bot decided*. This
+    records *whether the bot is working* — the question you ask when no signals
+    have appeared for an hour and you need to know whether that is a quiet
+    market or a dead websocket.
+    """
+
+    def record(
+        self,
+        *,
+        component: str,
+        status: str,
+        message: str | None = None,
+        detail: dict[str, Any] | None = None,
+        ts: datetime | str | None = None,
+    ) -> int:
+        return self.db.insert(
+            "system_health",
+            {
+                "ts": to_iso(ts) or utc_now_iso(),
+                "component": component,
+                "status": status.upper(),
+                "message": message,
+                "detail": _dumps(detail),
+            },
+        )
+
+    def recent(self, limit: int = 100, *, component: str | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if component:
+            where = "WHERE component = ?"
+            params.append(component)
+        params.append(limit)
+        rows = self.db.query(
+            f"SELECT * FROM system_health {where} ORDER BY ts DESC LIMIT ?", params
+        )
+        for row in rows:
+            row["detail"] = _loads(row.get("detail"))
+        return rows
+
+    def latest(self, component: str) -> dict[str, Any] | None:
+        row = self.db.query_one(
+            "SELECT * FROM system_health WHERE component = ? ORDER BY ts DESC LIMIT 1",
+            [component],
+        )
+        if row:
+            row["detail"] = _loads(row.get("detail"))
+        return row

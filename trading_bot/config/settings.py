@@ -215,6 +215,123 @@ class LoggingSettings(BaseSettings):
         return normalized
 
 
+class ScannerSettings(BaseSettings):
+    """The continuously running market scanner (Phase 1)."""
+
+    model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="SCANNER_")
+
+    #: Categories from :mod:`trading_bot.config.universe` to watch.
+    categories: Annotated[list[str], NoDecode] = Field(
+        default=["INDEX_ETFS", "MEGA_CAPS"]
+    )
+    #: Symbols added on top of the categories.
+    extra_symbols: Annotated[list[str], NoDecode] = Field(default=[])
+    #: Symbols removed after the categories are expanded.
+    exclude_symbols: Annotated[list[str], NoDecode] = Field(default=[])
+    #: Optional JSON file overriding the built-in categories.
+    universe_file: Path | None = None
+
+    #: Bar size the detectors analyse.
+    timeframe: str = "5Min"
+    #: Bars of history fetched before live data starts, for detector baselines.
+    lookback_bars: int = Field(default=400, ge=50, le=10_000)
+    #: Bars retained per symbol while running.
+    max_bars: int = Field(default=1_500, ge=100, le=50_000)
+
+    #: Open a websocket. When false the scanner polls REST on ``poll_seconds``.
+    stream_enabled: bool = True
+    stream_bars: bool = True
+    stream_trades: bool = False
+    #: Quotes arrive per tick and are off by default: thirty symbols of quotes
+    #: is thousands of messages a second, and the detectors read bars.
+    stream_quotes: bool = False
+    #: Seconds between REST cycles. 0 tracks the timeframe automatically.
+    poll_seconds: int = Field(default=0, ge=0, le=3_600)
+    #: Seconds of websocket silence before a health warning is logged.
+    stream_staleness_seconds: float = Field(default=300.0, gt=0)
+
+    #: Analyse only during regular hours.
+    regular_hours_only: bool = False
+
+    #: Scoring weights. They are renormalised, so relative size is what matters.
+    weight_volume: float = Field(default=0.25, ge=0)
+    weight_momentum: float = Field(default=0.25, ge=0)
+    weight_breakout: float = Field(default=0.25, ge=0)
+    weight_gap: float = Field(default=0.15, ge=0)
+    weight_volatility: float = Field(default=0.10, ge=0)
+
+    @field_validator("categories", "extra_symbols", "exclude_symbols", mode="before")
+    @classmethod
+    def _parse_lists(cls, value: Any) -> Any:
+        return _split_csv(value)
+
+    @field_validator("timeframe")
+    @classmethod
+    def _validate_timeframe(cls, value: str) -> str:
+        from trading_bot.utils.timeframes import Timeframe
+
+        return Timeframe.parse(value).label
+
+    @model_validator(mode="after")
+    def _validate_weights(self) -> ScannerSettings:
+        total = (
+            self.weight_volume
+            + self.weight_momentum
+            + self.weight_breakout
+            + self.weight_gap
+            + self.weight_volatility
+        )
+        if total <= 0:
+            raise ValueError("At least one SCANNER_WEIGHT_* value must be greater than zero")
+        return self
+
+
+class DetectorSettings(BaseSettings):
+    """Detector thresholds worth tuning from the environment.
+
+    Only the five that change behaviour most are exposed here. The rest live in
+    :mod:`trading_bot.detectors.base`, where each default is stated next to the
+    reasoning for it — a threshold nobody can justify is one nobody can safely
+    change, and burying all thirty in ``.env`` would invite exactly that.
+    """
+
+    model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="DETECTOR_")
+
+    #: Relative volume at which participation stops being ordinary.
+    volume_threshold: float = Field(default=1.5, gt=0)
+    #: Move size in ATR units that counts as momentum.
+    momentum_atr_threshold: float = Field(default=1.5, gt=0)
+    #: Percentage past a level a close must reach to count as a break.
+    breakout_buffer_pct: float = Field(default=0.05, ge=0, le=10)
+    #: Percentage gap that counts as a gap.
+    gap_threshold_pct: float = Field(default=1.0, gt=0, le=100)
+    #: Bar-range expansion ratio that counts as abnormal.
+    volatility_threshold: float = Field(default=1.6, gt=0)
+
+
+class AlertSettings(BaseSettings):
+    """When and where the scanner interrupts you."""
+
+    model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="ALERT_")
+
+    #: Overall score (0-10) required before an alert is raised.
+    min_score: float = Field(default=5.0, ge=0, le=10)
+    #: Silence for one symbol and direction after an alert.
+    cooldown_seconds: int = Field(default=900, ge=0)
+    #: Score improvement that re-opens the cooldown early.
+    escalation_delta: float = Field(default=1.5, ge=0)
+    #: Hard cap per symbol per trading day.
+    max_per_symbol_per_session: int = Field(default=5, ge=1)
+    #: Minimum directional agreement (0-1) among the signals. 0 disables it.
+    min_agreement: float = Field(default=0.0, ge=0, le=1)
+    #: Suppress alerts whose signals cancel out to no direction.
+    require_direction: bool = True
+
+    console_enabled: bool = True
+    log_enabled: bool = True
+    database_enabled: bool = True
+
+
 class Settings(BaseSettings):
     """Root settings object composing every configuration group."""
 
@@ -236,6 +353,9 @@ class Settings(BaseSettings):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     data: DataSettings = Field(default_factory=DataSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    scanner: ScannerSettings = Field(default_factory=ScannerSettings)
+    detectors: DetectorSettings = Field(default_factory=DetectorSettings)
+    alerts: AlertSettings = Field(default_factory=AlertSettings)
 
     project_root: Path = PROJECT_ROOT
 

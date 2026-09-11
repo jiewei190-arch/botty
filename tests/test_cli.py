@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from trading_bot.data.database import SCHEMA_VERSION
 from trading_bot.main import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, build_parser, main
 
 
@@ -33,7 +34,9 @@ def test_config_command_masks_secrets(capsys, monkeypatch):
 
 def test_db_init_creates_the_schema(capsys, tmp_path):
     assert main(["db-init"]) == EXIT_OK
-    assert "schema v1" in capsys.readouterr().out
+    # Asserted against the constant, not a literal: a new migration should not
+    # break a test about whether db-init reports the version it applied.
+    assert f"schema v{SCHEMA_VERSION}" in capsys.readouterr().out
     assert (tmp_path / "bot.db").exists()
 
 

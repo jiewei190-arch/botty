@@ -6,16 +6,17 @@ a target and a share count sized to your account. You place the orders yourself,
 wherever you trade.
 
 ```bash
-python main.py hunt
+python main.py hunt     # scan the whole market, on demand
+python main.py watch    # stay connected and alert when something starts
 ```
 
 > **It places no orders and connects to no broker for trading.** Market data is
 > read from a data provider; execution is yours. That separation is deliberate,
 > not a missing feature — see [Where you trade](#where-you-trade-is-not-where-you-get-data).
 
-> **Status: the scanner, the analysis behind it and the backtester are complete
-> and tested** — 850 tests, no credentials needed to run them. See the
-> [roadmap](#roadmap).
+> **Status: the scanner, the analysis behind it, the backtester and the
+> continuous market scanner are complete and tested** — 1,093 tests, no
+> credentials needed to run them. See the [roadmap](#roadmap).
 
 ---
 
@@ -46,13 +47,15 @@ python main.py hunt
 │  Orchestration    bot engine — scan → decide → size → execute │
 ├──────────────────────────────────────────────────────────────┤
 │  Decision         scanner → strategies/ → risk/               │
+│                   detectors/ → alerts/                        │
 ├──────────────────────────────────────────────────────────────┤
 │  Analytics        indicators/            backtesting/         │
 ├──────────────────────────────────────────────────────────────┤
 │  Access           data/market_data.py  data/database.py       │
-│                   execution/broker.py                         │
+│                   data/market_stream.py  execution/broker.py  │
 ├──────────────────────────────────────────────────────────────┤
-│  Foundation       config/  utils/ (logging, retry, timeframes)│
+│  Foundation       config/ (settings, universe)                │
+│                   utils/ (logging, retry, timeframes, hours)  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -65,15 +68,19 @@ swappable: the backtester and the live bot both consume the same
 ```
 botty/
 ├── trading_bot/
-│   ├── config/settings.py        Typed settings + live-trading locks
+│   ├── config/
+│   │   ├── settings.py           Typed settings + live-trading locks
+│   │   └── universe.py           Categorised watchlists, free-plan symbol cap
 │   ├── data/
 │   │   ├── market_data.py        Provider interface, Alpaca client, normalization
+│   │   ├── market_stream.py      Websocket supervisor: pre-flight, queue, health
 │   │   ├── cache.py              Parquet bar cache
 │   │   ├── database.py           SQLite schema + repositories
 │   │   └── models.py             Quote, MarketClock, AccountSnapshot, AssetInfo
 │   ├── execution/broker.py       Read-only broker access (orders: Phase 7)
 │   ├── utils/
 │   │   ├── logging_setup.py      Console + rotating file + JSON-lines sinks
+│   │   ├── market_hours.py       Sessions, holidays and early closes, offline
 │   │   ├── retry.py              Exponential backoff for API calls
 │   │   └── timeframes.py         Bar-size parsing and calendar arithmetic
 │   ├── indicators/
@@ -90,9 +97,25 @@ botty/
 │   │   ├── risk_manager.py          The gate: nine limits, explicit verdicts
 │   │   ├── position_sizing.py       Size from stop distance, four caps
 │   │   └── portfolio.py             The state the limits are judged against
+│   ├── detectors/
+│   │   ├── models.py                DetectorSignal: one shape for every observation
+│   │   ├── context.py               Session grouping, shared by all five detectors
+│   │   ├── volume_detector.py       Time-of-day-matched relative volume
+│   │   ├── momentum_detector.py     Size (in ATR), speed and persistence
+│   │   ├── breakout_detector.py     Level breaks, buffered and de-duplicated
+│   │   ├── gap_detector.py          Overnight gaps and how much has filled
+│   │   ├── volatility_detector.py   Range expansion against the symbol's own norm
+│   │   ├── scoring.py               Weighted rank + directional agreement
+│   │   └── engine.py                Runs the suite; one failure cannot end a scan
+│   ├── alerts/
+│   │   ├── models.py                Alert + the console block
+│   │   ├── channels.py              Console, JSON log, database, callback
+│   │   └── alert_manager.py         Threshold, direction, cooldown, session budget
 │   ├── scanner/
 │   │   ├── scanner.py               Filter, find, score, size, rank
-│   │   └── scoring.py               Seven direction-aware factors
+│   │   ├── scoring.py               Seven direction-aware factors
+│   │   ├── realtime.py              Continuous scanner + minute-bar aggregation
+│   │   └── factory.py               Settings -> detectors, weights, channels
 │   ├── backtesting/              Phase 6
 │   ├── dashboard/
 │   │   ├── app.py                   Streamlit app (read-only)
@@ -100,7 +123,7 @@ botty/
 │   │   ├── theme.py                 Validated palette, light and dark
 │   │   └── data.py                  Cached data access for the UI
 │   └── main.py                   CLI
-├── tests/                        603 tests, no credentials required
+├── tests/                        1,093 tests, no credentials required
 ├── logs/                         Runtime logs (gitignored)
 ├── storage/                      SQLite database + parquet cache (gitignored)
 ├── main.py                       Launcher
@@ -196,7 +219,10 @@ The command exits non-zero if any check fails, so it works in CI too.
 |---|---|
 | `python main.py check` | Full health check: config, database, credentials, broker, data |
 | `python main.py config` | Print resolved configuration (secrets masked) |
-| `python main.py clock` | Market session state |
+| `python main.py clock` | Market session state (local calendar + broker) |
+| `python main.py universe` | List symbol categories and the resolved watchlist |
+| `python main.py detect` | Run the five detectors once over historical bars |
+| `python main.py watch` | **Run the continuous market scanner** |
 | `python main.py fetch` | Download and preview historical bars |
 | `python main.py db-init` | Create or migrate the database |
 | `python main.py cache` | Inspect (`--clear` to empty) the bar cache |
@@ -463,6 +489,204 @@ profit.**
 Risk runs *after* scoring, so a rejected opportunity still appears with its score
 and the reason it was refused. A scanner that silently dropped everything the
 limits blocked would leave you unable to tell a quiet market from a mis-set limit.
+
+---
+
+## The continuous scanner
+
+`hunt` and `scan` answer "what looks good right now?" on demand. The continuous
+scanner answers "tell me when something starts happening" — it stays connected,
+watches a fixed list of symbols, and interrupts you when several independent
+measurements agree that one of them has stopped behaving normally.
+
+```bash
+# What am I watching, and does it fit the data plan?
+python main.py universe
+
+# Run the detectors once over history — no websocket, no waiting
+python main.py detect --symbols NVDA,AMD,TSLA --timeframe 15Min
+
+# Try it with no API keys at all
+python main.py detect --demo --timeframe 1Day
+
+# Watch continuously. Ctrl-C to stop.
+python main.py watch
+
+# One cycle, then exit — useful from cron
+python main.py watch --once
+
+# Poll over REST instead of streaming, with a lower alert bar
+python main.py watch --no-stream --min-score 4
+```
+
+**`watch` cannot place an order.** Nothing in the detector, scoring or alert
+layers imports the execution module, and the CLI passes it no broker. That is
+structural, not a policy setting.
+
+### Five detectors, one signal shape
+
+Each detector answers one question and returns at most one signal, on a shared
+0-10 strength scale:
+
+| Detector | Fires when | Key metric |
+|---|---|---|
+| **Unusual volume** | Participation is well above this symbol's own norm | `relative_volume` |
+| **Momentum** | Price moved far and fast for this symbol's volatility | `atr_multiple` |
+| **Breakout** | A close cleared a level people watch, decisively and freshly | `distance_pct` |
+| **Gap** | The session opened away from the previous close | `gap_pct` |
+| **Volatility expansion** | Bar ranges widened against their own baseline | `expansion_ratio` |
+
+Three deliberate choices shape what they report:
+
+**Relative volume is time-of-day matched.** Volume accumulated through the first
+`k` bars of today is compared with the same `k` bars of recent sessions. Against
+a full-day average, every morning looks quiet and every afternoon looks busy —
+which is a fact about the clock, not about the stock. Before the bell the
+comparison falls back to pre-market against pre-market, which is the earliest
+honest read available.
+
+**Momentum is measured in ATR, not percent.** A 2% move means something
+different in a utility than in a small-cap semiconductor. Dividing by the
+symbol's own typical range puts every ticker on one scale, which is what a
+cross-market scanner needs. Percent is kept as a fallback when history is too
+short for an ATR, and as the number a human actually reads.
+
+**Breakouts need a buffer and freshness.** Price must close *past* a level by a
+margin, and the level must have been intact on the previous bar. Without the
+buffer, every tick through a level is a breakout; without freshness, a symbol
+that broke out at 09:45 keeps reporting it until the close, and the one alert
+that mattered is buried under forty that did not.
+
+A detector staying quiet is a measurement, not a gap. It means nothing unusual
+happened.
+
+### Scoring ranks; it does not decide
+
+The scoring engine combines the five strengths with configurable weights and
+produces a 0-10 rank. Two rules are worth knowing because they are the opposite
+of what the rest of the codebase does:
+
+**A silent detector counts as zero, not as missing.** Everywhere else in this
+project, an uncomputable factor is dropped and the remaining weights
+renormalised. Here it is not. Confluence is the entire value of a scanner: a
+symbol with four independent confirmations must outrank one with a single loud
+reading, and renormalising would invert that.
+
+**Disagreement is reported, not averaged away.** A symbol whose volume leans
+bullish while its breakout leans bearish gets an `agreement` near zero and a
+`conflicted` flag, rather than a direction that quietly cancels out. That is a
+real and interesting state — it is just not a trade.
+
+The result is a rank. It is not a probability of profit. The one place this
+project attempts a probability is `python main.py calibrate`, which measures
+what the strategy confidence score was historically worth, and says so honestly
+when the answer is "nothing measurable".
+
+### Alerts: four gates and an escape hatch
+
+An alert is a decision to interrupt someone, so most of what the scorer ranks
+never becomes one:
+
+1. **Threshold** — `ALERT_MIN_SCORE`, default 5.0.
+2. **Direction** — signals that cancel out are not an opportunity.
+3. **Cooldown** — one alert per symbol per direction per `ALERT_COOLDOWN_SECONDS`.
+4. **Session budget** — a hard cap per symbol per trading day.
+
+The escape hatch is escalation: a setup that was worth 5.2 an hour ago and is
+now worth 8.9 has genuinely changed, and re-alerts once, labelled as an
+escalation so the reader knows it is not a duplicate.
+
+Cooldowns are measured against the **bar's** timestamp, not the wall clock, so
+replaying a day of bars produces exactly the alerts that day would have
+produced. Every suppression is counted in `AlertManager.stats` — a scanner that
+silently drops alerts is indistinguishable from a broken one.
+
+Alerts go to the console, the JSON-lines log and the database. Discord,
+Telegram, SMS or email is one `CallbackChannel(your_function)` away; the manager
+needs no knowledge of it. On restart the manager is primed from stored alerts,
+so it honours cooldowns it was already observing instead of re-announcing a
+morning's worth of setups.
+
+### Streaming, and what is actually ours
+
+`alpaca-py` already reconnects with exponential backoff (1s to 30s) and can
+force a reconnect when a socket goes quiet. Reimplementing that would be
+duplicated, worse code. What the SDK does *not* do is everything a long-running
+process needs around it, and that is what `market_stream.py` adds:
+
+- **A credential pre-flight.** The SDK treats a rejected key like any other
+  error: it logs it and reconnects, forever. A scanner started with a dead key
+  would sit there looking busy and never say why. One cheap REST call first
+  turns that into an error message you can act on.
+- **A thread and a queue.** `run()` calls `asyncio.run` internally, so it owns an
+  event loop and blocks. It runs on a worker thread; events are republished onto
+  an `asyncio.Queue` the application consumes normally.
+- **Backpressure that favours freshness.** If the consumer falls behind, the
+  *oldest* event is dropped and counted. A stale quote has no value, and
+  blocking the websocket thread to preserve one would risk the connection.
+- **Health events.** Connects, reconnects, thread death and unexpected silence
+  are recorded in `system_health` and the structured log, so "no signals for an
+  hour" can be told apart from "dead socket for an hour".
+
+Bars are aggregated locally. Alpaca streams *minute* bars; a coarser timeframe
+is assembled here and published **only once the bucket is complete**. A
+partially formed 15-minute bar has a low that has not finished falling, and
+feeding one to a detector produces a signal that changes its mind four times
+before the bar closes. This is the same rule the backtester enforces, which is
+what makes the two comparable.
+
+### Market sessions are computed, not asked for
+
+`utils/market_hours.py` derives sessions from the NYSE's published rules:
+regular hours, Alpaca's 04:00-20:00 extended window, ten fixed holidays, Good
+Friday, three early closes, and the weekend-observance rule — including the
+oddity that a Saturday New Year's Day is not observed at all.
+
+It is cheap, offline, and always available, which matters most when the network
+is the thing that has broken. It is **not authoritative**: unscheduled closures
+— a day of mourning, a hurricane, an exchange outage — are decided on the day
+and cannot be computed. `python main.py clock` prints both and says so when they
+disagree.
+
+### What the free data plan actually gives you
+
+The Basic (free) Alpaca plan is the binding constraint on this whole feature,
+and it is worth stating plainly:
+
+| | Basic (free) | Algo Trader Plus |
+|---|---|---|
+| Real-time feed | IEX only | All US exchanges (SIP) |
+| Websocket subscription | **30 symbols** | Unlimited |
+| REST rate limit | 200/min | 10,000/min |
+| Historical data | Excludes the last 15 minutes | No restriction |
+
+What that means in practice:
+
+- **IEX is one venue**, carrying a low single-digit percentage of consolidated
+  volume. Every *relative* measure here compares IEX with IEX and stays
+  meaningful; absolute share counts do not represent the tape.
+- **30 symbols is a hard cap.** The shipped default resolves to 27. Going over
+  is not silently truncated — the scanner refuses to stream and tells you to
+  trim the list or fall back to REST, where the cap does not apply.
+- **Thin symbols will look dead.** A stock whose IEX prints are sparse produces
+  a relative-volume reading built on almost nothing. The liquidity screen in
+  `universe/filters.py` exists for this, and `hunt` warns about it explicitly.
+
+The scanner does not pretend any of this away. If you want the consolidated
+tape, that is a paid subscription and a one-line change to `ALPACA_DATA_FEED`.
+
+### Known limitations
+
+- **The live path has not been exercised against a real key.** Every component
+  is tested against a fake stream with the SDK's contract, but no session has
+  yet run against Alpaca's production websocket.
+- **Quotes are subscribed but unused.** The detectors read bars. A bid-ask
+  spread check would be a natural next detector and is not implemented.
+- **No news or catalyst layer.** A volume spike with no explanation looks exactly
+  like a volume spike with one (Phase 4).
+- **Score calibration covers strategy confidence, not detector scores.** The
+  machinery in `backtesting/calibration.py` applies to `scan`/`hunt` confidence;
+  pointing it at detector scores is unfinished work.
 
 ---
 
@@ -967,12 +1191,22 @@ pytest                    # full suite
 pytest -v tests/test_settings.py
 ```
 
-**850+ tests, `ruff check` clean.** The suite runs against synthetic bars and an
-in-memory database — **no API credentials or network access required**, so it is
-safe to run in CI. Tests cover the universe filters, the scan funnel, per-trade
-sizing, bar normalization, the lookahead guards, cache coverage rules, P&L
-arithmetic, retry classification, CLI exit codes, and every indicator's maths
-against independently derived reference values.
+**1,093 tests, `ruff check` clean.** The suite runs against synthetic bars and
+an in-memory database — **no API credentials or network access required**, so it
+is safe to run in CI. Tests cover the universe filters, the scan funnel,
+per-trade sizing, bar normalization, the lookahead guards, cache coverage rules,
+P&L arithmetic, retry classification, CLI exit codes, and every indicator's
+maths against independently derived reference values.
+
+The Phase 1 scanner is tested the same way. No test opens a websocket: the SDK's
+stream is replaced by a fake with the same contract — coroutine handlers, a
+blocking `run()` that owns its own event loop, a `stop()` that signals it —
+because what needs proving is the supervision, not the transport. A rejected
+credential fails fast instead of retrying forever; a slow consumer drops the
+oldest event rather than wedging the socket; a thread that dies says so. The
+holiday dates are checked against the NYSE's published calendars rather than
+against the code that produced them, since a test that recomputes the same
+algorithm proves only that the algorithm is deterministic.
 
 The synthetic bars are calibrated rather than arbitrary: a generated daily bar's
 true range averages 2.54% of price, against 2.48% measured on real AAPL
@@ -998,6 +1232,12 @@ exist.
 | Volume analysis | `tests/test_volume_analysis.py` | 30 |
 | Universe filters and discovery | `tests/test_universe.py` | 45 |
 | Market-wide sweep | `tests/test_market_scan.py` | 26 |
+| The five detectors, scoring and the engine | `tests/test_detectors.py` | 61 |
+| Sessions, holidays and early closes | `tests/test_market_hours.py` | 38 |
+| Continuous scanner and bar aggregation | `tests/test_realtime_scanner.py` | 26 |
+| Alert gating, cooldown and channels | `tests/test_alerts.py` | 24 |
+| Websocket supervision | `tests/test_market_stream.py` | 14 |
+| Symbol categories and overrides | `tests/test_universe_config.py` | 13 |
 | Foundation, data access and CLI | 10 further files | 196 |
 
 ---
@@ -1019,7 +1259,9 @@ than deferred — they are not features this tool is missing.
 | Backtesting engine | **Complete** |
 | Universe discovery and market-wide hunt | **Complete** |
 | Dashboard (hunt, charts, backtests, settings) | **Complete** |
-| Alerts when a setup appears (email/push, scheduled scans) | Planned |
+| Continuous scanner: streaming, five detectors, alerts | **Complete** |
+| Alerts to Discord / Telegram / SMS / email | One `CallbackChannel` away |
+| News and catalyst analysis behind a volume spike | Planned |
 | Tracking setups you took, to measure the scanner against reality | Planned |
 | Broker order placement | **Not planned** — you execute |
 
