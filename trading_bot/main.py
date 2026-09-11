@@ -37,7 +37,7 @@ import sys
 import textwrap
 from collections import Counter
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,13 +48,19 @@ if __package__ in (None, ""):  # pragma: no cover - script execution path
 from pydantic import ValidationError
 
 from trading_bot import __version__
-from trading_bot.backtesting import FRICTIONLESS, CostModel
+from trading_bot.backtesting import FRICTIONLESS, CostModel, calibrate
 from trading_bot.backtesting.runner import (
     BacktestDataError,
     BacktestRequest,
     run_backtest,
 )
 from trading_bot.config.settings import Settings, TradingMode, load_settings
+from trading_bot.config.universe import (
+    UniverseConfigError,
+    load_catalogue,
+    normalize_symbols,
+    stream_capacity_error,
+)
 from trading_bot.data.cache import BarCache
 from trading_bot.data.database import Database
 from trading_bot.data.market_data import (
@@ -97,6 +103,7 @@ from trading_bot.universe import (
     feed_liquidity_warning,
     profile_liquidity,
 )
+from trading_bot.utils import market_hours
 from trading_bot.utils.logging_setup import (
     configure_logging,
     log_banner,
@@ -135,6 +142,45 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check", help="Run connectivity and configuration health checks.")
     subparsers.add_parser("clock", help="Show current market session state.")
     subparsers.add_parser("db-init", help="Create or migrate the SQLite database.")
+
+    universe_cmd = subparsers.add_parser(
+        "universe", help="List symbol categories and the resolved watchlist."
+    )
+    universe_cmd.add_argument(
+        "--categories", help="Comma-separated categories to resolve (default: configured)."
+    )
+
+    detect = subparsers.add_parser(
+        "detect", help="Run the Phase 1 detectors once over historical bars."
+    )
+    detect.add_argument("--symbols", help="Comma-separated symbols (default: scanner universe).")
+    detect.add_argument("--categories", help="Comma-separated symbol categories.")
+    detect.add_argument("--timeframe", default=None, help="Bar size (default: SCANNER_TIMEFRAME).")
+    detect.add_argument("--bars", type=int, default=None, help="Bars of history per symbol.")
+    detect.add_argument("--min-score", type=float, default=0.0, help="Hide symbols below this.")
+    detect.add_argument("--top", type=int, default=15, help="Rows to show (default: 15).")
+    detect.add_argument("--json", action="store_true", help="Emit JSON instead of a table.")
+    detect.add_argument("--demo", action="store_true", help="Use generated bars (no API key).")
+    detect.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+
+    watch = subparsers.add_parser(
+        "watch", help="Run the continuous market scanner (no orders are ever placed)."
+    )
+    watch.add_argument("--symbols", help="Comma-separated symbols (default: scanner universe).")
+    watch.add_argument("--categories", help="Comma-separated symbol categories.")
+    watch.add_argument("--timeframe", default=None, help="Bar size (default: SCANNER_TIMEFRAME).")
+    watch.add_argument("--min-score", type=float, default=None, help="Alert threshold (0-10).")
+    watch.add_argument("--poll", type=int, default=None, help="Seconds between REST cycles.")
+    watch.add_argument(
+        "--no-stream", action="store_true", help="Poll over REST instead of streaming."
+    )
+    watch.add_argument("--once", action="store_true", help="Run a single cycle and exit.")
+    watch.add_argument(
+        "--duration", type=float, default=None, help="Stop after this many minutes."
+    )
+    watch.add_argument(
+        "--no-database", action="store_true", help="Do not persist signals or alerts."
+    )
 
     fetch = subparsers.add_parser("fetch", help="Download historical bars.")
     fetch.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
@@ -229,13 +275,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
 
+    calibrate_cmd = subparsers.add_parser(
+        "calibrate",
+        help="Measure whether the confidence score actually predicts outcomes.",
+    )
+    calibrate_cmd.add_argument(
+        "--symbols", help="Comma-separated symbols (default: watchlist)."
+    )
+    calibrate_cmd.add_argument(
+        "--strategy", default="all",
+        help=f"Strategy name, list, or 'all'. Available: {', '.join(available_strategies())}",
+    )
+    calibrate_cmd.add_argument(
+        "--timeframe", default="1Day", help="Bar size (default 1Day)."
+    )
+    calibrate_cmd.add_argument("--start", help="First date, YYYY-MM-DD.")
+    calibrate_cmd.add_argument("--end", help="Last date, YYYY-MM-DD.")
+    calibrate_cmd.add_argument(
+        "--capital", type=float, default=100_000.0,
+        help="Starting equity. Larger than a real account on purpose: sizing "
+        "limits would otherwise reject setups and bias the sample.",
+    )
+    calibrate_cmd.add_argument(
+        "--csv", help="Write the per-trade record to this CSV file."
+    )
+    calibrate_cmd.add_argument("--no-cache", action="store_true",
+                               help="Bypass the parquet bar cache.")
+
     hunt = subparsers.add_parser(
         "hunt",
         help="Scan the whole market for swing setups and rank the best entries.",
     )
     hunt.add_argument(
-        "--strategy", default="all",
-        help="Strategy name, comma-separated list, or 'all' (default). "
+        "--strategy", default="swing_quality",
+        help="Strategy name, comma-separated list, or 'all' (default: swing_quality). "
         f"Available: {', '.join(available_strategies())}",
     )
     hunt.add_argument(
@@ -313,8 +386,8 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
     backtest.add_argument(
         "--strategy",
-        default="momentum",
-        help="Strategy name, comma-separated list, or 'all'. "
+        default="swing_quality",
+        help="Strategy name, comma-separated list, or 'all' (default: swing_quality). "
         f"Available: {', '.join(available_strategies())}",
     )
     backtest.add_argument(
@@ -529,9 +602,30 @@ def cmd_check(settings: Settings) -> int:
 def cmd_clock(settings: Settings) -> int:
     from trading_bot.execution.broker import build_broker
 
-    clock = build_broker(settings).get_clock()
-    print(f"Market is {clock.describe()}")
+    now = datetime.now(timezone.utc)
+    # The local calendar always answers, including when the broker cannot be
+    # reached — which is exactly when you most want to know whether the silence
+    # is the market being shut or the connection being down.
+    print(f"Local calendar: {market_hours.describe(now)}")
+
+    try:
+        clock = build_broker(settings).get_clock()
+    except Exception as error:  # noqa: BLE001 - the local answer still stands
+        print(f"Broker clock unavailable: {error}")
+        print(
+            "The local calendar cannot see unscheduled closures, so treat it as "
+            "advisory until the broker answers."
+        )
+        return EXIT_OK
+
+    print(f"Broker says: market is {clock.describe()}")
     print(f"Broker time: {clock.timestamp.isoformat()}")
+    if clock.is_open is not market_hours.is_market_open(now):
+        print(
+            "\nNote: broker and local calendar disagree. The broker is "
+            "authoritative — this usually means an unscheduled closure or a "
+            "half day the calendar does not know about."
+        )
     return EXIT_OK
 
 
@@ -619,11 +713,18 @@ def cmd_fetch(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _demo_bars(symbol: str, periods: int = 400):
-    """Generate a deterministic sample series for ``analyze --demo``.
+def _demo_bars(symbol: str, periods: int = 400, timeframe: str | Timeframe = "15Min"):
+    """Generate a deterministic sample series for ``--demo`` commands.
 
-    This is **not** market data. It exists so the indicator engine can be
+    This is **not** market data. It exists so the analysis layers can be
     exercised end to end without API credentials.
+
+    The index is placed on real trading sessions rather than on a continuous
+    clock. That matters to anything session-aware: with 24/7 timestamps, the
+    fourteen hours between one close and the next open are filled with random
+    walk, and the gap detector correctly reports a 25% overnight gap in
+    synthetic data that was never meant to have one. Skipping the closed hours
+    makes the demo show what the real feed would show.
     """
     import zlib
 
@@ -634,16 +735,19 @@ def _demo_bars(symbol: str, periods: int = 400):
     # make "deterministic" false and the demo unreproducible between runs.
     seed = zlib.crc32(symbol.encode("utf-8"))
     rng = np.random.default_rng(seed)
-    drift = float(rng.choice([0.0035, -0.0035, 0.0]))
-    close = 100 * np.exp(np.cumsum(rng.normal(drift, 0.005, periods)))
-    spread = np.abs(rng.normal(0, 0.004, periods)) * close
-    index = pd.date_range(
-        end=pd.Timestamp.now(tz="UTC").floor("15min"),
-        periods=periods,
-        freq="15min",
-        tz="UTC",
-        name="timestamp",
-    )
+    parsed = Timeframe.parse(timeframe)
+    index = _demo_index(periods, parsed)
+
+    # Volatility scales with the square root of bar length, so one setting
+    # produces sensible-looking bars at any timeframe.
+    session_fraction = min(
+        parsed.duration / timedelta(minutes=390), 1.0
+    ) if parsed.is_intraday else 1.0
+    sigma = 0.019 * (session_fraction ** 0.5)
+    drift = float(rng.choice([1.0, -1.0, 0.0])) * sigma / 12
+
+    close = 100 * np.exp(np.cumsum(rng.normal(drift, sigma, periods)))
+    spread = np.abs(rng.normal(0, sigma * 0.4, periods)) * close
     open_ = np.concatenate([[close[0]], close[:-1]])
     return pd.DataFrame(
         {
@@ -655,6 +759,35 @@ def _demo_bars(symbol: str, periods: int = 400):
         },
         index=index,
     )
+
+
+def _demo_index(periods: int, timeframe: Timeframe):
+    """A timestamp index on real trading sessions, ending at the last one."""
+    import pandas as pd
+
+    if not timeframe.is_intraday:
+        end = pd.Timestamp.now(tz="UTC").normalize()
+        freq = "W-FRI" if timeframe.to_pandas_freq().endswith("W") else "B"
+        return pd.DatetimeIndex(
+            pd.date_range(end=end, periods=periods, freq=freq, tz="UTC"), name="timestamp"
+        )
+
+    stamps: list[pd.Timestamp] = []
+    day = datetime.now(timezone.utc).astimezone(market_hours.MARKET_TZ).date()
+    step = pd.Timedelta(timeframe.duration)
+    while len(stamps) < periods:
+        window = market_hours.session_window(day)
+        day -= timedelta(days=1)
+        if window is None:
+            continue
+        session = pd.date_range(
+            start=pd.Timestamp(window.regular_open),
+            end=pd.Timestamp(window.regular_close) - step,
+            freq=step,
+            tz="UTC",
+        )
+        stamps.extend(reversed(list(session)))
+    return pd.DatetimeIndex(sorted(stamps[:periods]), name="timestamp")
 
 
 def _money(value: float | None, places: int = 2) -> str:
@@ -830,7 +963,9 @@ def _load_bars(settings: Settings, args: argparse.Namespace, symbols, timeframe,
         print("  DEMO MODE \u2014 GENERATED SAMPLE DATA, NOT REAL MARKET DATA")
         print("  Prices below are synthetic. Supply Alpaca credentials for live analysis.")
         print(banner)
-        return {symbol: _demo_bars(symbol, bars_wanted) for symbol in symbols}, {}
+        return {
+            symbol: _demo_bars(symbol, bars_wanted, timeframe) for symbol in symbols
+        }, {}
 
     provider = build_market_data(settings.alpaca, settings.data, use_cache=not args.no_cache)
     logger.info("Fetching %s bars for %d symbol(s)", timeframe.label, len(symbols))
@@ -1218,6 +1353,71 @@ def _stated_portfolio(settings: Settings, args: argparse.Namespace):
     )
 
 
+def cmd_calibrate(settings: Settings, args: argparse.Namespace) -> int:
+    """Measure whether the confidence score predicts anything.
+
+    Backtests the requested symbols, buckets every closed trade by the score it
+    entered on, and reports how each bucket actually resolved. This is the only
+    honest way to attach odds to a ranking: measure them.
+    """
+    symbols = (
+        [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else list(settings.data.watchlist)
+    )
+    names = (
+        available_strategies()
+        if args.strategy.strip().lower() == "all"
+        else [item.strip() for item in args.strategy.split(",") if item.strip()]
+    )
+    start = _parse_date(args.start)
+    end = _parse_date(args.end)
+
+    width = 74
+    print()
+    print("=" * width)
+    print("SCORE CALIBRATION — does a higher score mean a better setup?")
+    print("=" * width)
+    print(f"\nBacktesting {len(symbols)} symbol(s) with {', '.join(names)}...")
+
+    try:
+        request = BacktestRequest(
+            symbols=tuple(symbols),
+            strategies=tuple(names),
+            timeframe=args.timeframe,
+            start=start,
+            end=end,
+            starting_equity=args.capital,
+            risk=settings.risk,
+            use_cache=not args.no_cache,
+        )
+        result = run_backtest(request, settings)
+    except (BacktestDataError, StrategyError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    calibration = calibrate(result.trades)
+    print()
+    for line in calibration.summary_lines():
+        print(line)
+
+    if args.csv and result.trades:
+        path = Path(args.csv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result.trade_frame.to_csv(path, index=False)
+        print(f"\nPer-trade record written to {path}")
+
+    print()
+    print("-" * width)
+    print(
+        "These are historical frequencies, not forward probabilities. A band's\n"
+        "win rate says how setups like it resolved on this data — not what the\n"
+        "next one will do. Read the sample size and the error before the rate."
+    )
+    print("-" * width)
+    return EXIT_OK
+
+
 def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     """Scan the market for swing setups and print an entry plan for each.
 
@@ -1497,6 +1697,302 @@ def _render_entry_plan(opportunity, width: int) -> None:
         print(f"\n  NOT SIZED — {decision.rejection_reason}")
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: universe, detectors and the continuous scanner
+# ---------------------------------------------------------------------------
+
+
+def _watch_symbols(settings: Settings, args: argparse.Namespace) -> tuple[str, ...]:
+    """Resolve the symbol list for a scanner command."""
+    from trading_bot.scanner.factory import resolve_symbols
+
+    if getattr(args, "symbols", None):
+        return normalize_symbols(args.symbols.split(","))
+    if getattr(args, "categories", None):
+        catalogue = load_catalogue(settings.scanner.universe_file)
+        return catalogue.resolve(
+            [part.strip() for part in args.categories.split(",") if part.strip()],
+            include=settings.scanner.extra_symbols,
+            exclude=settings.scanner.exclude_symbols,
+        )
+    return resolve_symbols(settings)
+
+
+def cmd_universe(settings: Settings, args: argparse.Namespace) -> int:
+    """Show the symbol catalogue and what the scanner would watch."""
+    catalogue = load_catalogue(settings.scanner.universe_file)
+    print("Symbol categories")
+    print("-" * 40)
+    print(catalogue.describe())
+
+    symbols = _watch_symbols(settings, args)
+    source = args.categories or ", ".join(settings.scanner.categories)
+    print(f"\nResolved watchlist ({source}): {len(symbols)} symbols")
+    for index in range(0, len(symbols), 10):
+        print("  " + " ".join(f"{symbol:<7}" for symbol in symbols[index : index + 10]))
+
+    warning = stream_capacity_error(symbols)
+    if warning:
+        print(f"\nStreaming: {warning}")
+    else:
+        print("\nStreaming: fits one websocket subscription on the free plan.")
+    if settings.scanner.universe_file:
+        print(f"Universe file: {settings.scanner.universe_file}")
+    return EXIT_OK
+
+
+def _render_detections(analyses, *, top: int, min_score: float) -> None:
+    """Print the ranked detector table."""
+    shown = [a for a in analyses if a.overall >= min_score][:top]
+    if not shown:
+        print("\nNothing above the score threshold.")
+        return
+
+    header = f"{'SYMBOL':<8} {'SCORE':>6} {'DIR':<8} {'AGREE':>6}  SIGNALS"
+    print(f"\n{header}")
+    print("-" * len(header))
+    for analysis in shown:
+        score = analysis.score
+        kinds = ", ".join(
+            f"{signal.signal_type.value.split('_')[0].title()} {signal.strength:.1f}"
+            for signal in score.fired
+        )
+        print(
+            f"{score.symbol:<8} {score.overall:>6.2f} {score.direction.value:<8} "
+            f"{score.agreement:>6.0%}  {kinds or '-'}"
+        )
+
+    best = shown[0]
+    if best.signals:
+        print(f"\nTop candidate\n{'-' * 40}")
+        print(best.score.describe())
+
+
+def cmd_detect(settings: Settings, args: argparse.Namespace) -> int:
+    """Run every detector once over historical bars and rank the results."""
+    from trading_bot.scanner.factory import build_engine
+
+    symbols = _watch_symbols(settings, args)
+    timeframe = Timeframe.parse(args.timeframe or settings.scanner.timeframe)
+    bars_wanted = args.bars or settings.scanner.lookback_bars
+
+    print(f"Detecting on {len(symbols)} symbols, {timeframe.label} bars")
+    print(market_hours.describe())
+
+    frames, failures = _load_bars(settings, args, symbols, timeframe, bars_wanted)
+    if failures:
+        print(f"\n{len(failures)} symbol(s) returned no data: {', '.join(sorted(failures))}")
+    if not frames:
+        print("\nNo bars to analyse.", file=sys.stderr)
+        return EXIT_FAILURE
+
+    analyses = build_engine(settings).analyze_many(frames)
+    failed_detectors = Counter(
+        name for analysis in analyses for name in analysis.failures
+    )
+    if failed_detectors:
+        print(f"\nDetector errors: {dict(failed_detectors)}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps([a.score.as_dict() for a in analyses], indent=2))
+        return EXIT_OK
+
+    _render_detections(analyses, top=args.top, min_score=args.min_score)
+    total = sum(len(a.signals) for a in analyses)
+    print(f"\n{total} signal(s) across {len(analyses)} symbol(s).")
+    print("Ranking only \u2014 no order was placed and none can be from this command.")
+    return EXIT_OK
+
+
+def cmd_watch(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the continuous scanner until interrupted."""
+    import asyncio
+
+    from trading_bot.scanner.factory import (
+        build_alert_manager,
+        build_scanner,
+        build_stream_config,
+    )
+
+    symbols = _watch_symbols(settings, args)
+    if args.timeframe:
+        settings = settings.with_overrides(
+            scanner=settings.scanner.model_copy(update={"timeframe": args.timeframe})
+        )
+    if args.min_score is not None:
+        settings = settings.with_overrides(
+            alerts=settings.alerts.model_copy(update={"min_score": args.min_score})
+        )
+    if args.poll is not None:
+        settings = settings.with_overrides(
+            scanner=settings.scanner.model_copy(update={"poll_seconds": args.poll})
+        )
+
+    database: Database | None = None
+    if not args.no_database:
+        database = Database(settings.data.database_path)
+        database.initialize()
+
+    alerts = build_alert_manager(settings, database=database)
+    scanner = build_scanner(settings, _watch_provider(settings), symbols=symbols, alerts=alerts)
+
+    if database is not None:
+        scanner.on_analysis = _persisting_recorder(database)
+
+    log_banner(
+        logger,
+        "Market scanner starting",
+        {
+            "symbols": len(symbols),
+            "timeframe": scanner.timeframe.label,
+            "feed": settings.alpaca.data_feed,
+            "alert threshold": settings.alerts.min_score,
+            "streaming": not args.no_stream and settings.scanner.stream_enabled,
+        },
+    )
+    print(f"\nWatching {len(symbols)} symbols on {scanner.timeframe.label} bars")
+    print(market_hours.describe())
+    print("This command never places an order. Ctrl-C to stop.\n")
+
+    try:
+        if args.once:
+            cycle = scanner.scan_once()
+            print(f"Cycle complete: {cycle.summary()}")
+            _render_detections(cycle.analyses, top=10, min_score=0.0)
+            return EXIT_OK
+
+        streaming = settings.scanner.stream_enabled and not args.no_stream
+        stream_config = build_stream_config(settings, symbols) if streaming else None
+        asyncio.run(
+            _watch_loop(
+                settings,
+                scanner,
+                stream_config=stream_config,
+                database=database,
+                duration_minutes=args.duration,
+            )
+        )
+        return EXIT_OK
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return EXIT_OK
+    finally:
+        alerts.close()
+        if database is not None:
+            _record_health(database, "scanner", "STOPPED", "Scanner exited", scanner.status())
+            database.close()
+
+
+def _watch_provider(settings: Settings):
+    """Market data for the scanner, cached like every other command."""
+    return build_market_data(settings.alpaca, settings.data, use_cache=True)
+
+
+def _persisting_recorder(database: Database):
+    """Store detector signals and scores as they are produced."""
+
+    def record(analysis) -> None:
+        try:
+            if analysis.signals:
+                database.detector_signals.record_many(analysis.signals)
+                database.opportunities.record(analysis.score)
+        except Exception:  # noqa: BLE001 - persistence must not stop a scan
+            logger.exception("Could not persist analysis for %s", analysis.symbol)
+
+    return record
+
+
+def _record_health(
+    database: Database | None, component: str, status: str, message: str, detail=None
+) -> None:
+    if database is None:
+        return
+    try:
+        database.health.record(
+            component=component, status=status, message=message, detail=detail
+        )
+    except Exception:  # noqa: BLE001 - health logging must never stop the scanner
+        logger.exception("Could not record health event %s/%s", component, status)
+
+
+async def _watch_loop(
+    settings: Settings,
+    scanner,
+    *,
+    stream_config,
+    database: Database | None,
+    duration_minutes: float | None,
+) -> None:
+    """Seed, then either stream or poll until the deadline or an interrupt."""
+    import asyncio
+
+    from trading_bot.data.market_stream import StreamError, StreamSupervisor
+    from trading_bot.scanner.realtime import next_poll_delay
+
+    loop = asyncio.get_running_loop()
+    deadline = (
+        loop.time() + duration_minutes * 60 if duration_minutes is not None else None
+    )
+
+    seeded = await asyncio.to_thread(scanner.seed)
+    print(f"Seeded {len(seeded)} symbols with history.")
+    _record_health(database, "scanner", "STARTED", "Scanner seeded", scanner.status())
+
+    supervisor: StreamSupervisor | None = None
+    if stream_config is not None:
+        supervisor = StreamSupervisor(
+            stream_config,
+            api_key=settings.alpaca.api_key,
+            secret_key=settings.alpaca.secret_key,
+            on_health=lambda event: _record_health(
+                database, event.component, event.status, event.message, event.detail
+            ),
+        )
+        try:
+            await supervisor.start()
+            print(f"Streaming {len(stream_config.symbols)} symbols on the "
+                  f"{stream_config.feed} feed.\n")
+        except StreamError as error:
+            # Streaming is an optimisation, not a requirement: the REST path
+            # produces the same analysis a bar later. Falling back beats
+            # exiting, and the reason is printed rather than buried in a log.
+            print(f"Streaming unavailable, falling back to REST polling:\n  {error}\n")
+            _record_health(database, "stream", "UNAVAILABLE", str(error))
+            supervisor = None
+
+    if supervisor is not None:
+        await _consume_stream(supervisor, scanner, deadline=deadline)
+        await supervisor.stop()
+        return
+
+    delay = settings.scanner.poll_seconds or next_poll_delay(scanner.timeframe)
+    while deadline is None or loop.time() < deadline:
+        cycle = await asyncio.to_thread(scanner.scan_once)
+        logger.info("Scan cycle: %s", cycle.summary())
+        if deadline is not None and loop.time() + delay > deadline:
+            return
+        await asyncio.sleep(delay)
+
+
+async def _consume_stream(supervisor, scanner, *, deadline: float | None) -> None:
+    """Feed streamed bars into the scanner until the deadline."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    while deadline is None or loop.time() < deadline:
+        remaining = None if deadline is None else max(deadline - loop.time(), 0.0)
+        event = await supervisor.next_event(timeout=min(remaining or 5.0, 5.0))
+        if event is None:
+            if not supervisor.running:
+                logger.warning("Stream stopped; ending the scan loop")
+                return
+            continue
+        try:
+            scanner.handle_event(event)
+        except Exception:  # noqa: BLE001 - one bad message is not a dead scanner
+            logger.exception("Failed to process %s event for %s", event.kind, event.symbol)
+
+
 def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
     """Simulate a strategy over historical bars and report what it would have done.
 
@@ -1695,6 +2191,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_clock(settings)
         if args.command == "db-init":
             return cmd_db_init(settings)
+        if args.command == "universe":
+            return cmd_universe(settings, args)
+        if args.command == "detect":
+            return cmd_detect(settings, args)
+        if args.command == "watch":
+            return cmd_watch(settings, args)
         if args.command == "fetch":
             return cmd_fetch(settings, args)
         if args.command == "analyze":
@@ -1703,6 +2205,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_signals(settings, args)
         if args.command == "scan":
             return cmd_scan(settings, args)
+        if args.command == "calibrate":
+            return cmd_calibrate(settings, args)
         if args.command == "hunt":
             return cmd_hunt(settings, args)
         if args.command == "backtest":
@@ -1713,7 +2217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_cache(settings, args)
         parser.error(f"Unknown command {args.command!r}")
         return EXIT_FAILURE
-    except (MarketDataError, ValueError) as error:
+    except (MarketDataError, UniverseConfigError, ValueError) as error:
         logger.error("%s", error)
         print(f"\nError: {error}", file=sys.stderr)
         return EXIT_FAILURE

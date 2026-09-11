@@ -21,7 +21,7 @@ from trading_bot.data.database import Database
 def _isolate_env(monkeypatch):
     """Strip bot-related environment variables so a developer's real .env or
     exported keys cannot influence test outcomes."""
-    for prefix in ("ALPACA_", "RISK_", "DATA_", "LOG_"):
+    for prefix in ("ALPACA_", "RISK_", "DATA_", "LOG_", "SCANNER_", "DETECTOR_", "ALERT_"):
         for key in list(dict(**__import__("os").environ)):
             if key.startswith(prefix):
                 monkeypatch.delenv(key, raising=False)
@@ -134,3 +134,52 @@ def database() -> Database:
     db.initialize()
     yield db
     db.close()
+
+
+def session_bars(
+    *,
+    sessions: int = 12,
+    freq: str = "5min",
+    end_day: str = "2026-09-04",
+    seed: int = 11,
+    volume: tuple[int, int] = (2_000, 3_000),
+    start_price: float = 100.0,
+) -> pd.DataFrame:
+    """Regular-hours intraday bars across several complete trading sessions.
+
+    The detectors group bars into sessions, so a flat 24/7 range would exercise
+    none of that. This puts every bar inside 09:30-16:00 New York, which is what
+    the feed actually returns.
+    """
+    rng = np.random.default_rng(seed)
+    frames = []
+    price = start_price
+    for day in pd.bdate_range(end=end_day, periods=sessions).strftime("%Y-%m-%d"):
+        # 13:30-19:55 UTC is 09:30-15:55 New York while daylight saving is in effect.
+        index = pd.date_range(f"{day} 13:30", f"{day} 19:55", freq=freq, tz="UTC")
+        count = len(index)
+        closes = price * (1 + np.cumsum(rng.normal(0, 0.0012, count)))
+        opens = np.r_[price, closes[:-1]]
+        spread = np.abs(rng.normal(0, 0.0012, count)) * closes
+        frames.append(
+            pd.DataFrame(
+                {
+                    "open": opens,
+                    "high": np.maximum(opens, closes) + spread,
+                    "low": np.minimum(opens, closes) - spread,
+                    "close": closes,
+                    "volume": rng.integers(volume[0], volume[1], count).astype(float),
+                },
+                index=index,
+            )
+        )
+        price = closes[-1]
+    combined = pd.concat(frames)
+    combined.index.name = "timestamp"
+    return combined
+
+
+@pytest.fixture
+def intraday_sessions() -> pd.DataFrame:
+    """Twelve quiet sessions of 5-minute bars."""
+    return session_bars()

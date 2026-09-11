@@ -161,7 +161,9 @@ def _sidebar(settings) -> dict:
         strategies = st.multiselect(
             "Strategies", available_strategies(), default=available_strategies()
         )
-        min_confidence = st.slider("Minimum confidence", 0, 100, 55, step=5)
+        min_confidence = st.slider(
+            "Minimum confidence", 0, 100, int(settings.risk.min_confidence), step=5
+        )
         allow_short = st.checkbox("Allow short signals", value=False)
 
         min_dollar_volume = st.number_input(
@@ -973,7 +975,7 @@ def _backtest(settings, controls: dict, palette) -> None:
             help="Comma-separated. More symbols means a longer run.",
         )
         strategy_names = second.multiselect(
-            "Strategies", available_strategies(), default=["momentum"],
+            "Strategies", available_strategies(), default=["swing_quality"],
         )
         capital = third.number_input(
             "Starting capital", min_value=100.0, value=10_000.0, step=1_000.0,
@@ -1034,8 +1036,11 @@ def _backtest(settings, controls: dict, palette) -> None:
                 update={
                     "max_risk_per_trade_pct": float(risk_pct),
                     "max_open_positions": int(max_positions),
+                    "min_confidence": float(controls["min_confidence"]),
                 }
             ),
+            allow_short=bool(controls["allow_short"]),
+            min_confidence=float(controls["min_confidence"]),
             demo=controls["demo"],
         )
         with st.spinner(f"Simulating {len(symbols)} symbol(s)…"):
@@ -1204,8 +1209,25 @@ def _backtest_result(result, palette) -> None:
         )
     else:
         st.info(
-            "No trades were taken. Widen the date range, lower the confidence "
-            "floor on the Strategy Settings page, or try another strategy."
+            "No trades were taken. That can be the correct result for a selective "
+            "swing system. Use the diagnostics below to see which entry conditions "
+            "blocked candidates before changing thresholds."
+        )
+
+    if getattr(result, "strategy_blockers", None):
+        st.markdown("**Why candidate swings did not become signals**")
+        st.caption(
+            f"{getattr(result, 'evaluations', 0):,} strategy evaluations. "
+            "Counts can overlap because more than one required condition can fail "
+            "on the same bar."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                sorted(result.strategy_blockers.items(), key=lambda item: -item[1])[:15],
+                columns=["Blocked by", "Evaluations"],
+            ),
+            width="stretch",
+            hide_index=True,
         )
 
     if result.rejection_reasons:

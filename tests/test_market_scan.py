@@ -240,3 +240,4 @@ class TestConfigValidation:
     def test_min_score_is_bounded(self):
         with pytest.raises(ValueError, match="min_score"):
             HuntConfig(min_score=150.0)
+

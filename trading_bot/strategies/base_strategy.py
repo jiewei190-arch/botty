@@ -342,6 +342,18 @@ class StrategyConfig:
     allow_short: bool = False
     #: Close a position after this many bars, or None to hold indefinitely.
     max_holding_bars: int | None = None
+    #: Abandon a setup when this fraction of the planned risk is already gone by
+    #: the time it can be filled.
+    #:
+    #: A signal's stop is measured from the bar that produced it, but the fill
+    #: happens at the next bar's open. When price gaps toward the stop overnight,
+    #: the trade is entered with a fraction of the room it was supposed to have
+    #: and is stopped out almost immediately — measured at 0.035% of remaining
+    #: room on a setup whose plan called for 1.48%. The alert said one thing and
+    #: the position was another. Past this fraction the setup no longer exists at
+    #: the available price, which is what a trader with a limit order would
+    #: conclude. 1.0 disables the check.
+    max_entry_drift: float = 0.5
 
     def __post_init__(self) -> None:
         if not 0 <= self.min_confidence <= 100:
@@ -367,6 +379,10 @@ class StrategyConfig:
         if self.max_holding_bars is not None and self.max_holding_bars < 1:
             raise ValueError(
                 f"max_holding_bars must be >= 1 or None, got {self.max_holding_bars}"
+            )
+        if not 0 < self.max_entry_drift <= 1:
+            raise ValueError(
+                f"max_entry_drift must be within (0, 1], got {self.max_entry_drift}"
             )
 
     def with_overrides(self, **overrides: Any) -> StrategyConfig:
@@ -505,17 +521,31 @@ class BaseStrategy(ABC):
         if protective is not None:
             return protective
 
-        if (
-            self.config.max_holding_bars is not None
-            and position.bars_held >= self.config.max_holding_bars
-        ):
-            return ExitSignal(
-                reason=ExitReason.TIME_STOP,
-                price=close,
-                detail=f"Held {position.bars_held} bars, limit is {self.config.max_holding_bars}",
-            )
+        expired = self.check_time_stop(position, price=close)
+        if expired is not None:
+            return expired
 
         return self.evaluate_exit(position, prepared)
+
+    def check_time_stop(self, position: Position, *, price: float) -> ExitSignal | None:
+        """Whether the holding-period cap has been reached.
+
+        Split out of :meth:`should_exit` because the two callers need different
+        parts of it. The backtester handles protective exits itself — it has the
+        bar's high and low and fills them intrabar — and so asks only for the
+        discretionary and time-based decisions, which fill at the next open.
+        Leaving the cap buried inside ``should_exit`` meant it was never reached
+        from a backtest, and a strategy declaring ``max_holding_bars=20`` quietly
+        held positions for thirty bars.
+        """
+        limit = self.config.max_holding_bars
+        if limit is None or position.bars_held < limit:
+            return None
+        return ExitSignal(
+            reason=ExitReason.TIME_STOP,
+            price=price,
+            detail=f"Held {position.bars_held} bars, limit is {limit}",
+        )
 
     def _check_protective_exits(
         self, position: Position, *, high: float, low: float
@@ -803,3 +833,29 @@ def _timestamp_of(data: pd.DataFrame) -> datetime:
     if isinstance(stamp, pd.Timestamp):
         return stamp.to_pydatetime()
     raise InvalidDataError(f"Expected a timestamp index, got {type(stamp).__name__}")
+
+
+def entry_drift_fraction(signal: Signal, fill_price: float) -> float:
+    """How much of a signal's planned risk is already gone at ``fill_price``.
+
+    ``0.0`` means the fill is at or better than the signalled entry; ``1.0``
+    means price has reached the stop before the position even opened. Values
+    above 1 are possible when a gap jumps clean through it.
+
+    Returns ``0.0`` when the signal has no usable risk distance, so a degenerate
+    stop cannot make every entry look invalid.
+    """
+    planned_risk = abs(signal.entry_price - signal.stop_loss)
+    if planned_risk <= 0:
+        return 0.0
+    # Adverse movement is toward the stop: down for a long, up for a short.
+    adverse = (signal.entry_price - fill_price) * signal.direction.sign
+    return max(adverse, 0.0) / planned_risk
+
+
+def entry_still_valid(signal: Signal, fill_price: float, *, limit: float) -> bool:
+    """Whether a setup still exists at the price it can actually be filled.
+
+    ``limit`` is :attr:`StrategyConfig.max_entry_drift`.
+    """
+    return entry_drift_fraction(signal, fill_price) <= limit

@@ -64,7 +64,9 @@ from trading_bot.strategies import (
     Position,
     Signal,
     SignalDirection,
+    explain_blockers,
 )
+from trading_bot.strategies.base_strategy import entry_still_valid
 from trading_bot.utils.timeframes import Timeframe
 
 logger = logging.getLogger(__name__)
@@ -75,7 +77,10 @@ class BacktestConfig:
     """How the simulation is run."""
 
     starting_equity: float = 10_000.0
-    timeframe: str = "15Min"
+    #: Bar size, which also sets the periods-per-year used to annualise Sharpe.
+    #: Daily to match the rest of the project; a backtest run at another bar size
+    #: must say so, or its risk-adjusted numbers are scaled by the wrong root.
+    timeframe: str = "1Day"
     costs: CostModel = field(default_factory=CostModel)
     risk: RiskSettings = field(default_factory=RiskSettings)
     #: Close any position still open when the data ends. Leaving them open would
@@ -148,6 +153,8 @@ class BacktestResult:
     signals_generated: int = 0
     signals_rejected: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
+    strategy_blockers: dict[str, int] = field(default_factory=dict)
+    evaluations: int = 0
 
     @property
     def trade_frame(self) -> pd.DataFrame:
@@ -186,6 +193,8 @@ class BacktestResult:
             "signals_generated": self.signals_generated,
             "signals_rejected": self.signals_rejected,
             "rejection_reasons": dict(self.rejection_reasons),
+            "strategy_blockers": dict(self.strategy_blockers),
+            "evaluations": self.evaluations,
             "trades": self.trades,
         }
 
@@ -232,6 +241,8 @@ class Backtester:
         self._signals = 0
         self._rejected = 0
         self._rejections: dict[str, int] = {}
+        self._strategy_blockers: dict[str, int] = {}
+        self._evaluations = 0
 
     def _equity_now(self, prices: dict[str, float]) -> float:
         held = sum(
@@ -382,6 +393,8 @@ class Backtester:
             signals_generated=self._signals,
             signals_rejected=self._rejected,
             rejection_reasons=self._rejections,
+            strategy_blockers=self._strategy_blockers,
+            evaluations=self._evaluations,
         )
 
     # -- steps -------------------------------------------------------------------
@@ -395,6 +408,13 @@ class Backtester:
             self._current_day = day
             self._realised_today = 0.0
 
+    def _config_for(self, name: str) -> Any:
+        """The config of the strategy that produced a signal, if it is loaded."""
+        for strategy in self.strategies:
+            if strategy.name == name:
+                return strategy.config
+        return None
+
     def _fill_pending(
         self, bars: dict[str, Any], stamp: pd.Timestamp, step: int
     ) -> None:
@@ -405,6 +425,21 @@ class Backtester:
             if bar is None:
                 continue  # symbol has no bar here; the intent expires
             if symbol in self._positions:
+                continue
+
+            # The stop was measured from the bar that produced the signal; the
+            # fill happens here, one bar later. If price has already travelled
+            # most of the way to the stop overnight, the setup that was signalled
+            # is not the one on offer, and taking it buys a near-certain
+            # stop-out at a fraction of the intended room.
+            strategy_config = self._config_for(signal.strategy)
+            if strategy_config is not None and not entry_still_valid(
+                signal, float(bar["open"]), limit=strategy_config.max_entry_drift
+            ):
+                self._rejected += 1
+                self._rejections["gapped past the entry"] = (
+                    self._rejections.get("gapped past the entry", 0) + 1
+                )
                 continue
 
             closes = {name: float(row["close"]) for name, row in bars.items()}
@@ -518,12 +553,19 @@ class Backtester:
             if row is None:
                 continue
             history = prepared[symbol].iloc[: row + 1]
+            close = float(history["close"].iloc[-1])
             for strategy in self.strategies:
                 if strategy.name != position.strategy:
                     continue
-                exit_signal = strategy.evaluate_exit(
-                    position.to_strategy_position(), history
-                )
+                view = position.to_strategy_position()
+                # The holding-period cap first: a strategy that has run out of
+                # time should leave regardless of what its discretionary logic
+                # thinks. Protective exits are not asked for here — they are
+                # filled intrabar by `_process_exits`, which has the bar's high
+                # and low; these fill at the next open.
+                exit_signal = strategy.check_time_stop(
+                    view, price=close
+                ) or strategy.evaluate_exit(view, history)
                 if exit_signal is not None:
                     self._pending_exits[symbol] = exit_signal.reason.value
                     break
@@ -551,15 +593,29 @@ class Backtester:
             history = frame.iloc[: row + 1]
 
             for strategy in self.strategies:
+                self._evaluations += 1
                 try:
                     signal = strategy.generate_signal(symbol, history)
                 except Exception:  # noqa: BLE001 - one symbol must not stop the run
                     logger.exception("%s failed on %s at %s", strategy.name, symbol, stamp)
+                    key = f"{strategy.name}: evaluation_error"
+                    self._strategy_blockers[key] = self._strategy_blockers.get(key, 0) + 1
                     continue
                 if signal is not None:
                     self._signals += 1
                     self._pending.append((symbol, signal))
                     break  # one position per symbol; first strategy wins
+
+                blockers = explain_blockers(strategy)
+                if blockers:
+                    for blocker in blockers:
+                        key = f"{strategy.name}: {blocker}"
+                        self._strategy_blockers[key] = self._strategy_blockers.get(key, 0) + 1
+                elif strategy.last_evaluation:
+                    # Required conditions passed but generate_signal still returned
+                    # None: the confidence floor is the usual remaining gate.
+                    key = f"{strategy.name}: confidence_floor"
+                    self._strategy_blockers[key] = self._strategy_blockers.get(key, 0) + 1
 
     def _close(
         self, symbol: str, fill: Fill, stamp: pd.Timestamp, reason: str
@@ -615,6 +671,11 @@ class Backtester:
                 "r_multiple": r_multiple,
                 "bars_held": position.bars_held,
                 "exit_reason": reason,
+                # The score this setup carried when it was entered. Without it
+                # a backtest can say how the strategy did overall but not
+                # whether its own ranking meant anything, which is the question
+                # that decides if the ranking is worth reading.
+                "confidence": position.signal.confidence,
                 "gapped": fill.gapped,
             }
         )

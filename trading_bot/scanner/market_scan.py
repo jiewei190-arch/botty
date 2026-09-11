@@ -260,19 +260,28 @@ def sweep_market(
         )
 
     # Prepare indicators once per symbol, then let every strategy read them.
+    #
+    # Memory, measured rather than guessed: about 158 MB of interpreter and
+    # libraries, plus 0.15 MB per symbol. A 4,000-symbol sweep therefore needs
+    # roughly 750 MB, which fits the ~1 GB a small hosted container provides.
+    #
+    # Releasing each raw frame as its enriched replacement is built was tried
+    # and reverted. It saved only 6% — the indicator columns dominate, the raw
+    # bars are a small share — and paid for that by emptying the caller's
+    # universe as a side effect, which broke four unrelated tests within a
+    # minute of existing. Headroom that is not needed is not worth a surprise.
     stage_started = time.perf_counter()
     prepared: dict[str, pd.DataFrame] = {}
+    total = len(frames)
     for index, (symbol, frame) in enumerate(frames.items(), start=1):
         try:
             prepared[symbol] = strategies[0].prepare(frame)
         except Exception as error:  # noqa: BLE001 - one symbol must not stop a sweep
             logger.debug("Could not prepare %s: %s", symbol, error)
         if progress is not None and index % 100 == 0:
-            progress(index, len(frames))
+            progress(index, total)
     stages.append(
-        SweepStage(
-            "indicators", len(frames), len(prepared), time.perf_counter() - stage_started
-        )
+        SweepStage("indicators", total, len(prepared), time.perf_counter() - stage_started)
     )
 
     scanner = MarketScanner(

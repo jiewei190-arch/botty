@@ -6,6 +6,7 @@ from trading_bot.universe.discovery import (
     Universe,
     UniverseError,
     build_universe,
+    explain_auth_failure,
     screen_liquidity,
     screen_static,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "UniverseError",
     "UniverseFilter",
     "build_universe",
+    "explain_auth_failure",
     "feed_liquidity_warning",
     "passes_liquidity_filters",
     "passes_static_filters",

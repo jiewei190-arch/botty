@@ -40,6 +40,55 @@ logger = logging.getLogger(__name__)
 ASSET_CACHE_TTL = timedelta(hours=20)
 
 
+#: Alpaca issues paper keys with a ``PK`` prefix and live keys with ``AK``.
+#: The prefix is the one thing about a rejected credential that can be checked
+#: without a working connection, so it is the only cause below stated as fact
+#: rather than as a possibility.
+PAPER_KEY_PREFIX = "PK"
+
+
+def explain_auth_failure(api_key: str, error: object) -> str:
+    """Turn Alpaca's 401 into something a person can act on.
+
+    Alpaca answers every rejected credential with the same body — literally
+    ``{"message": "unauthorized."}`` — for at least four different causes. A
+    newly created account whose compliance review has not cleared yet reads
+    exactly like a mistyped secret, which sends people to check the wrong
+    thing. This names the causes in the order they actually occur.
+    """
+    key = (api_key or "").strip()
+    lines = [
+        "Alpaca rejected these credentials. It answers every rejected "
+        "credential the same way, so this cannot tell the causes apart — "
+        "they are listed in the order they usually occur:",
+        "",
+        "  1. The account is still under review. A new Alpaca account cannot "
+        "use its keys until the compliance check clears, usually a few hours "
+        "to a couple of days. The dashboard shows a banner while it is "
+        "pending, and key regeneration fails too.",
+        "  2. The key and secret are from different pairs. Regenerating "
+        "issues a new pair and invalidates the old one at once, so a new key "
+        "kept with an old secret fails exactly like a wrong key. Replace both "
+        "together, from the same screen.",
+        "  3. A copy-paste error — a trailing space, or a secret truncated "
+        "at the end. One missing character fails identically to a wrong key.",
+    ]
+    if key and not key.upper().startswith(PAPER_KEY_PREFIX):
+        lines.append(
+            f"  4. **These look like live-account keys** — this key starts "
+            f"{key[:2]!r}, and paper keys start 'PK'. The asset list is read "
+            "from the paper endpoint, and Alpaca keeps separate pairs for "
+            "paper and live. Generate keys from the Paper dashboard."
+        )
+    else:
+        lines.append(
+            "  4. Live-account keys used against the paper endpoint. Ruled "
+            "out here: this key has the 'PK' prefix of a paper key."
+        )
+    lines += ["", f"Alpaca said: {error}"]
+    return "\n".join(lines)
+
+
 class UniverseError(RuntimeError):
     """The universe could not be built."""
 
@@ -63,7 +112,7 @@ class Universe:
 
     @property
     def total_dollar_volume(self) -> float:
-        return sum(profile.avg_dollar_volume for profile in self.profiles.values())
+        return sum(profile.median_dollar_volume for profile in self.profiles.values())
 
     def summary_lines(self) -> list[str]:
         lines = ["Static filters (no price data needed):"]
@@ -82,15 +131,15 @@ class Universe:
             {
                 "symbol": profile.symbol,
                 "last_close": profile.last_close,
-                "avg_dollar_volume": profile.avg_dollar_volume,
-                "avg_volume": profile.avg_volume,
+                "median_dollar_volume": profile.median_dollar_volume,
+                "median_volume": profile.median_volume,
                 "atr_pct": profile.atr_pct,
                 "bars": profile.bars,
             }
             for profile in self.profiles.values()
         ]
         frame = pd.DataFrame(rows)
-        return frame.sort_values("avg_dollar_volume", ascending=False, ignore_index=True)
+        return frame.sort_values("median_dollar_volume", ascending=False, ignore_index=True)
 
 
 class AssetCatalogue:
@@ -163,6 +212,10 @@ class AssetCatalogue:
         try:
             assets = client.get_all_assets(request)
         except Exception as error:  # noqa: BLE001 - surfaced with context
+            if _is_auth_failure(error):
+                raise UniverseError(
+                    explain_auth_failure(self._settings.api_key, error)
+                ) from error
             raise UniverseError(f"Could not fetch the asset list: {error}") from error
 
         records = [_asset_to_dict(asset) for asset in assets]
@@ -199,6 +252,17 @@ class AssetCatalogue:
             )
         except OSError as error:
             logger.warning("Could not write the asset cache: %s", error)
+
+
+def _is_auth_failure(error: object) -> bool:
+    """Whether an exception is Alpaca refusing the credentials.
+
+    Matched on the message rather than a status attribute: the SDK raises
+    several exception types here, and reading ``.code`` on one of them
+    re-parses the response body and can raise again on a non-JSON error page.
+    """
+    text = str(error).lower()
+    return "unauthorized" in text or "401" in text or "forbidden" in text
 
 
 def _asset_to_dict(asset: Any) -> dict[str, Any]:
@@ -262,8 +326,30 @@ def screen_liquidity(
             continue
         profiles[symbol] = profile
 
+    # Staleness, judged against the rest of the universe rather than the clock.
+    #
+    # A delisted or indefinitely halted stock keeps its full history, so every
+    # per-symbol check passes: it screens as liquid on a year-old record and
+    # ranks like anything else. What gives it away is that the market moved on
+    # without it — so the newest bar anyone has is the reference, and a symbol
+    # far behind that has stopped trading. Comparing to the universe rather
+    # than to now also means replaying a past date behaves like a live scan
+    # instead of rejecting everything.
+    stamped = [p.last_bar for p in profiles.values() if p.last_bar is not None]
+    if stamped and filters.max_staleness_days > 0:
+        newest = max(stamped)
+        cutoff = newest - pd.Timedelta(days=filters.max_staleness_days)
+        fresh: dict[str, LiquidityProfile] = {}
+        for symbol, profile in profiles.items():
+            if profile.last_bar is not None and profile.last_bar < cutoff:
+                behind = (newest - profile.last_bar).days
+                report.drop(f"last traded {behind} days behind the market")
+                continue
+            fresh[symbol] = profile
+        profiles = fresh
+
     ranked = sorted(
-        profiles.values(), key=lambda item: -item.avg_dollar_volume
+        profiles.values(), key=lambda item: -item.median_dollar_volume
     )
     if filters.max_symbols is not None and len(ranked) > filters.max_symbols:
         report.drop(

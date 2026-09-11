@@ -16,6 +16,13 @@ here errs pessimistic on purpose — see :mod:`trading_bot.backtesting.execution
 for the three assumptions that decide whether it resembles reality.
 """
 
+from trading_bot.backtesting.calibration import (
+    DEFAULT_BANDS,
+    MIN_BAND_SAMPLE,
+    Calibration,
+    ScoreBand,
+    calibrate,
+)
 from trading_bot.backtesting.engine import (
     BacktestConfig,
     Backtester,
@@ -37,6 +44,11 @@ from trading_bot.backtesting.metrics import (
 )
 
 __all__ = [
+    "MIN_BAND_SAMPLE",
+    "DEFAULT_BANDS",
+    "calibrate",
+    "ScoreBand",
+    "Calibration",
     "Backtester",
     "BacktestConfig",
     "BacktestResult",
