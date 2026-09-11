@@ -401,6 +401,12 @@ class OptionsSettings(BaseSettings):
     max_contracts_per_trade: int = Field(default=4, ge=1, le=4)
     max_total_contracts: int = Field(default=4, ge=1, le=20)
     max_open_positions: int = Field(default=2, ge=1, le=5)
+    #: How many underlyings a single scan may look up a chain for, and therefore
+    #: how many swing alerts it can send. This bounds API usage; it is not a risk
+    #: control. The premium and position caps above govern *orders* — using them
+    #: to gate alerts as well meant a manually-traded account went quiet after
+    #: the second name in a scan, losing the setups ranked below it.
+    max_alerts_per_scan: int = Field(default=8, ge=1, le=25)
     #: The holding window the contract has to survive. Matches the equity swing
     #: strategy's 7-30 calendar days; it was 60, which no longer describes what
     #: the strategy does.

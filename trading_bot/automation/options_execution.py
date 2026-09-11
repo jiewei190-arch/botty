@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from trading_bot.options import SwingOptionSelector
 
@@ -46,20 +46,26 @@ class OptionPaperExecutor:
             logger.exception("Option notification failed")
 
     def execute(self, opportunities, capacity: int) -> OptionExecutionReport:
+        """Alert on every ranked setup; submit only what the caps allow.
+
+        Alerting and ordering are separated deliberately. The premium budget,
+        the position count and the per-scan capacity exist to protect capital,
+        so they gate **orders**. Letting them gate **alerts** too meant a
+        manually-traded account went quiet after the second name in a scan and
+        the reader simply never saw the third-ranked setup — the caps were
+        silently rationing information rather than money. Every candidate that
+        resolves to a real contract is now named, with what Botty did about it.
+
+        The one candidate still passed over in silence is an underlying Botty
+        already holds, where a second alert is a duplicate rather than news.
+        """
         considered = list(opportunities)
         decisions: list[OptionExecutionDecision] = []
         active = self.db.option_selections.active()
-        active_underlyings = {row["underlying_symbol"] for row in active}
-        if len(active_underlyings) >= self.settings.options.max_open_positions:
-            for opportunity in considered:
-                decisions.append(OptionExecutionDecision(
-                    opportunity.signal.symbol, False,
-                    "not approved: maximum open Botty positions already reached",
-                ))
-            return OptionExecutionReport(
-                skipped=len(considered), decisions=tuple(decisions)
-            )
         held_underlyings = {row["underlying_symbol"] for row in active}
+        positions_full = (
+            len(held_underlyings) >= self.settings.options.max_open_positions
+        )
         remaining_premium = max(
             0.0, self.settings.options.max_total_premium
             - self.db.option_selections.premium_committed()
@@ -69,38 +75,62 @@ class OptionPaperExecutor:
             - self.db.option_selections.contracts_committed()
         )
         placed = alerted = skipped = failed = 0
-        selection_limit = max(0, capacity)
+        order_capacity = max(0, capacity)
+        lookups = 0
         for opportunity in considered:
             signal = opportunity.signal
             decision = opportunity.decision
-            skip_reason = None
             if signal.symbol in held_underlyings:
-                skip_reason = "not approved: Botty already tracks this underlying"
-            elif placed + alerted >= selection_limit:
-                skip_reason = "not approved: account capacity filled by higher-ranked contracts"
-            elif len(held_underlyings) >= self.settings.options.max_open_positions:
-                skip_reason = "not approved: maximum open Botty positions reached"
-            elif remaining_contracts < 1:
-                skip_reason = "not approved: total contract limit reached"
-            elif decision is None:
-                skip_reason = "not approved: no risk decision was available"
-            elif not decision.approved:
-                detail = getattr(decision, "rejection_reason", None) or "risk checks failed"
-                skip_reason = f"not approved: {detail}"
-            if skip_reason:
                 skipped += 1
-                decisions.append(OptionExecutionDecision(signal.symbol, False, skip_reason))
+                decisions.append(OptionExecutionDecision(
+                    signal.symbol, False,
+                    "not approved: Botty already tracks this underlying",
+                ))
                 continue
+            if lookups >= self.settings.options.max_alerts_per_scan:
+                skipped += 1
+                decisions.append(OptionExecutionDecision(
+                    signal.symbol, False,
+                    "not approved: per-scan alert budget spent on higher-ranked setups",
+                ))
+                continue
+            # Why no order goes out. This no longer suppresses the alert.
+            order_block = None
+            if positions_full:
+                order_block = "maximum open Botty positions reached"
+            elif placed >= order_capacity:
+                order_block = "account capacity filled by higher-ranked contracts"
+            elif remaining_contracts < 1:
+                order_block = "total contract limit reached"
+            elif decision is None:
+                order_block = "no risk decision was available"
+            elif not decision.approved:
+                order_block = (
+                    getattr(decision, "rejection_reason", None) or "risk checks failed"
+                )
             selection_id = None
             try:
+                lookups += 1
                 quotes = self.chain.quotes(
                     signal.symbol, signal.direction.value, signal.entry_price
+                )
+                # A blocked candidate is sized against the full per-trade
+                # budget rather than what is left of the account's: no order is
+                # going out, and an alert should name the contract worth buying
+                # rather than one shrunk to fit capacity the reader does not share.
+                budget = (
+                    self.settings.options.max_premium_per_trade
+                    if order_block else remaining_premium
+                )
+                contract_room = (
+                    self.settings.options.max_contracts_per_trade
+                    if order_block else remaining_contracts
                 )
                 selection = self.selector.select(
                     direction=signal.direction.value, quotes=quotes, as_of=date.today(),
                     confidence=opportunity.confidence,
-                    remaining_premium=remaining_premium,
-                    remaining_contracts=remaining_contracts,
+                    remaining_premium=budget,
+                    remaining_contracts=contract_room,
                 )
                 if selection is None:
                     skipped += 1
@@ -143,25 +173,47 @@ class OptionPaperExecutor:
                     f"at ${quote.ask:.2f}; premium ${selection.estimated_cost:,.0f}, "
                     f"{selection.days_to_expiry} DTE ({quote.symbol})"
                 )
-                alert_message = (
-                    f"BOTTY SWING ALERT: {signal.symbol} {signal.direction.value} "
-                    f"({opportunity.confidence:.0f}/100) | "
-                    f"{quote.contract_type.upper()} ${quote.strike:,.2f} "
-                    f"exp {quote.expiration.isoformat()} | {quote.symbol} "
-                    f"x{selection.quantity} @ suggested limit ${quote.ask:.2f} | "
-                    f"estimated premium ${selection.estimated_cost:,.0f} | "
-                    f"{selection.days_to_expiry} DTE"
+                # Written for a phone. The contract is the headline because it
+                # is the thing actually bought; everything else is support.
+                strike = (
+                    f"{quote.strike:,.0f}" if float(quote.strike).is_integer()
+                    else f"{quote.strike:,.2f}"
                 )
+                exit_by = quote.expiration - timedelta(
+                    days=self.settings.options.exit_before_expiry_days
+                )
+                alert_message = (
+                    f"BOTTY SWING ALERT — {signal.symbol} "
+                    f"{signal.direction.value} ({opportunity.confidence:.0f}/100)\n"
+                    f"  {signal.symbol} ${strike} {quote.contract_type.upper()}"
+                    f"  {quote.expiration.isoformat()}  ({selection.days_to_expiry} DTE)\n"
+                    f"  Buy x{selection.quantity} @ limit ${quote.ask:.2f}"
+                    f"   —   premium ${selection.estimated_cost:,.0f}\n"
+                    f"  Stock ${signal.entry_price:,.2f} · "
+                    f"stop ${signal.stop_loss:,.2f} · "
+                    f"target ${signal.take_profit:,.2f}\n"
+                    f"  Hold {self.settings.options.planned_min_hold_days}-"
+                    f"{self.settings.options.planned_max_hold_days} days; "
+                    f"close by {exit_by.isoformat()}\n"
+                    f"  {quote.symbol}"
+                )
+                if order_block:
+                    self.db.option_selections.set_status(selection_id, "alerted")
+                    alerted += 1
+                    skipped += 1
+                    decisions.append(OptionExecutionDecision(
+                        signal.symbol, False,
+                        f"alerted, no order ({order_block}): {contract_summary}",
+                    ))
+                    self._notify(f"{alert_message}\n  NO ORDER: {order_block}.")
+                    continue
                 if self.settings.options.alert_only:
                     self.db.option_selections.set_status(selection_id, "alerted")
-                    remaining_premium -= selection.estimated_cost
-                    remaining_contracts -= selection.quantity
-                    held_underlyings.add(signal.symbol)
                     alerted += 1
                     decisions.append(OptionExecutionDecision(
                         signal.symbol, True, f"approved alert: {contract_summary}",
                     ))
-                    self._notify(f"{alert_message} | ALERT ONLY — NO ORDER SUBMITTED.")
+                    self._notify(f"{alert_message}\n  ALERT ONLY — NO ORDER SUBMITTED.")
                     continue
                 client_id = (
                     f"botty-opt-{date.today():%Y%m%d}-{signal.symbol}-"
@@ -180,16 +232,17 @@ class OptionPaperExecutor:
                     raw={"underlying": signal.symbol, "instrument": "option"},
                 )
                 self.db.option_selections.set_status(selection_id, "submitted")
+                # Only a real order consumes the account's capacity. An alert
+                # spends nothing, so it must not decrement these.
                 remaining_premium -= selection.estimated_cost
                 remaining_contracts -= selection.quantity
                 held_underlyings.add(signal.symbol)
                 placed += 1
+                alerted += 1
                 decisions.append(OptionExecutionDecision(
                     signal.symbol, True, f"approved: {contract_summary}",
                 ))
-                self._notify(
-                    f"{alert_message} | PAPER ORDER SUBMITTED."
-                )
+                self._notify(f"{alert_message}\n  PAPER ORDER SUBMITTED.")
             except Exception as error:  # noqa: BLE001 - isolate one candidate
                 failed += 1
                 decisions.append(OptionExecutionDecision(
