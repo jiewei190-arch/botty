@@ -62,8 +62,14 @@ class AlpacaOptionChain:
         if not contracts:
             return []
         symbols = [str(contract.symbol) for contract in contracts]
+        # The feed is stated rather than defaulted. Alpaca serves OPRA to paid
+        # plans and an indicative feed to the free one; leaving it unset asks for
+        # whatever the account happens to have, which makes a failure here depend
+        # on the subscription instead of on the code.
         snapshots = self.data_client.get_option_snapshot(
-            OptionSnapshotRequest(symbol_or_symbols=symbols)
+            OptionSnapshotRequest(
+                symbol_or_symbols=symbols, feed=self.settings.alpaca.options_feed
+            )
         )
         output: list[OptionQuote] = []
         for contract in contracts:
@@ -71,18 +77,23 @@ class AlpacaOptionChain:
             snap = snapshots.get(symbol) if hasattr(snapshots, "get") else None
             quote = getattr(snap, "latest_quote", None)
             greeks = getattr(snap, "greeks", None)
-            daily = getattr(snap, "daily_bar", None)
             if quote is None:
                 continue
+            # No daily volume here on purpose: an option snapshot carries the
+            # latest trade, latest quote, implied volatility and greeks, and
+            # nothing else. Reading a `daily_bar` off it returned None every
+            # time, so every contract scored zero volume and a non-zero
+            # `min_daily_volume` rejected the entire chain in silence. Open
+            # interest below comes from the contract record, which does have it.
             output.append(OptionQuote(
                 symbol=symbol, underlying=underlying.upper(),
                 contract_type=_value(contract.type),
                 expiration=contract.expiration_date,
                 strike=_number(contract.strike_price), bid=_number(quote.bid_price),
                 ask=_number(quote.ask_price), delta=getattr(greeks, "delta", None),
-                daily_volume=int(_number(getattr(daily, "volume", 0))),
                 open_interest=int(_number(getattr(contract, "open_interest", 0))),
                 implied_volatility=getattr(snap, "implied_volatility", None),
+                underlying_price=underlying_price,
             ))
         return output
 

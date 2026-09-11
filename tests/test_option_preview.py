@@ -11,7 +11,7 @@ class Chain:
             symbol=f"{underlying}261120C00250000",
             underlying=underlying,
             contract_type="call" if direction == "LONG" else "put",
-            expiration=date(2026, 10, 16),
+            expiration=date(2026, 11, 20),
             strike=underlying_price,
             bid=5.0,
             ask=5.2,
@@ -48,8 +48,8 @@ def test_option_preview_returns_human_readable_contract(database, settings):
 
     assert rows[0]["Type"] == "CALL"
     assert rows[0]["Strike"] == 250.0
-    assert rows[0]["Expiration"] == "2026-10-16"
-    assert rows[0]["DTE"] == (date(2026, 10, 16) - date(2026, 9, 9)).days
+    assert rows[0]["Expiration"] == "2026-11-20"
+    assert rows[0]["DTE"] == (date(2026, 11, 20) - date(2026, 9, 9)).days
     assert rows[0]["Status"] == "QUALIFIES — preview only"
 
 

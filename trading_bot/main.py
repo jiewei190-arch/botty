@@ -39,6 +39,7 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 # Allow `python main.py` from the repository root without installing the package.
@@ -279,6 +280,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo", action="store_true", help="Use generated sample data — no API keys needed."
     )
     scan.add_argument("--no-cache", action="store_true", help="Bypass the parquet cache.")
+    scan.add_argument(
+        "--no-options", action="store_true",
+        help="Print the stock plan only; skip looking up an option contract for each setup.",
+    )
 
     calibrate_cmd = subparsers.add_parser(
         "calibrate",
@@ -383,6 +388,10 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument(
         "--watch-market", action="store_true",
         help="Stay online and run once whenever Alpaca reports a new market session open.",
+    )
+    hunt.add_argument(
+        "--no-options", action="store_true",
+        help="Print the stock plan only; skip looking up an option contract for each setup.",
     )
 
     backtest = subparsers.add_parser(
@@ -1298,8 +1307,16 @@ def cmd_scan(settings: Settings, args: argparse.Namespace) -> int:
                 result.blockers.items(), key=lambda item: -item[1]
             )[:8]:
                 print(f"  {count:>3}x  {name}")
+    tradable = [o for o in result.opportunities if o.decision and o.decision.approved]
+    contracts = _option_contracts(
+        settings,
+        SimpleNamespace(opportunities=tradable, concurrent_capacity=len(tradable)),
+        skip=args.no_options,
+    )
     for opportunity in result.opportunities:
-        _render_opportunity(opportunity, width)
+        _render_opportunity(
+            opportunity, width, contracts.get(opportunity.signal.symbol)
+        )
 
     if result.opportunities:
         print("\n" + "=" * width)
@@ -1334,7 +1351,7 @@ def cmd_scan(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _render_opportunity(opportunity, width: int) -> None:
+def _render_opportunity(opportunity, width: int, contract: dict | None = None) -> None:
     """Print one ranked opportunity."""
     signal = opportunity.signal
     print()
@@ -1359,6 +1376,15 @@ def _render_opportunity(opportunity, width: int) -> None:
           f"  ({signal.stop_distance_pct:.2f}% away)")
     print(f"Take Profit     : ${signal.take_profit:,.2f}")
     print(f"Risk/Reward     : 1:{signal.risk_reward_ratio:.2f}")
+    if contract:
+        if "Strike" in contract:
+            print(
+                f"Option          : {contract['Underlying']} ${contract['Strike']:g} "
+                f"{contract['Type']} {contract['Expiration']} ({contract['DTE']}DTE)"
+                f"  x{contract['Contracts']} @ ${contract['Limit']:.2f}"
+            )
+        else:
+            print(f"Option          : {contract.get('Status', 'no contract')}")
 
     decision = opportunity.decision
     if decision is None:
@@ -1730,8 +1756,9 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     print("=" * width)
     print(f"{len(sweep.opportunities)} SETUP(S) — sized for a ${equity:,.0f} account")
     print("=" * width)
+    contracts = _option_contracts(settings, sweep, skip=args.no_options)
     for opportunity in sweep.opportunities:
-        _render_entry_plan(opportunity, width)
+        _render_entry_plan(opportunity, width, contracts.get(opportunity.signal.symbol))
 
     print()
     print("-" * width)
@@ -1800,7 +1827,50 @@ def cmd_hunt(settings: Settings, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _render_entry_plan(opportunity, width: int) -> None:
+def _option_contracts(settings: Settings, sweep, *, skip: bool) -> dict[str, dict]:
+    """Pick the contract behind each setup, keyed by underlying.
+
+    Best-effort by design: option chains are a second API and a second
+    subscription, and a scan that dies because the chain endpoint is unavailable
+    would be worse than one that prints the stock plan without a contract. Any
+    failure explains itself once and leaves the equity plan intact.
+    """
+    if skip or not settings.options.enabled or not sweep.opportunities:
+        return {}
+    if not settings.alpaca.has_credentials:
+        return {}
+    try:
+        from trading_bot.options.preview import preview_option_trades
+
+        rows = preview_option_trades(
+            settings, sweep.opportunities, capacity=sweep.concurrent_capacity
+        )
+    except Exception as error:  # noqa: BLE001 - a missing chain is not a failed scan
+        logger.warning("Option contracts unavailable: %s", error)
+        print(f"\n  (option contracts unavailable: {error})")
+        return {}
+    return {row["Underlying"]: row for row in rows}
+
+
+def _render_contract(contract: dict | None) -> None:
+    """Print the contract a setup would be traded through, if there is one."""
+    if not contract:
+        return
+    if "Strike" not in contract:
+        print(f"  {'Option':<12} {'':>6}        {contract.get('Status', 'no contract')}")
+        return
+    print(
+        f"  {'Option':<12} {contract['Contracts']:>6} x  "
+        f"{contract['Underlying']} ${contract['Strike']:g} {contract['Type']} "
+        f"{contract['Expiration']} ({contract['DTE']}DTE)"
+    )
+    print(
+        f"  {'':<12} {'':>6}        limit ${contract['Limit']:.2f}/contract"
+        f"   (premium ${contract['Estimated premium']:,.0f})"
+    )
+
+
+def _render_entry_plan(opportunity, width: int, contract: dict | None = None) -> None:
     """Print one setup as a plan you could work from."""
     signal = opportunity.signal
     decision = opportunity.decision
@@ -1830,6 +1900,7 @@ def _render_entry_plan(opportunity, width: int) -> None:
           f"   ({stop_pct:.2f}% away)")
     print(f"  {'Target':<12} {'':>6}        ${signal.take_profit:,.2f}"
           f"   ({target_pct:.2f}% away)")
+    _render_contract(contract)
 
     if decision is not None and decision.approved:
         print(

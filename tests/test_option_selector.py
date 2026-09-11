@@ -6,7 +6,10 @@ from trading_bot.options import OptionQuote, SwingOptionSelector
 TODAY = date(2026, 9, 8)
 
 
-def quote(*, dte=30, ask=5.2, bid=5.0, delta=0.6, kind="call"):
+SETTINGS = OptionsSettings()
+
+
+def quote(*, dte=SETTINGS.target_dte, ask=5.2, bid=5.0, delta=0.6, kind="call"):
     return OptionQuote(
         symbol=f"TEST-{dte}", underlying="TEST", contract_type=kind,
         expiration=TODAY + timedelta(days=dte), strike=100, bid=bid, ask=ask,
@@ -14,30 +17,46 @@ def quote(*, dte=30, ask=5.2, bid=5.0, delta=0.6, kind="call"):
     )
 
 
-def test_contracts_over_60_dte_are_rejected():
-    selector = SwingOptionSelector(OptionsSettings())
+def test_contracts_past_the_ordinary_window_are_rejected():
+    selector = SwingOptionSelector(SETTINGS)
     assert selector.select(
-        direction="LONG", quotes=[quote(dte=61)], as_of=TODAY, confidence=89
+        direction="LONG", quotes=[quote(dte=SETTINGS.max_dte + 1)],
+        as_of=TODAY, confidence=SETTINGS.exceptional_min_confidence - 1,
     ) is None
 
 
-def test_high_confidence_does_not_extend_past_60_dte():
-    assert SwingOptionSelector(OptionsSettings()).select(
-        direction="LONG", quotes=[quote(dte=61)], as_of=TODAY, confidence=92
+def test_high_confidence_extends_the_window_but_not_past_its_own_limit():
+    selector = SwingOptionSelector(SETTINGS)
+    assert selector.select(
+        direction="LONG", quotes=[quote(dte=SETTINGS.max_dte + 1)],
+        as_of=TODAY, confidence=SETTINGS.exceptional_min_confidence + 1,
+    ) is not None
+    assert selector.select(
+        direction="LONG", quotes=[quote(dte=SETTINGS.exceptional_max_dte + 1)],
+        as_of=TODAY, confidence=SETTINGS.exceptional_min_confidence + 1,
     ) is None
 
 
-def test_seven_dte_boundary_is_allowed():
-    selection = SwingOptionSelector(OptionsSettings()).select(
-        direction="LONG", quotes=[quote(dte=7)], as_of=TODAY, confidence=80
+def test_the_shortest_contract_still_outlives_the_holding_window():
+    """The floor is derived, not chosen: hold + exit buffer.
+
+    A contract that expires inside the planned hold is a losing trade decided
+    on the day it is opened, whatever the stock does.
+    """
+    assert SETTINGS.min_dte >= (
+        SETTINGS.planned_max_hold_days + SETTINGS.exit_before_expiry_days
+    )
+    selection = SwingOptionSelector(SETTINGS).select(
+        direction="LONG", quotes=[quote(dte=SETTINGS.min_dte)], as_of=TODAY, confidence=80
     )
     assert selection is not None
-    assert selection.days_to_expiry == 7
+    assert selection.days_to_expiry == SETTINGS.min_dte
 
 
-def test_contracts_below_seven_dte_are_rejected():
-    assert SwingOptionSelector(OptionsSettings()).select(
-        direction="LONG", quotes=[quote(dte=6)], as_of=TODAY, confidence=80
+def test_contracts_below_the_floor_are_rejected():
+    assert SwingOptionSelector(SETTINGS).select(
+        direction="LONG", quotes=[quote(dte=SETTINGS.min_dte - 1)],
+        as_of=TODAY, confidence=80
     ) is None
 
 
