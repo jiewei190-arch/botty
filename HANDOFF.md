@@ -50,8 +50,7 @@ alerts. The intended holding period is roughly three to eight weeks.
   recovery of a complete round trip that occurred while Botty was offline.
 - The primary automated instrument is now a long call for bullish setups or a
   long put for bearish setups; the equity scanner remains the signal engine.
-- Normal contracts are 60–90 DTE. Only setups scoring at least 90 may use
-  91–120 DTE contracts.
+- Contracts must have 7–60 DTE, with selection targeting roughly 30 DTE.
 - Each swing must use $500–$1,000 of premium. At most two swings and four total
   contracts may be open. Same-day option exits are structurally blocked.
 - Contract selection rejects weak delta, wide spreads, low volume, and low open

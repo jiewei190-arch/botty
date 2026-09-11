@@ -1,4 +1,4 @@
-"""Select liquid long calls/puts for 3-to-8-week swing ideas."""
+"""Select liquid long calls/puts with 7-to-60 days until expiration."""
 
 from __future__ import annotations
 

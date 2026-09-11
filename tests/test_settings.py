@@ -24,6 +24,9 @@ def test_defaults_to_paper_mode():
 def test_options_default_to_alert_only_with_seven_to_sixty_day_plan():
     options = OptionsSettings()
     assert options.alert_only is True
+    assert options.min_dte == 7
+    assert options.max_dte == 60
+    assert options.target_dte == 30
     assert options.planned_min_hold_days == 7
     assert options.planned_max_hold_days == 60
 

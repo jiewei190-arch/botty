@@ -257,11 +257,11 @@ class OptionsSettings(BaseSettings):
 
     enabled: bool = True
     alert_only: bool = True
-    min_dte: int = Field(default=60, ge=30, le=365)
-    max_dte: int = Field(default=90, ge=45, le=365)
-    exceptional_max_dte: int = Field(default=120, ge=60, le=730)
+    min_dte: int = Field(default=7, ge=1, le=365)
+    max_dte: int = Field(default=60, ge=7, le=365)
+    exceptional_max_dte: int = Field(default=60, ge=7, le=730)
     exceptional_min_confidence: float = Field(default=90.0, ge=70, le=100)
-    target_dte: int = Field(default=75, ge=30, le=365)
+    target_dte: int = Field(default=30, ge=7, le=365)
     target_delta: float = Field(default=0.60, ge=0.35, le=0.80)
     min_abs_delta: float = Field(default=0.50, ge=0.20, le=0.80)
     max_abs_delta: float = Field(default=0.70, ge=0.40, le=0.95)

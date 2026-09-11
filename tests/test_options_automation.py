@@ -25,7 +25,7 @@ class Chain:
         kind = "call" if direction == "LONG" else "put"
         return [OptionQuote(
             symbol=f"{underlying}261120C00250000", underlying=underlying,
-            contract_type=kind, expiration=date.today() + timedelta(days=75),
+            contract_type=kind, expiration=date.today() + timedelta(days=30),
             strike=underlying_price, bid=5.0, ask=5.2, delta=0.60,
             daily_volume=100, open_interest=500,
         )]
@@ -81,7 +81,7 @@ def test_option_executor_only_places_risk_approved_paper_swing(database, setting
     selected = database.option_selections.active()[0]
     assert 500 <= selected["estimated_cost"] <= 1000
     assert "CALL $250.00" in notifier.messages[0]
-    assert str(date.today() + timedelta(days=75)) in notifier.messages[0]
+    assert str(date.today() + timedelta(days=30)) in notifier.messages[0]
 
 
 def test_option_executor_alert_only_sends_contract_without_order(database, settings):
