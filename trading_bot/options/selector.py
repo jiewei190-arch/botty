@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from math import ceil
 
@@ -59,6 +59,11 @@ class OptionSelection:
     #: reader can tell a measured selection from an approximated one.
     delta_source: str = "greeks"
 
+    #: True when the normal delta band bought nothing affordable and the
+    #: relaxed floor was used instead. A cheaper, further out-of-the-money
+    #: contract is a different trade, so it is never presented as the same one.
+    relaxed: bool = False
+
     @property
     def approximated(self) -> bool:
         return self.delta_source != "greeks"
@@ -66,11 +71,12 @@ class OptionSelection:
     def describe(self) -> str:
         """The one line a trader actually reads: ticker, strike, type, expiry."""
         quote = self.quote
-        return (
+        line = (
             f"{quote.underlying} ${quote.strike:g} "
             f"{quote.contract_type.upper()} "
             f"{quote.expiration.isoformat()} ({self.days_to_expiry}DTE)"
         )
+        return f"{line} [reduced delta]" if self.relaxed else line
 
 
 class SwingOptionSelector:
@@ -83,6 +89,37 @@ class SwingOptionSelector:
         self, *, direction: str, quotes: list[OptionQuote], as_of: date,
         confidence: float = 0, remaining_premium: float | None = None,
         remaining_contracts: int | None = None,
+    ) -> OptionSelection | None:
+        """Pick a contract, preferring the normal delta band.
+
+        Two passes, never one. The relaxed floor exists because the premium
+        ceiling makes a 0.50-0.70 delta unaffordable on any underlying much
+        above $200, not because a cheaper contract is as good -- so it is only
+        reached when the first pass finds nothing, and what it returns is
+        flagged rather than presented as an ordinary selection.
+        """
+        found = self._select_within(
+            direction=direction, quotes=quotes, as_of=as_of, confidence=confidence,
+            remaining_premium=remaining_premium, remaining_contracts=remaining_contracts,
+            min_delta=self.settings.min_abs_delta,
+            max_moneyness=self.settings.fallback_max_moneyness_pct,
+        )
+        if found is not None:
+            return found
+        relaxed = self._select_within(
+            direction=direction, quotes=quotes, as_of=as_of, confidence=confidence,
+            remaining_premium=remaining_premium, remaining_contracts=remaining_contracts,
+            min_delta=self.settings.relaxed_min_abs_delta,
+            max_moneyness=self.settings.relaxed_max_moneyness_pct,
+        )
+        if relaxed is None:
+            return None
+        return replace(relaxed, relaxed=True)
+
+    def _select_within(
+        self, *, direction: str, quotes: list[OptionQuote], as_of: date,
+        confidence: float, remaining_premium: float | None,
+        remaining_contracts: int | None, min_delta: float, max_moneyness: float,
     ) -> OptionSelection | None:
         desired = "call" if direction.upper() == "LONG" else "put"
         budget = min(
@@ -118,7 +155,7 @@ class SwingOptionSelector:
             # distance from spot stands in — a coarser proxy for the same thing,
             # flagged so nothing downstream mistakes it for a measured delta.
             if delta is not None:
-                if not self.settings.min_abs_delta <= delta <= self.settings.max_abs_delta:
+                if not min_delta <= delta <= self.settings.max_abs_delta:
                     continue
                 delta_source = "greeks"
             else:
@@ -126,9 +163,7 @@ class SwingOptionSelector:
                 if moneyness is None:
                     continue
                 if not (
-                    self.settings.fallback_min_moneyness_pct
-                    <= moneyness
-                    <= self.settings.fallback_max_moneyness_pct
+                    self.settings.fallback_min_moneyness_pct <= moneyness <= max_moneyness
                 ):
                     continue
                 delta_source = "moneyness"
@@ -149,10 +184,7 @@ class SwingOptionSelector:
             if delta is not None:
                 delta_penalty = abs(delta - self.settings.target_delta) * 100
             else:
-                midpoint = (
-                    self.settings.fallback_min_moneyness_pct
-                    + self.settings.fallback_max_moneyness_pct
-                ) / 2
+                midpoint = (self.settings.fallback_min_moneyness_pct + max_moneyness) / 2
                 delta_penalty = abs((quote.moneyness_pct or 0.0) - midpoint) * 10
             score = (
                 delta_penalty
