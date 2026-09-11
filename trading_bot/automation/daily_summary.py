@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from datetime import date
 from typing import Any
 
@@ -66,68 +68,63 @@ def load_scan_report(database, session: date) -> dict[str, Any] | None:
     return payload if payload.get("session") == session.isoformat() else None
 
 
+def _reason_family(reason: str) -> str:
+    """Group a decision reason so the report counts causes, not symbols.
+
+    The per-symbol verdicts belong on the dashboard, which already lists them.
+    Repeating them in Slack made the closing message a second copy of a screen
+    the reader already has, and buried the market summary above it. What does
+    not appear anywhere else is *why* a day produced no alerts, so that is what
+    survives here -- as a tally of causes.
+    """
+    text = re.sub(r"^(not approved|approved(?: alert)?|alerted)[:,]?\s*", "", reason.strip())
+    # Execution errors carry a raw payload that is unique per failure; the
+    # cause is the same one regardless of which broker message came back.
+    text = re.sub(r"\s*\(.*", "", text)
+    return text.rstrip(".") or "no reason recorded"
+
+
 def format_close_summary(database, session: date) -> str:
-    """Render a concise report that stays below Slack's practical message limit."""
+    """Render the bot's side of the closing report.
+
+    Deliberately short. It follows the market recap, and its job is to say
+    whether Botty worked and why it stayed quiet -- not to re-list the
+    candidates, which the dashboard shows in full.
+    """
     payload = load_scan_report(database, session)
     if payload is None:
         return (
-            f"BOTTY END-OF-DAY SUMMARY — {session.isoformat()}\n"
+            f"BOTTY — {session.isoformat()}\n"
             "No completed scan report was available for this session."
         )
 
     lines = [
-        f"*BOTTY END-OF-DAY SUMMARY — {session.isoformat()}*",
+        f"*BOTTY — {session.isoformat()}*",
         (
-            f"• Started with {payload['catalogue_considered']:,} listed assets; "
-            f"analysed {payload['scanned']:,} liquid symbols "
-            f"in {payload['elapsed_seconds']:,.1f}s"
+            f"• Scanned {payload['scanned']:,} liquid symbols of "
+            f"{payload['catalogue_considered']:,} listed in "
+            f"{payload['elapsed_seconds']:,.1f}s — "
+            f"{len(payload['opportunities'])} chart setup(s)."
         ),
         (
-            f"• Final chart setups: {len(payload['opportunities'])} | "
-            f"Option alerts: {payload.get('alerted', 0)} | "
-            f"Paper orders: {payload['placed']} | "
-            f"Skipped: {payload['skipped']} | Errors: {payload['failed']}"
+            f"• Option alerts: {payload.get('alerted', 0)} | "
+            f"Paper orders: {payload['placed']} | Errors: {payload['failed']}"
         ),
     ]
     if payload.get("halt_reason"):
         lines.append(f"• Trading halt: {payload['halt_reason']}")
 
-    candidates = {item["symbol"]: item for item in payload["opportunities"]}
-    decisions = payload.get("decisions", [])
-    if decisions:
-        lines.append("\n*Final candidate decisions* ")
-        for decision in decisions[:10]:
-            candidate = candidates.get(decision["symbol"], {})
-            score = candidate.get("confidence")
-            label = "✅" if decision["approved"] else "❌"
-            score_text = f" ({score:.0f}/100)" if score is not None else ""
-            lines.append(
-                f"{label} *{decision['symbol']}*{score_text} — {decision['reason']}"
-            )
-            if decision["approved"] and candidate.get("reasons"):
-                lines.append(f"   Why: {'; '.join(candidate['reasons'][:2])}")
-    elif payload["opportunities"]:
-        lines.append("\n*Final chart setups* ")
-        for candidate in payload["opportunities"][:10]:
-            lines.append(
-                f"• *{candidate['symbol']}* {candidate['direction']} "
-                f"({candidate['confidence']:.0f}/100) — option decision unavailable"
-            )
-    else:
-        lines.append("\nNo setup cleared the full chart and risk funnel today.")
-
-    combined = dict(payload.get("blockers", {}))
-    for reason, count in payload.get("filtered_out", {}).items():
-        combined[reason] = combined.get(reason, 0) + count
-    if payload.get("stale"):
-        combined["signal was stale"] = len(payload["stale"])
-    if combined:
-        lines.append("\n*Most common rejection reasons* ")
-        for reason, count in sorted(combined.items(), key=lambda item: -item[1])[:5]:
-            lines.append(f"• {count:,}× {reason}")
+    blocked = [d for d in payload.get("decisions", []) if not d["approved"]]
+    if blocked and not payload.get("alerted", 0):
+        tally = Counter(_reason_family(d["reason"]) for d in blocked)
+        lines.append("• Nothing was alerted because:")
+        lines.extend(f"    {count}× {reason}" for reason, count in tally.most_common(3))
+    elif not payload["opportunities"]:
+        lines.append("• No setup cleared the chart and risk funnel today.")
 
     lines.append(
-        f"\nOpen now: {len(database.positions.all())} position(s), "
+        f"• Open now: {len(database.positions.all())} position(s), "
         f"{len(database.orders.open_orders())} order(s). Paper trading only."
     )
+    lines.append("• Per-symbol detail is on the dashboard.")
     return "\n".join(lines)[:3900]
