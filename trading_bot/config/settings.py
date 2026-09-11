@@ -380,6 +380,21 @@ class OptionsSettings(BaseSettings):
     min_abs_delta: float = Field(default=0.50, ge=0.20, le=0.80)
     max_abs_delta: float = Field(default=0.70, ge=0.40, le=0.95)
     max_spread_pct: float = Field(default=12.0, gt=0, le=50)
+    #: Delta floor used ONLY when the band above buys nothing affordable.
+    #:
+    #: A $1,000 ceiling with at most 4 contracts means a contract must cost
+    #: $125-$1,000. At 0.50-0.70 delta and 60 DTE that is roughly 5-7% of spot,
+    #: so the band silently excluded every underlying above about $200 -- the
+    #: large caps that actually move. Measured across volatility: at 35% IV the
+    #: window was $13.50-$206, at 60% IV only $8-$128.
+    #:
+    #: Dropping the floor buys further out of the money: cheaper, less
+    #: directional per dollar, and more exposed to time decay. That is a real
+    #: trade-off, so it is a fallback rather than the rule, and the selection
+    #: is flagged so an alert can say it was taken.
+    relaxed_min_abs_delta: float = Field(default=0.35, ge=0.15, le=0.60)
+    #: Moneyness ceiling for the same fallback when the feed supplies no greeks.
+    relaxed_max_moneyness_pct: float = Field(default=8.0, ge=0, le=25)
     #: Contracts traded today. Defaults to 0 because Alpaca's option **snapshot**
     #: does not carry a daily bar — only the latest trade, quote, IV and greeks —
     #: so nothing fills this in on the live path. It was 10, which silently
@@ -433,6 +448,15 @@ class OptionsSettings(BaseSettings):
             raise ValueError("per-trade premium cannot exceed total premium")
         if self.min_premium_per_trade > self.max_premium_per_trade:
             raise ValueError("minimum premium cannot exceed maximum premium")
+        if self.relaxed_min_abs_delta >= self.min_abs_delta:
+            raise ValueError(
+                "relaxed_min_abs_delta must be below min_abs_delta: the relaxed "
+                "floor exists to admit cheaper contracts than the normal band"
+            )
+        if self.relaxed_max_moneyness_pct < self.fallback_max_moneyness_pct:
+            raise ValueError(
+                "relaxed_max_moneyness_pct cannot be below fallback_max_moneyness_pct"
+            )
         if self.exceptional_max_dte < self.max_dte:
             raise ValueError("exceptional max DTE cannot be below normal max DTE")
         required = self.planned_max_hold_days + self.exit_before_expiry_days

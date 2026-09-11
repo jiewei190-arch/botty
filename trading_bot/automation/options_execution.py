@@ -197,6 +197,18 @@ class OptionPaperExecutor:
                     f"close by {exit_by.isoformat()}\n"
                     f"  {quote.symbol}"
                 )
+                if selection.relaxed:
+                    # A reduced-delta contract is a different trade from the one
+                    # the strategy normally buys: cheaper, further out of the
+                    # money, and more exposed to time decay. Saying so is the
+                    # point -- it is taken because the premium ceiling left no
+                    # alternative on this underlying, not because it is equal.
+                    alert_message += (
+                        f"\n  ! Reduced delta ({quote.delta:.2f}) — a "
+                        f"{self.settings.options.min_abs_delta:.2f}+ contract "
+                        f"costs more than the ${self.settings.options.max_premium_per_trade:,.0f} "
+                        f"cap at this share price. Further OTM, decays faster."
+                    )
                 if order_block:
                     self.db.option_selections.set_status(selection_id, "alerted")
                     alerted += 1
