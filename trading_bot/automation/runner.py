@@ -164,8 +164,21 @@ class MarketOpenRunner:
         """
         if new_session:
             return True
-        if self.open_scan_interval_seconds is None or self._last_scan_at is None:
+        if self.open_scan_interval_seconds is None:
             return False
+        if self._last_scan_at is None:
+            # The session is recorded as scanned but nothing says when: a
+            # database written before this timestamp was persisted, which is
+            # every deployment upgrading into it. Scanning once is what keeps
+            # such an upgrade from sitting idle for the rest of its first
+            # session -- the failure this mechanism exists to prevent.
+            #
+            # Only when the result can be recorded, though. Persistence is what
+            # makes this safe rather than a loop: the timestamp is written
+            # before the scan runs, so the next poll measures a real interval.
+            # A caller that cannot record one gets the stricter old reading,
+            # where a restart never repeats a session already marked complete.
+            return self.save_last_scan_at is not None
         elapsed = (timestamp - self._last_scan_at).total_seconds()
         return elapsed >= self.open_scan_interval_seconds
 
