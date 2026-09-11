@@ -1068,6 +1068,53 @@ Most common blockers (condition, times it blocked an entry):
 
 An idle bot with no explanation is indistinguishable from a broken one.
 
+### What actually sets the holding period
+
+A strategy does not hold for weeks because its docstring says so. The holding
+period is decided by three numbers, and if they disagree the documentation is
+the thing that turns out to be wrong.
+
+`swing_quality` is built for a 7-30 calendar day hold, which is 5-21 trading
+days. Its exits are derived from that window rather than inherited:
+
+| | Value | Why |
+|---|---|---|
+| `atr_stop_multiplier` | 2.25 | A random walk covers *k* ATRs in roughly *k²* bars, so the stop is first threatened around the fifth session, not the first |
+| `min_stop_atr` | 2.0 | A structural level can sit close to the entry; taking it literally re-creates a two-day hold |
+| `atr_target_multiplier` | 4.5 | `sqrt(21)` — the target has to be **reachable before the cap fires** |
+| `max_holding_bars` | 21 | 30 calendar days, the far edge of the window |
+
+The inherited defaults were 1.5 ATR floored at 0.75. Measured on real AAPL and
+MSFT daily bars, those produced a **median hold of two trading days**, stopped
+out 22 of 32 trades, and exited seven of them on the same bar they opened — a
+day-trading result from a strategy documenting a one-to-four week hold. After
+the change the median is five days, the distribution reaches the cap, and
+nothing runs past it.
+
+Three defects had to be fixed before any of that was true:
+
+- **The holding cap was never enforced.** It lived in `should_exit()`, which
+  nothing in the codebase calls — the backtester calls `evaluate_exit()`. The
+  bug was latent until `swing_quality` became the first strategy to set
+  `max_holding_bars`, then trades ran to 22 and 30 bars against a 20-bar cap.
+  It is now `check_time_stop()`, called from both paths.
+- **A target further out than the cap is incoherent**, not ambitious. At 5 ATR
+  against a 20-bar cap, five of 24 trades were closed by the clock while still
+  in profit.
+- **Entries were not re-validated against the fill.** The stop is measured from
+  the bar that produced the signal; the fill happens at the next open. One
+  measured setup planned 1.48% of room and opened with **0.035%** after an
+  overnight gap — an alert describing one trade and a position that was another.
+  `max_entry_drift` now abandons a setup once half its planned risk is gone
+  before entry.
+
+**None of this makes the strategy profitable, and the tests do not claim it
+does.** Over 24 trades on two symbols the expectancy is indistinguishable from
+zero — moving the cap by a single bar swung the total return by more than a
+point, which is what a sample this small does. The holding period is now a
+property you can verify; the edge is not, and `python main.py calibrate` over a
+wide universe is the only thing that would settle it.
+
 ### Strategies have different risk shapes
 
 Mean reversion ships with a **tighter stop and a lower reward:risk floor** (1.5

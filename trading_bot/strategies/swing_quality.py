@@ -18,7 +18,12 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from trading_bot.indicators import analyze_trend, analyze_volume, find_support_resistance, rsi_column
+from trading_bot.indicators import (
+    analyze_trend,
+    analyze_volume,
+    find_support_resistance,
+    rsi_column,
+)
 from trading_bot.strategies.base_strategy import (
     BaseStrategy,
     Condition,
@@ -33,11 +38,42 @@ class SwingQualityConfig(StrategyConfig):
     """Parameters for :class:`SwingQualityStrategy`.
 
     Defaults deliberately favour quality over frequency. With daily bars,
-    ``max_holding_bars=20`` is approximately one trading month.
+    ``max_holding_bars=21`` is about 30 calendar days.
+
+    Exit geometry is the part that decides whether this is actually a swing
+    strategy. The inherited defaults (a 1.5 ATR stop floored at 0.75 ATR) were
+    chosen for intraday bars; on daily bars they put the stop inside a single
+    session's noise. Measured on real AAPL and MSFT daily bars, that produced a
+    **median hold of two trading days** and stopped out 22 of 32 trades — a
+    day-trading result from a strategy documenting a one-to-four week hold.
+
+    The multiples below are set from how far price wanders before it trends. A
+    random walk covers roughly ``k`` ATRs in ``k²`` bars, which ties the three
+    numbers together: the stop should not be threatened in the first few
+    sessions, and the target has to be **reachable before the holding cap
+    fires**, or the strategy spends its life timing out on trades that were
+    working. The cap is 21 bars — 30 calendar days, the far edge of the window
+    asked for — so ``sqrt(21) ≈ 4.5`` sets the target; reward:risk of 2 then
+    sets the stop at 2.25 ATR, first threatened around the fifth session.
+
+    A target further out than the cap is not a more ambitious strategy, it is an
+    incoherent one — measured at 5 ATR against a 20-bar cap, five of 24 trades
+    were closed by the clock while still in profit.
     """
 
     min_confidence: float = 70.0
-    max_holding_bars: int | None = 20
+    #: 21 trading days is about 30 calendar days.
+    max_holding_bars: int | None = 21
+
+    #: Stop distance in ATRs. Wide enough that ordinary daily noise does not end
+    #: a multi-week thesis; ~5 sessions before it is first threatened.
+    atr_stop_multiplier: float = 2.25
+    #: Floor on the stop, in ATRs. A structural level can sit close to the
+    #: entry, and taking it literally re-creates the two-day hold.
+    min_stop_atr: float = 2.0
+    #: Target distance in ATRs, chosen so it is reachable inside
+    #: ``max_holding_bars``. Keeps reward:risk at 2.0 against the stop above.
+    atr_target_multiplier: float = 4.5
 
     fast_ema: int = 20
     mid_ema: int = 50
@@ -106,7 +142,10 @@ class SwingQualityStrategy(BaseStrategy):
         trigger = pullback_reclaim or breakout
 
         trend = analyze_trend(data, self.indicators)
-        trend_quality = trend.direction.is_bullish and trend.strength >= self.config.min_trend_strength
+        trend_quality = (
+            trend.direction.is_bullish
+            and trend.strength >= self.config.min_trend_strength
+        )
 
         volume = analyze_volume(data, self.indicators)
         relative_volume = volume.relative_volume

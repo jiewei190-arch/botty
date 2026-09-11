@@ -117,7 +117,7 @@ class RiskSettings(BaseSettings):
     account_equity: float = Field(default=10_000.0, gt=0)
 
     @model_validator(mode="after")
-    def _validate_coherence(self) -> "RiskSettings":
+    def _validate_coherence(self) -> RiskSettings:
         if self.max_position_size_pct > self.max_portfolio_exposure_pct:
             raise ValueError(
                 "RISK_MAX_POSITION_SIZE_PCT cannot exceed RISK_MAX_PORTFOLIO_EXPOSURE_PCT"
@@ -200,7 +200,13 @@ class ScannerSettings(BaseSettings):
     universe_file: Path | None = None
 
     #: Bar size the detectors analyse.
-    timeframe: str = "5Min"
+    #:
+    #: Daily, to match the rest of a swing bot. The detectors work on any
+    #: timeframe, but a 5-minute scanner alerting into a strategy that holds for
+    #: weeks is answering a different question from the one being asked, and the
+    #: two disagree most at exactly the moments that matter. Set a finer bar size
+    #: here only to time an entry that daily bars already justified.
+    timeframe: str = "1Day"
     #: Bars of history fetched before live data starts, for detector baselines.
     lookback_bars: int = Field(default=400, ge=50, le=10_000)
     #: Bars retained per symbol while running.
@@ -344,7 +350,7 @@ class Settings(BaseSettings):
     project_root: Path = PROJECT_ROOT
 
     @model_validator(mode="after")
-    def _enforce_live_trading_locks(self) -> "Settings":
+    def _enforce_live_trading_locks(self) -> Settings:
         if self.trading_mode is not TradingMode.LIVE:
             return self
         if not self.enable_live_trading:
@@ -372,7 +378,7 @@ class Settings(BaseSettings):
         self.data.cache_dir.mkdir(parents=True, exist_ok=True)
         self.data.database_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def with_overrides(self, **overrides: Any) -> "Settings":
+    def with_overrides(self, **overrides: Any) -> Settings:
         return self.model_copy(update=overrides)
 
     def redacted_dict(self) -> dict[str, Any]:

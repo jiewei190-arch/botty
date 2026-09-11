@@ -21,7 +21,9 @@ def test_swing_quality_is_registered() -> None:
 def test_swing_quality_defaults_are_selective_and_month_sized() -> None:
     config = SwingQualityConfig()
     assert config.min_confidence == 70.0
-    assert config.max_holding_bars == 20
+    # 21 trading days, not 20: the target sits at sqrt(21) ATRs so it stays
+    # reachable before the cap fires. See TestSwingQualityGeometry.
+    assert config.max_holding_bars == 21
     assert config.fast_ema == 20
     assert config.mid_ema == 50
     assert config.long_ema == 200
