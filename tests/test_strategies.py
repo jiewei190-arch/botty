@@ -392,8 +392,10 @@ def test_disallowed_direction_produces_no_signal():
 # ============================================================================
 
 
-def test_registry_lists_the_three_strategies():
-    assert available_strategies() == ["breakout", "mean_reversion", "momentum"]
+def test_registry_lists_available_strategies():
+    assert available_strategies() == [
+        "breakout", "mean_reversion", "momentum", "swing_quality"
+    ]
 
 
 @pytest.mark.parametrize(

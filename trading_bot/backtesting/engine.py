@@ -64,6 +64,7 @@ from trading_bot.strategies import (
     Position,
     Signal,
     SignalDirection,
+    explain_blockers,
 )
 from trading_bot.utils.timeframes import Timeframe
 
@@ -148,6 +149,8 @@ class BacktestResult:
     signals_generated: int = 0
     signals_rejected: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
+    strategy_blockers: dict[str, int] = field(default_factory=dict)
+    evaluations: int = 0
 
     @property
     def trade_frame(self) -> pd.DataFrame:
@@ -186,6 +189,8 @@ class BacktestResult:
             "signals_generated": self.signals_generated,
             "signals_rejected": self.signals_rejected,
             "rejection_reasons": dict(self.rejection_reasons),
+            "strategy_blockers": dict(self.strategy_blockers),
+            "evaluations": self.evaluations,
             "trades": self.trades,
         }
 
@@ -232,6 +237,8 @@ class Backtester:
         self._signals = 0
         self._rejected = 0
         self._rejections: dict[str, int] = {}
+        self._strategy_blockers: dict[str, int] = {}
+        self._evaluations = 0
 
     def _equity_now(self, prices: dict[str, float]) -> float:
         held = sum(
@@ -382,6 +389,8 @@ class Backtester:
             signals_generated=self._signals,
             signals_rejected=self._rejected,
             rejection_reasons=self._rejections,
+            strategy_blockers=self._strategy_blockers,
+            evaluations=self._evaluations,
         )
 
     # -- steps -------------------------------------------------------------------
@@ -551,15 +560,29 @@ class Backtester:
             history = frame.iloc[: row + 1]
 
             for strategy in self.strategies:
+                self._evaluations += 1
                 try:
                     signal = strategy.generate_signal(symbol, history)
                 except Exception:  # noqa: BLE001 - one symbol must not stop the run
                     logger.exception("%s failed on %s at %s", strategy.name, symbol, stamp)
+                    key = f"{strategy.name}: evaluation_error"
+                    self._strategy_blockers[key] = self._strategy_blockers.get(key, 0) + 1
                     continue
                 if signal is not None:
                     self._signals += 1
                     self._pending.append((symbol, signal))
                     break  # one position per symbol; first strategy wins
+
+                blockers = explain_blockers(strategy)
+                if blockers:
+                    for blocker in blockers:
+                        key = f"{strategy.name}: {blocker}"
+                        self._strategy_blockers[key] = self._strategy_blockers.get(key, 0) + 1
+                elif strategy.last_evaluation:
+                    # Required conditions passed but generate_signal still returned
+                    # None: the confidence floor is the usual remaining gate.
+                    key = f"{strategy.name}: confidence_floor"
+                    self._strategy_blockers[key] = self._strategy_blockers.get(key, 0) + 1
 
     def _close(
         self, symbol: str, fill: Fill, stamp: pd.Timestamp, reason: str

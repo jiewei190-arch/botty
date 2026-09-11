@@ -180,7 +180,7 @@ def test_duplicate_detection_ignores_case(manager):
 def test_low_confidence_is_rejected(manager):
     decision = manager.evaluate(a_signal(confidence=45), a_portfolio(), now=NOW)
     assert not decision.approved
-    assert "below the 60 floor" in decision.rejection_reason
+    assert f"below the {manager.settings.min_confidence:g} floor" in decision.rejection_reason
 
 
 def test_poor_reward_to_risk_is_rejected(manager):

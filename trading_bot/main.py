@@ -307,8 +307,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scan the whole market for swing setups and rank the best entries.",
     )
     hunt.add_argument(
-        "--strategy", default="all",
-        help="Strategy name, comma-separated list, or 'all' (default). "
+        "--strategy", default="swing_quality",
+        help="Strategy name, comma-separated list, or 'all' (default: swing_quality). "
         f"Available: {', '.join(available_strategies())}",
     )
     hunt.add_argument(
@@ -386,8 +386,8 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--symbols", help="Comma-separated symbols (default: watchlist).")
     backtest.add_argument(
         "--strategy",
-        default="momentum",
-        help="Strategy name, comma-separated list, or 'all'. "
+        default="swing_quality",
+        help="Strategy name, comma-separated list, or 'all' (default: swing_quality). "
         f"Available: {', '.join(available_strategies())}",
     )
     backtest.add_argument(
