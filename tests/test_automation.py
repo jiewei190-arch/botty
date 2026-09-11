@@ -267,3 +267,30 @@ def test_a_failed_scan_is_still_recorded_as_attempted():
 
     assert runner.step()
     assert saved == [datetime(2026, 9, 11, 14, 30, tzinfo=timezone.utc)]
+
+
+def test_an_upgrade_with_no_recorded_scan_time_scans_once():
+    """Every deployment upgrading into the persisted timestamp has no key yet.
+
+    Its session is already marked complete, so without this the upgrade sits
+    idle until the next morning's bell -- the exact failure the timestamp was
+    added to prevent, reintroduced by the migration.
+    """
+    scans = []
+    saved = []
+    runner = MarketOpenRunner(
+        ClockBroker(clock(11, hour=17, minute=40), clock(11, hour=17, minute=45)),
+        lambda: scans.append("scan") or 0,
+        Recorder(),
+        open_scan_interval_seconds=3600,
+        load_last_session=lambda: date(2026, 9, 11),
+        load_last_scan_at=lambda: None,       # the key has never been written
+        save_last_scan_at=saved.append,
+    )
+
+    assert runner.step()
+    assert scans == ["scan"]
+    # And the very next poll is quiet, because the scan recorded its time.
+    assert not runner.step()
+    assert scans == ["scan"]
+    assert saved == [datetime(2026, 9, 11, 17, 40, tzinfo=timezone.utc)]
