@@ -54,6 +54,13 @@ def test_missing_verdict_fails_closed_to_sit_out():
     assert _parse_response(payload, "TSLA").verdict == "SIT OUT"
 
 
+@pytest.mark.parametrize("verdict", ["LONG CALL SWING", "LONG PUT SWING", "SIT OUT"])
+def test_options_swing_verdicts(verdict):
+    payload = _payload()
+    payload["steps"][1]["content"][0]["text"] = f"VERDICT: {verdict}"
+    assert _parse_response(payload, "TSLA").verdict == verdict
+
+
 def test_empty_response_is_rejected():
     with pytest.raises(ResearchError, match="no analysis"):
         _parse_response({"steps": []}, "TSLA")
@@ -90,5 +97,7 @@ def test_analysis_calls_grounded_interactions_api(monkeypatch):
     assert body["model"] == "gemini-test"
     assert body["tools"] == [{"type": "google_search"}]
     assert "7-to-60" in body["input"]
+    assert "buying a call" in body["input"]
+    assert "buying a put" in body["input"]
     assert captured["request"].headers["X-goog-api-key"] == "secret"
     assert report.verdict == "SIT OUT"

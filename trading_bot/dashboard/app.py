@@ -139,7 +139,7 @@ def _require_dashboard_password() -> None:
 def _stock_analyst(settings) -> None:
     st.title("Stock Analyst")
     st.caption(
-        "Fresh, source-grounded research for a 7–60 day swing decision. "
+        "Deep, source-grounded research for a 7–60 day options swing decision. "
         "This page analyzes; it cannot place an order."
     )
     if not settings.research.enabled:
@@ -162,8 +162,9 @@ def _stock_analyst(settings) -> None:
 
     if not submitted:
         st.info(
-            "Botty searches current company releases, filings, news, catalysts, and market "
-            "context. It will choose SIT OUT when the evidence is weak or conflicting."
+            "Botty cross-checks current company releases, filings, news, catalysts, technical "
+            "context, and major risks. Expect roughly 45–120 seconds. It will choose SIT OUT "
+            "when the evidence is weak or conflicting."
         )
         return
 
@@ -174,9 +175,9 @@ def _stock_analyst(settings) -> None:
         st.error(str(error))
         return
 
-    if report.verdict == "BUY":
+    if report.verdict == "LONG CALL SWING":
         st.success(f"Research verdict: {report.verdict}")
-    elif report.verdict == "SELL":
+    elif report.verdict == "LONG PUT SWING":
         st.error(f"Research verdict: {report.verdict}")
     else:
         st.warning(f"Research verdict: {report.verdict}")
