@@ -299,6 +299,21 @@ class OptionsSettings(BaseSettings):
         return self
 
 
+class ResearchSettings(BaseSettings):
+    """Read-only, web-grounded stock research settings."""
+
+    model_config = _BASE_CONFIG | SettingsConfigDict(env_prefix="RESEARCH_")
+
+    gemini_api_key: str | None = None
+    # Gemini 2.5 Flash includes a no-cost API tier with Google Search grounding.
+    model: str = "gemini-2.5-flash"
+    timeout_seconds: float = Field(default=90.0, gt=5, le=180)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.gemini_api_key)
+
+
 class Settings(BaseSettings):
     """Root settings object composing every configuration group."""
 
@@ -322,6 +337,7 @@ class Settings(BaseSettings):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     automation: AutomationSettings = Field(default_factory=AutomationSettings)
     options: OptionsSettings = Field(default_factory=OptionsSettings)
+    research: ResearchSettings = Field(default_factory=ResearchSettings)
 
     project_root: Path = PROJECT_ROOT
 
@@ -373,6 +389,9 @@ class Settings(BaseSettings):
         for key in ("webhook_url", "slack_bot_token", "slack_app_token"):
             if automation.get(key):
                 automation[key] = "***set***"
+        research = payload.get("research", {})
+        if research.get("gemini_api_key"):
+            research["gemini_api_key"] = "***set***"
         return payload
 
 

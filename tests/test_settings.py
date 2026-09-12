@@ -10,6 +10,7 @@ from trading_bot.config.settings import (
     AlpacaSettings,
     DataSettings,
     OptionsSettings,
+    ResearchSettings,
     RiskSettings,
     Settings,
     TradingMode,
@@ -29,6 +30,15 @@ def test_options_default_to_alert_only_with_seven_to_sixty_day_plan():
     assert options.target_dte == 30
     assert options.planned_min_hold_days == 7
     assert options.planned_max_hold_days == 60
+
+
+def test_research_is_optional_and_key_is_redacted():
+    defaults = ResearchSettings()
+    assert defaults.enabled is False
+    assert defaults.model == "gemini-2.5-flash"
+    settings = Settings(research=ResearchSettings(gemini_api_key="top-secret"))
+    assert settings.research.enabled is True
+    assert settings.redacted_dict()["research"]["gemini_api_key"] == "***set***"
 
 
 def test_live_mode_rejected_without_any_lock(monkeypatch):

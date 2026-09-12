@@ -79,7 +79,12 @@ def _adopt_streamlit_secrets() -> None:
         secrets = st.secrets
     except Exception:  # noqa: BLE001 - no secrets file is the normal local case
         return
-    for key in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "RISK_ACCOUNT_EQUITY"):
+    for key in (
+        "ALPACA_API_KEY",
+        "ALPACA_SECRET_KEY",
+        "RISK_ACCOUNT_EQUITY",
+        "RESEARCH_GEMINI_API_KEY",
+    ):
         try:
             value = secrets[key]
         except Exception:  # noqa: BLE001 - absent key

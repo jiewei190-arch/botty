@@ -78,3 +78,16 @@ sudo systemctl restart botty
 ```
 
 The installer never overwrites `/etc/botty/botty.env` or `/var/lib/botty`.
+
+### Optional Stock Analyst
+
+The manual Stock Analyst uses the Gemini 2.5 Flash free tier with Google Search grounding.
+Create a free-tier Gemini API key in Google AI Studio, leave billing disabled if you want a
+hard $0 setup, then run this on the VM (the input is hidden):
+
+```bash
+sudo bash /opt/botty/deploy/oracle-cloud/configure-research.sh
+```
+
+Open the **Stock Analyst** page, enter a company or ticker, and select **Analyze stock**.
+This research feature is read-only and never submits an order.

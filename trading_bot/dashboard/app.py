@@ -54,12 +54,14 @@ from trading_bot.indicators import (
     find_support_resistance,
     rsi_column,
 )
+from trading_bot.research import ResearchError, analyze_stock
 from trading_bot.strategies import available_strategies
 from trading_bot.universe import feed_liquidity_warning
 from trading_bot.utils.timeframes import SUPPORTED_TIMEFRAMES
 
 PAGES = (
     "Hunt",
+    "Stock Analyst",
     "Automation",
     "Swing Tracker",
     "Overview",
@@ -94,6 +96,8 @@ def main() -> None:
     page = controls["page"]
     if page == "Hunt":
         _hunt(settings, controls, palette)
+    elif page == "Stock Analyst":
+        _stock_analyst(settings)
     elif page == "Automation":
         _automation(settings)
     elif page == "Swing Tracker":
@@ -130,6 +134,64 @@ def _require_dashboard_password() -> None:
         else:
             st.error("Incorrect password.")
     st.stop()
+
+
+def _stock_analyst(settings) -> None:
+    st.title("Stock Analyst")
+    st.caption(
+        "Fresh, source-grounded research for a 7–60 day swing decision. "
+        "This page analyzes; it cannot place an order."
+    )
+    if not settings.research.enabled:
+        st.warning(
+            "Web research is not configured yet. Add `RESEARCH_GEMINI_API_KEY` "
+            "to Botty's environment and restart the service."
+        )
+
+    with st.form("stock_research"):
+        query = st.text_input(
+            "Company or ticker",
+            placeholder="Tesla or TSLA",
+            max_chars=100,
+        )
+        submitted = st.form_submit_button(
+            "Analyze stock",
+            type="primary",
+            disabled=not settings.research.enabled,
+        )
+
+    if not submitted:
+        st.info(
+            "Botty searches current company releases, filings, news, catalysts, and market "
+            "context. It will choose SIT OUT when the evidence is weak or conflicting."
+        )
+        return
+
+    try:
+        with st.spinner("Searching and cross-checking current sources…"):
+            report = analyze_stock(query, settings.research)
+    except ResearchError as error:
+        st.error(str(error))
+        return
+
+    if report.verdict == "BUY":
+        st.success(f"Research verdict: {report.verdict}")
+    elif report.verdict == "SELL":
+        st.error(f"Research verdict: {report.verdict}")
+    else:
+        st.warning(f"Research verdict: {report.verdict}")
+    st.markdown(report.analysis)
+
+    st.subheader("Sources")
+    if not report.sources:
+        st.warning("No verifiable source links were returned. Treat the verdict as SIT OUT.")
+    else:
+        for number, source in enumerate(report.sources, 1):
+            st.link_button(f"{number}. {source.title}", source.url)
+    if report.search_queries:
+        with st.expander("Searches Botty ran"):
+            for search in report.search_queries:
+                st.code(search, language=None)
 
 
 # -- sidebar -----------------------------------------------------------------
