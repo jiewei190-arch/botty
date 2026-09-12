@@ -58,7 +58,19 @@ def test_missing_verdict_fails_closed_to_sit_out():
 def test_options_swing_verdicts(verdict):
     payload = _payload()
     payload["steps"][1]["content"][0]["text"] = f"VERDICT: {verdict}"
+    payload["steps"][1]["content"][0]["annotations"].extend(
+        [
+            {"type": "url_citation", "title": "SEC", "url": "https://sec.gov/a"},
+            {"type": "url_citation", "title": "News", "url": "https://example.com/b"},
+        ]
+    )
     assert _parse_response(payload, "TSLA").verdict == verdict
+
+
+def test_fewer_than_three_sources_forces_sit_out():
+    payload = _payload()
+    payload["steps"][1]["content"][0]["text"] = "VERDICT: LONG CALL SWING"
+    assert _parse_response(payload, "TSLA").verdict == "SIT OUT"
 
 
 def test_empty_response_is_rejected():

@@ -121,6 +121,9 @@ def _parse_response(payload: dict[str, Any], query: str) -> ResearchReport:
     for source in sources:
         if source.url.startswith(("https://", "http://")):
             unique_sources.setdefault(source.url, source)
+    # Enforce the evidence floor in code instead of trusting prompt compliance.
+    if len(unique_sources) < 3:
+        verdict = "SIT OUT"
     return ResearchReport(
         query=query,
         verdict=verdict,
